@@ -64,13 +64,14 @@ Select-String -Path .\DisplayOrchestrator.ps1 -Pattern "Write-Log.*-Level (ERROR
 ### Profile apply (`Invoke-Profile`)
 ```
 devices.json (.profiles.<Name>)
-  → Step 1: Enable wanted displays        Enable-DisplayByPattern
+  → Step 1: Configure topology (one shot) [DisplayNative]::ConfigureTopology
+               extend: each display gets a unique GPU source (no accidental mirror)
+               clone:  displays with mirrorOf share the same GPU source
   → Step 2: Set primary                   Set-DisplayPrimaryByPattern
-  → Step 3: Disable unwanted             Disable-DisplaysExcept
-  → Step 4: Resolution / DPI / HDR       Set-DisplayModeForPattern
+  → Step 3: Resolution / DPI / HDR       Set-DisplayModeForPattern
                                           Set-DisplayDpi
                                           Set-DisplayHdr
-  → Step 5: Audio default + volume       Set-AudioDeviceDefaultByPattern
+  → Step 4: Audio default + volume       Set-AudioDeviceDefaultByPattern
                                           Set-AudioDeviceVolumeByPattern
   → Post:   Start processes              Invoke-ProfilePostActions
 ```
@@ -129,7 +130,8 @@ Pattern (substring of FriendlyName)
           "refreshRate": 60,
           "dpiPercent":  125,       // null = don't touch; legacy field: dpiScaling (same semantics)
           "hdr":         false,     // null = don't touch
-          "rotation":    0          // 0=landscape 1=portrait 2=flip-landscape 3=flip-portrait
+          "rotation":    0,         // 0=landscape 1=portrait 2=flip-landscape 3=flip-portrait
+          "mirrorOf":   null        // null = extend; "<nickname>" = clone this display onto that nick's source
         }
       ],
       "audio": [

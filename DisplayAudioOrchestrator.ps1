@@ -580,6 +580,115 @@ public static class DisplayNative
         uint flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
         return SetDisplayConfig((uint)paths.Length, paths, (uint)modes.Length, modes, flags);
     }
+
+    private static string SourceKey(DISPLAYCONFIG_PATH_SOURCE_INFO s)
+    {
+        return s.adapterId.HighPart.ToString() + "_" + s.adapterId.LowPart.ToString() + "_" + s.id.ToString();
+    }
+
+    private static List<DISPLAYCONFIG_PATH_INFO> FindPathCandidates(DISPLAYCONFIG_PATH_INFO[] allPaths, string pattern)
+    {
+        var found = new List<DISPLAYCONFIG_PATH_INFO>();
+        foreach (var p in allPaths)
+        {
+            var n = GetTargetDeviceName(p.targetInfo.adapterId, p.targetInfo.id).monitorFriendlyDeviceName ?? "";
+            if (n.Length > 0 && n.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0)
+                found.Add(p);
+        }
+        found.Sort((a, b) => b.targetInfo.targetAvailable.CompareTo(a.targetInfo.targetAvailable));
+        return found;
+    }
+
+    // Configure the full display topology in one SetDisplayConfig call.
+    // extendPatterns: each display claims a unique GPU source (extended desktop).
+    // cloneGroups: each inner string[] shares one source (mirror); first element is the source display.
+    // Displays not mentioned are implicitly deactivated. Defaults to extend if cloneGroups is null/empty.
+    public static int ConfigureTopology(string[] extendPatterns, string[][] cloneGroups)
+    {
+        DISPLAYCONFIG_PATH_INFO[] allPaths; DISPLAYCONFIG_MODE_INFO[] allModes;
+        GetAllPaths(QDC_ALL_PATHS, out allPaths, out allModes);
+
+        var result = new List<DISPLAYCONFIG_PATH_INFO>();
+        var claimedSources = new HashSet<string>();
+
+        // Process clone groups: all displays in each group share one source
+        if (cloneGroups != null)
+        {
+            foreach (var group in cloneGroups)
+            {
+                if (group == null || group.Length == 0) continue;
+                bool groupHasSrc = false;
+                DISPLAYCONFIG_PATH_SOURCE_INFO sharedSrc = default(DISPLAYCONFIG_PATH_SOURCE_INFO);
+                string sharedKey = null;
+
+                foreach (var pattern in group)
+                {
+                    var cands = FindPathCandidates(allPaths, pattern);
+                    if (cands.Count == 0) continue;
+                    DISPLAYCONFIG_PATH_INFO tp = cands[0];
+
+                    if (!groupHasSrc)
+                    {
+                        bool foundSrc = false;
+                        foreach (var c in cands)
+                        {
+                            string k = SourceKey(c.sourceInfo);
+                            if (claimedSources.Add(k))
+                            {
+                                tp = c; sharedSrc = c.sourceInfo; sharedKey = k; groupHasSrc = true; foundSrc = true; break;
+                            }
+                        }
+                        if (!foundSrc) continue;
+                    }
+                    else
+                    {
+                        foreach (var c in cands) { if (SourceKey(c.sourceInfo) == sharedKey) { tp = c; break; } }
+                    }
+
+                    tp.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+                    tp.sourceInfo = sharedSrc;
+                    tp.sourceInfo.modeInfoIdx = 0xFFFFFFFF;
+                    tp.targetInfo.modeInfoIdx = 0xFFFFFFFF;
+                    result.Add(tp);
+                }
+            }
+        }
+
+        // Process extend displays: each claims a unique source
+        if (extendPatterns != null)
+        {
+            foreach (var pattern in extendPatterns)
+            {
+                var cands = FindPathCandidates(allPaths, pattern);
+                bool added = false;
+                foreach (var c in cands)
+                {
+                    string k = SourceKey(c.sourceInfo);
+                    if (claimedSources.Add(k))
+                    {
+                        var tp = c;
+                        tp.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+                        tp.sourceInfo.modeInfoIdx = 0xFFFFFFFF;
+                        tp.targetInfo.modeInfoIdx = 0xFFFFFFFF;
+                        result.Add(tp); added = true; break;
+                    }
+                }
+                if (!added && cands.Count > 0)
+                {
+                    var tp = cands[0];
+                    tp.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+                    tp.sourceInfo.modeInfoIdx = 0xFFFFFFFF;
+                    tp.targetInfo.modeInfoIdx = 0xFFFFFFFF;
+                    result.Add(tp);
+                }
+            }
+        }
+
+        if (result.Count == 0) return -1;
+        uint flags2 = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE
+                    | SDC_ALLOW_CHANGES | SDC_ALLOW_PATH_ORDER_CHANGES;
+        return SetDisplayConfig((uint)result.Count, result.ToArray(), 0, new DISPLAYCONFIG_MODE_INFO[0], flags2);
+    }
 }
 '@
 }
@@ -1367,7 +1476,7 @@ function Set-DisplayModeForPattern {
         [Parameter(Mandatory)][uint32]$Hz
     )
     $gdi = Get-GdiDeviceNameForPattern -Pattern $Pattern
-    if (-not $gdi) { Write-Log "Display '$Pattern' not active — cannot set mode." -Level ERROR; return $false }
+    if (-not $gdi) { Write-Log "Display '$Pattern' not active - cannot set mode." -Level ERROR; return $false }
     return Set-DisplayModeForGdiDevice -GdiDeviceName $gdi -Width $Width -Height $Height -Hz $Hz
 }
 
@@ -1654,6 +1763,32 @@ function Save-ProfileInteractive {
     $state     = Get-State
     $allPaths  = Get-AllDisplayPaths
 
+    # Detect clone topology: displays sharing the same SourceAdapterLUID+SourceId are mirrored.
+    $sourceToNicks = @{}
+    if ($state.displays) {
+        foreach ($nick in $state.displays.PSObject.Properties.Name) {
+            $pat = $state.displays.$nick.pattern
+            $pi  = $allPaths | Where-Object { $_.Active -and $_.FriendlyName -match [regex]::Escape($pat) } | Select-Object -First 1
+            if ($pi) {
+                $srcKey = "$($pi.SourceAdapterLUID)|$($pi.SourceId)"
+                if (-not $sourceToNicks.ContainsKey($srcKey)) { $sourceToNicks[$srcKey] = @() }
+                $sourceToNicks[$srcKey] += $nick
+            }
+        }
+    }
+    $mirrorOfMap = @{}  # nick → mirrorOf nick (null = extend/source)
+    foreach ($srcKey in $sourceToNicks.Keys) {
+        $grp = $sourceToNicks[$srcKey]
+        if ($grp.Count -lt 2) { continue }
+        # Primary display in the group is the clone source; others mirror it
+        $srcNick = $grp | Where-Object {
+            $pi2 = $allPaths | Where-Object { $_.Active -and $_.FriendlyName -match [regex]::Escape($state.displays.$_.pattern) -and $_.Primary } | Select-Object -First 1
+            $pi2 -ne $null
+        } | Select-Object -First 1
+        if (-not $srcNick) { $srcNick = $grp[0] }
+        foreach ($n in $grp) { if ($n -ne $srcNick) { $mirrorOfMap[$n] = $srcNick } }
+    }
+
     $displaySpecs = @()
     if ($state.displays) {
         foreach ($nick in $state.displays.PSObject.Properties.Name) {
@@ -1690,6 +1825,7 @@ function Save-ProfileInteractive {
                 dpiPercent  = if ($pathInfo) { $pathInfo.DpiPercent }  else { $null }
                 hdr         = if ($pathInfo) { $pathInfo.HdrEnabled }  else { $null }
                 rotation    = if ($pathInfo) { $pathInfo.Rotation }    else { $null }
+                mirrorOf    = if ($mirrorOfMap.ContainsKey($nick)) { $mirrorOfMap[$nick] } else { $null }
             }
         }
     }
@@ -1758,35 +1894,55 @@ function Invoke-Profile {
 
     Write-Section "Applying profile: $Name"
 
-    # ── Step 1: Activate wanted displays ──
-    Write-Log "[1/5] Activating displays..." -Level STEP
-    $keepPatterns = @()
+    # ── Steps 1-3: Configure topology (enable/disable/clone in one shot) ──
+    # This fixes accidental mirror: QDC_ALL_PATHS paths can share source IDs, causing
+    # sequential Enable calls to land two displays on the same GPU source (= clone mode).
+    # ConfigureTopology explicitly de-conflicts sources for extend displays.
+    Write-Log "[1/4] Configuring display topology..." -Level STEP
+
+    # First pass: find which displays are mirrors of another (mirrorOf field)
+    $mirrorTargets = @{}  # sourceNick → @(mirrorPattern, ...)
     foreach ($d in $prof.displays) {
-        if (-not $dispNicks.ContainsKey($d.nickname)) {
-            Write-Log "Nickname '$($d.nickname)' not registered. Skipping." -Level WARN; continue
-        }
-        $pattern = $dispNicks[$d.nickname].pattern
-        if ($d.active) {
-            $keepPatterns += $pattern
-            Enable-DisplayByPattern -Pattern $pattern | Out-Null
+        if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
+        $mo = $d.mirrorOf
+        if ($mo -and $dispNicks.ContainsKey($mo)) {
+            if (-not $mirrorTargets.ContainsKey($mo)) { $mirrorTargets[$mo] = @() }
+            $mirrorTargets[$mo] += $dispNicks[$d.nickname].pattern
         }
     }
+
+    # Second pass: build extendPatterns and cloneGroups
+    $extendPatterns = [System.Collections.Generic.List[string]]::new()
+    $cloneGroupsList = [System.Collections.Generic.List[string[]]]::new()
+
+    foreach ($d in $prof.displays) {
+        if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
+        $mo = $d.mirrorOf
+        if ($mo -and $dispNicks.ContainsKey($mo)) { continue }  # handled as part of clone group
+        $pat = $dispNicks[$d.nickname].pattern
+        if ($mirrorTargets.ContainsKey($d.nickname)) {
+            # This display is the source of a clone group
+            $grp = @($pat) + $mirrorTargets[$d.nickname]
+            [void]$cloneGroupsList.Add([string[]]$grp)
+        } else {
+            [void]$extendPatterns.Add($pat)
+        }
+    }
+
+    $ret = [DisplayNative]::ConfigureTopology([string[]]$extendPatterns.ToArray(), [string[][]]$cloneGroupsList.ToArray())
+    if ($ret -ne 0) { Write-Log "ConfigureTopology returned $ret." -Level WARN }
+    Start-Sleep -Milliseconds 2000
     Show-ActiveDisplays
 
     # ── Step 2: Set primary ──
-    Write-Log "[2/5] Setting primary display..." -Level STEP
+    Write-Log "[2/4] Setting primary display..." -Level STEP
     $primaryEntry = $prof.displays | Where-Object { $_.primary } | Select-Object -First 1
     if ($primaryEntry -and $dispNicks.ContainsKey($primaryEntry.nickname)) {
         Set-DisplayPrimaryByPattern -Pattern $dispNicks[$primaryEntry.nickname].pattern | Out-Null
     } else { Write-Log "No primary display defined in profile." -Level WARN }
 
-    # ── Step 3: Deactivate unwanted displays ──
-    Write-Log "[3/5] Deactivating displays not in profile..." -Level STEP
-    if ($keepPatterns.Count -gt 0) { Disable-DisplaysExcept -KeepPatterns $keepPatterns | Out-Null }
-    Show-ActiveDisplays
-
-    # ── Step 4: Resolution, DPI, HDR per display ──
-    Write-Log "[4/5] Applying resolution / DPI / HDR..." -Level STEP
+    # ── Step 3: Resolution, DPI, HDR per display ──
+    Write-Log "[3/4] Applying resolution / DPI / HDR..." -Level STEP
     foreach ($d in $prof.displays) {
         if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
         $pattern = $dispNicks[$d.nickname].pattern
@@ -1811,7 +1967,7 @@ function Invoke-Profile {
     }
 
     # ── Step 5: Audio ──
-    Write-Log "[5/5] Applying audio..." -Level STEP
+    Write-Log "[4/4] Applying audio..." -Level STEP
     foreach ($a in $prof.audio) {
         if (-not $audioNicks.ContainsKey($a.nickname)) {
             Write-Log "Audio nickname '$($a.nickname)' not registered. Skipping." -Level WARN; continue
@@ -1962,7 +2118,7 @@ function Read-ResolutionForDisplay {
 
     $modes = Get-DisplayModesForPattern -Pattern $Pattern
     if ($modes.Count -eq 0) {
-        Write-Log "Could not query modes for '$Nickname' — enter manually." -Level WARN
+        Write-Log "Could not query modes for '$Nickname' - enter manually." -Level WARN
         $w = [uint32](Read-Host "  Width (e.g. 1920)")
         $h = [uint32](Read-Host "  Height (e.g. 1080)")
         $hz= [uint32](Read-Host "  Refresh Hz (e.g. 60)")
@@ -2013,7 +2169,7 @@ function Show-ResolutionPickerDialog {
     $script:RP_Result  = $null
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Resolution — $Nickname"
+    $form.Text = "Resolution - $Nickname"
     $form.Size = New-Object System.Drawing.Size(420, 340)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
@@ -2102,7 +2258,7 @@ function Show-ResolutionPickerDialog {
         $lblStatus.Text = if ($script:RP_Modes.Count -gt 0) {
             "Filtered to $($script:RP_Modes.Count) modes reported by Windows."
         } else {
-            "Could not query modes — showing common presets."
+            "Could not query modes - showing common presets."
         }
         SyncResCombo
     })
@@ -2539,13 +2695,13 @@ function Show-ProfileSwitcherGui {
 
         $editForm = New-Object System.Windows.Forms.Form
         $editForm.Text = "Edit Profile: $profName"
-        $editForm.Size = New-Object System.Drawing.Size(660, 600)
+        $editForm.Size = New-Object System.Drawing.Size(760, 600)
         $editForm.StartPosition = 'CenterParent'
         $editForm.FormBorderStyle = 'Sizable'
         $editForm.MaximizeBox = $true
 
         $outerTabs = New-Object System.Windows.Forms.TabControl
-        $outerTabs.Top = 4; $outerTabs.Left = 4; $outerTabs.Width = 636; $outerTabs.Height = 514
+        $outerTabs.Top = 4; $outerTabs.Left = 4; $outerTabs.Width = 736; $outerTabs.Height = 514
         $outerTabs.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor
                             [System.Windows.Forms.AnchorStyles]::Bottom -bor
                             [System.Windows.Forms.AnchorStyles]::Left -bor
@@ -2574,7 +2730,7 @@ function Show-ProfileSwitcherGui {
         $tabFriendly.Controls.Add($lblDispSec)
 
         $dgvD = New-Object System.Windows.Forms.DataGridView
-        $dgvD.Top = 26; $dgvD.Left = 4; $dgvD.Width = 620; $dgvD.Height = 140
+        $dgvD.Top = 26; $dgvD.Left = 4; $dgvD.Width = 720; $dgvD.Height = 140
         $dgvD.AllowUserToAddRows = $false; $dgvD.AllowUserToDeleteRows = $false
         $dgvD.RowHeadersVisible = $false; $dgvD.SelectionMode = 'FullRowSelect'
         $dgvD.AutoSizeColumnsMode = 'None'; $dgvD.EditMode = 'EditOnEnter'
@@ -2597,9 +2753,14 @@ function Show-ProfileSwitcherGui {
         $colDHdr     = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
         $colDHdr.HeaderText = "HDR"; $colDHdr.Width = 90; $colDHdr.Name = "HDR"; $colDHdr.FlatStyle = 'Flat'
         foreach ($o in $hdrOptions) { [void]$colDHdr.Items.Add($o) }
+        $colDMirror  = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+        $colDMirror.HeaderText = "Mirror Of"; $colDMirror.Width = 100; $colDMirror.Name = "MirrorOf"; $colDMirror.FlatStyle = 'Flat'
+        [void]$colDMirror.Items.Add("(extend)")
+        foreach ($d2 in $prof.displays) { [void]$colDMirror.Items.Add($d2.nickname) }
         [void]$dgvD.Columns.Add($colDNick); [void]$dgvD.Columns.Add($colDActive)
         [void]$dgvD.Columns.Add($colDPrimary); [void]$dgvD.Columns.Add($colDRes)
         [void]$dgvD.Columns.Add($colDDpi); [void]$dgvD.Columns.Add($colDHdr)
+        [void]$dgvD.Columns.Add($colDMirror)
 
         foreach ($d in $prof.displays) {
             $resStr = if ($d.width -and $d.height -and $d.refreshRate) { "$($d.width)x$($d.height) @ $($d.refreshRate)Hz" } else { "(don't change)" }
@@ -2609,8 +2770,9 @@ function Show-ProfileSwitcherGui {
                             else { $null }
             $dpiStr = if ($null -ne $dpiEffective) { "$dpiEffective%" } else { "(don't change)" }
             if ($dpiStr -ne "(don't change)" -and $colDDpi.Items.IndexOf($dpiStr) -lt 0) { [void]$colDDpi.Items.Add($dpiStr) }
-            $hdrStr = if ($null -eq $d.hdr) { "(don't change)" } elseif ([bool]$d.hdr) { "On" } else { "Off" }
-            [void]$dgvD.Rows.Add($d.nickname, [bool]$d.active, [bool]$d.primary, $resStr, $dpiStr, $hdrStr)
+            $hdrStr    = if ($null -eq $d.hdr) { "(don't change)" } elseif ([bool]$d.hdr) { "On" } else { "Off" }
+            $mirrorStr = if ($d.mirrorOf -and $colDMirror.Items.IndexOf($d.mirrorOf) -ge 0) { $d.mirrorOf } else { "(extend)" }
+            [void]$dgvD.Rows.Add($d.nickname, [bool]$d.active, [bool]$d.primary, $resStr, $dpiStr, $hdrStr, $mirrorStr)
         }
 
         # --- Audio DataGridView ---
@@ -2621,7 +2783,7 @@ function Show-ProfileSwitcherGui {
         $tabFriendly.Controls.Add($lblAudioSec)
 
         $dgvA = New-Object System.Windows.Forms.DataGridView
-        $dgvA.Top = 194; $dgvA.Left = 4; $dgvA.Width = 620; $dgvA.Height = 110
+        $dgvA.Top = 194; $dgvA.Left = 4; $dgvA.Width = 720; $dgvA.Height = 110
         $dgvA.AllowUserToAddRows = $false; $dgvA.AllowUserToDeleteRows = $false
         $dgvA.RowHeadersVisible = $false; $dgvA.SelectionMode = 'FullRowSelect'
         $dgvA.AutoSizeColumnsMode = 'None'; $dgvA.EditMode = 'EditOnEnter'
@@ -2650,7 +2812,7 @@ function Show-ProfileSwitcherGui {
         $tabFriendly.Controls.Add($lblProcSec)
 
         $dgvP = New-Object System.Windows.Forms.DataGridView
-        $dgvP.Top = 332; $dgvP.Left = 4; $dgvP.Width = 620; $dgvP.Height = 112
+        $dgvP.Top = 332; $dgvP.Left = 4; $dgvP.Width = 720; $dgvP.Height = 112
         $dgvP.AllowUserToAddRows = $true; $dgvP.AllowUserToDeleteRows = $true
         $dgvP.RowHeadersVisible = $false; $dgvP.SelectionMode = 'FullRowSelect'
         $dgvP.AutoSizeColumnsMode = 'None'; $dgvP.EditMode = 'EditOnEnter'
@@ -2682,7 +2844,7 @@ function Show-ProfileSwitcherGui {
         $tabJson.Controls.Add($lblJsonInfo)
 
         $txtJson = New-Object System.Windows.Forms.TextBox
-        $txtJson.Top = 28; $txtJson.Left = 4; $txtJson.Width = 622; $txtJson.Height = 460
+        $txtJson.Top = 28; $txtJson.Left = 4; $txtJson.Width = 722; $txtJson.Height = 460
         $txtJson.Multiline = $true; $txtJson.ScrollBars = 'Both'; $txtJson.WordWrap = $false
         $txtJson.Font = New-Object System.Drawing.Font("Consolas", 9)
         $txtJson.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor
@@ -2738,12 +2900,15 @@ function Show-ProfileSwitcherGui {
                     if ($dpiVal -and $dpiVal -ne "(don't change)" -and $dpiVal -match '^(\d+)%$') { $dpiPct = [uint32]$Matches[1] }
                     $hdrVal = $row.Cells["HDR"].Value
                     $hdrBool = if ($hdrVal -eq "On") { $true } elseif ($hdrVal -eq "Off") { $false } else { $null }
+                    $moVal = $row.Cells["MirrorOf"].Value
+                    $mo = if ($moVal -and $moVal -ne "(extend)" -and $moVal -ne $nick) { $moVal } else { $null }
                     $newDisp += [ordered]@{
                         nickname    = $nick
                         active      = [bool]$row.Cells["Active"].Value
                         primary     = [bool]$row.Cells["Primary"].Value
                         width       = $w; height = $h; refreshRate = $hz
                         dpiPercent  = $dpiPct; hdr = $hdrBool; rotation = $null
+                        mirrorOf    = $mo
                     }
                 }
 
