@@ -498,15 +498,15 @@ public static class DisplayNative
         return ChangeDisplaySettingsExW(gdiDeviceName, ref dm, IntPtr.Zero, CDS_UPDATEREGISTRY, IntPtr.Zero);
     }
 
-    // Enable a monitor by friendly-name substring (adds to active set)
+    // Enable a monitor by pattern (adds to active set).
+    // Pattern "@ADAPTER:HIGH-LOW:TARGETID" -> hardware identity match; anything else -> FriendlyName substring.
     public static int EnableMonitorByName(string monitorName)
     {
         DISPLAYCONFIG_PATH_INFO[] active; DISPLAYCONFIG_MODE_INFO[] activeModes;
         GetAllPaths(QDC_ONLY_ACTIVE_PATHS, out active, out activeModes);
         foreach (var p in active)
         {
-            var n = GetTargetDeviceName(p.targetInfo.adapterId, p.targetInfo.id).monitorFriendlyDeviceName ?? "";
-            if (n.IndexOf(monitorName, StringComparison.OrdinalIgnoreCase) >= 0) return 0; // already active
+            if (MatchPath(p, monitorName)) return 0; // already active
         }
 
         DISPLAYCONFIG_PATH_INFO[] all; DISPLAYCONFIG_MODE_INFO[] allModes;
@@ -515,8 +515,7 @@ public static class DisplayNative
         DISPLAYCONFIG_PATH_INFO? found = null, fallback = null;
         foreach (var p in all)
         {
-            var n = GetTargetDeviceName(p.targetInfo.adapterId, p.targetInfo.id).monitorFriendlyDeviceName ?? "";
-            if (n.IndexOf(monitorName, StringComparison.OrdinalIgnoreCase) >= 0)
+            if (MatchPath(p, monitorName))
             {
                 if (p.targetInfo.targetAvailable != 0) { found = p; break; }
                 if (fallback == null) fallback = p;
@@ -537,24 +536,25 @@ public static class DisplayNative
         return SetDisplayConfig((uint)newPaths.Length, newPaths, (uint)activeModes.Length, activeModes, flags);
     }
 
-    // Deactivate all monitors NOT matching any of keepNames
+    // Deactivate all monitors NOT matching any of keepNames.
+    // Each keepName may be "@ADAPTER:HIGH-LOW:TARGETID" for hardware identity or a FriendlyName substring.
     public static int DeactivateAllExcept(string[] keepNames)
     {
         DISPLAYCONFIG_PATH_INFO[] paths; DISPLAYCONFIG_MODE_INFO[] modes;
         GetAllPaths(QDC_ONLY_ACTIVE_PATHS, out paths, out modes);
         for (int i = 0; i < paths.Length; i++)
         {
-            var n = GetTargetDeviceName(paths[i].targetInfo.adapterId, paths[i].targetInfo.id).monitorFriendlyDeviceName ?? "";
             bool keep = false;
             foreach (var kn in keepNames)
-                if (n.IndexOf(kn, StringComparison.OrdinalIgnoreCase) >= 0) { keep = true; break; }
+                if (MatchPath(paths[i], kn)) { keep = true; break; }
             if (!keep) paths[i].flags &= ~DISPLAYCONFIG_PATH_ACTIVE;
         }
         uint flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
         return SetDisplayConfig((uint)paths.Length, paths, (uint)modes.Length, modes, flags);
     }
 
-    // Move named monitor to position (0,0) = primary
+    // Move named monitor to position (0,0) = primary.
+    // Pattern "@ADAPTER:HIGH-LOW:TARGETID" -> hardware identity match; anything else -> FriendlyName substring.
     public static int SetPrimaryByName(string monitorName)
     {
         DISPLAYCONFIG_PATH_INFO[] paths; DISPLAYCONFIG_MODE_INFO[] modes;
@@ -562,8 +562,7 @@ public static class DisplayNative
         int primaryIdx = -1;
         for (int i = 0; i < paths.Length; i++)
         {
-            var n = GetTargetDeviceName(paths[i].targetInfo.adapterId, paths[i].targetInfo.id).monitorFriendlyDeviceName ?? "";
-            if (n.IndexOf(monitorName, StringComparison.OrdinalIgnoreCase) >= 0) { primaryIdx = i; break; }
+            if (MatchPath(paths[i], monitorName)) { primaryIdx = i; break; }
         }
         if (primaryIdx < 0) return -1;
         uint modeIdx = paths[primaryIdx].sourceInfo.modeInfoIdx;
@@ -586,13 +585,39 @@ public static class DisplayNative
         return s.adapterId.HighPart.ToString() + "_" + s.adapterId.LowPart.ToString() + "_" + s.id.ToString();
     }
 
+    // Match a CCD path against a pattern string.
+    // Pattern "@ADAPTER:HIGH-LOW:TARGETID" -> exact hardware identity match (adapterLUID + targetId).
+    // Any other string -> FriendlyName substring match (case-insensitive), original behaviour.
+    private static bool MatchPath(DISPLAYCONFIG_PATH_INFO p, string pattern)
+    {
+        if (pattern != null && pattern.StartsWith("@ADAPTER:"))
+        {
+            var rest  = pattern.Substring(9).Split(':');
+            if (rest.Length == 2)
+            {
+                var lp = rest[0].Split('-');
+                if (lp.Length == 2 &&
+                    int.TryParse(lp[0],  out int  hi) &&
+                    uint.TryParse(lp[1], out uint lo) &&
+                    uint.TryParse(rest[1], out uint tid))
+                {
+                    return p.targetInfo.adapterId.HighPart == hi &&
+                           p.targetInfo.adapterId.LowPart  == lo &&
+                           p.targetInfo.id == tid;
+                }
+            }
+            return false;
+        }
+        var n = GetTargetDeviceName(p.targetInfo.adapterId, p.targetInfo.id).monitorFriendlyDeviceName ?? "";
+        return n.Length > 0 && n.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
     private static List<DISPLAYCONFIG_PATH_INFO> FindPathCandidates(DISPLAYCONFIG_PATH_INFO[] allPaths, string pattern)
     {
         var found = new List<DISPLAYCONFIG_PATH_INFO>();
         foreach (var p in allPaths)
         {
-            var n = GetTargetDeviceName(p.targetInfo.adapterId, p.targetInfo.id).monitorFriendlyDeviceName ?? "";
-            if (n.Length > 0 && n.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0)
+            if (MatchPath(p, pattern))
                 found.Add(p);
         }
         found.Sort((a, b) => b.targetInfo.targetAvailable.CompareTo(a.targetInfo.targetAvailable));
@@ -1031,27 +1056,39 @@ function ConvertTo-Hashtable {
 # =============================================================================
 
 function Register-DisplayNickname {
+    # Design: nickname maps to a physical monitor via hardware identity only.
+    # No name-pattern matching — patterns are ambiguous for identical models.
+    # Matching priority (see Get-DisplayNicknameFor):
+    #   1. adapterLUID + targetId  (exact GPU port, runtime-stable within session)
+    #   2. edidManufactureId + edidProductCodeId + connectorInstance [+ serial if stored]
+    #      (stable across reboots when monitor stays on same port type)
     param(
         [Parameter(Mandatory)][string]$Nickname,
-        [Parameter(Mandatory)][string]$Pattern,
-        [string]$Notes = '',
-        [string]$Guid  = $null,
-        [string]$AdapterLUID = $null,
-        [string]$TargetId    = $null
+        [string]$Notes            = '',
+        [string]$FriendlyName     = $null,
+        [string]$AdapterLUID      = $null,
+        [string]$TargetId         = $null,
+        [int]   $ConnectorInstance = -1,
+        [int]   $EdidManufactureId = 0,
+        [int]   $EdidProductCodeId = 0,
+        [string]$Serial           = $null
     )
     $state = ConvertTo-Hashtable (Get-State)
-    if ($state.displays.Contains($Nickname) -and $state.displays[$Nickname].pattern -ne $Pattern) {
-        Write-Log "Nickname '$Nickname' previously -> '$($state.displays[$Nickname].pattern)'. Overwriting." -Level WARN
+    if ($state.displays.Contains($Nickname)) {
+        Write-Log "Overwriting display nickname '$Nickname'." -Level WARN
     }
     $state.displays[$Nickname] = [ordered]@{
-        pattern     = $Pattern
-        notes       = $Notes
-        guid        = $Guid
-        adapterLUID = $AdapterLUID
-        targetId    = $TargetId
+        notes             = $Notes
+        friendlyName      = $FriendlyName
+        adapterLUID       = $AdapterLUID
+        targetId          = $TargetId
+        connectorInstance = $ConnectorInstance
+        edidManufactureId = $EdidManufactureId
+        edidProductCodeId = $EdidProductCodeId
+        serial            = $Serial
     }
     Save-State $state
-    Write-Log "Display nickname '$Nickname' -> '$Pattern' saved." -Level OK
+    Write-Log "Display nickname '$Nickname' -> '$FriendlyName' (conn#$ConnectorInstance) saved." -Level OK
 }
 
 function Register-AudioNickname {
@@ -1086,22 +1123,25 @@ function Remove-Nickname {
 }
 
 function Get-DisplayNicknameFor {
+    # Design: three-tier hardware-identity lookup, NO FriendlyName pattern matching.
+    # Tier 1 — adapterLUID + targetId: exact GPU port (changes only on driver reinit).
+    # Tier 2 — EDID mfr/product + connectorInstance [+ serial]: stable across reboots
+    #           when the monitor stays on the same connector type.
+    # Tier 3 — nothing found -> $null.
     param(
-        [Parameter(Mandatory)][string]$FriendlyName,
-        [string]$Guid,          # kept for backwards compat; NOT used for lookup — it's the shared Monitor class GUID
-        [string]$AdapterLUID,   # unique per GPU port (CCD targetInfo.adapterId)
-        [string]$TargetId       # unique per target connector
+        [string]$FriendlyName     = '',   # informational only, not used for lookup
+        [string]$Guid             = $null, # legacy param, unused
+        [string]$AdapterLUID      = '',
+        [string]$TargetId         = '',
+        [int]   $ConnectorInstance = -1,
+        [int]   $EdidManufactureId = 0,
+        [int]   $EdidProductCodeId = 0,
+        [string]$Serial           = ''
     )
     $state = Get-State
     if (-not $state.displays) { return $null }
-    # Primary: pattern substring match
-    foreach ($nick in $state.displays.PSObject.Properties.Name) {
-        $pat = $state.displays.$nick.pattern
-        if ($pat -and $FriendlyName -match [regex]::Escape($pat)) { return $nick }
-    }
-    # Fallback: hardware identity — AdapterLUID+TargetId are unique per CCD path
-    # (GUID is intentionally not used: monitorDevicePath ends with the Windows Monitor
-    #  device-interface class GUID which is the same for every display on the system)
+
+    # Tier 1: exact GPU port
     if ($AdapterLUID -and $TargetId) {
         foreach ($nick in $state.displays.PSObject.Properties.Name) {
             $e = $state.displays.$nick
@@ -1111,6 +1151,22 @@ function Get-DisplayNicknameFor {
             }
         }
     }
+
+    # Tier 2: EDID identity + connector instance
+    if ($EdidManufactureId -ne 0 -and $EdidProductCodeId -ne 0 -and $ConnectorInstance -ge 0) {
+        foreach ($nick in $state.displays.PSObject.Properties.Name) {
+            $e = $state.displays.$nick
+            if ([int]$e.edidManufactureId -eq $EdidManufactureId -and
+                [int]$e.edidProductCodeId -eq $EdidProductCodeId -and
+                [int]$e.connectorInstance -eq $ConnectorInstance) {
+                # If a serial is stored it must also match; absent serial on either side = accept
+                if (-not $e.serial -or -not $Serial -or $e.serial -eq $Serial) {
+                    return $nick
+                }
+            }
+        }
+    }
+
     return $null
 }
 
@@ -1136,19 +1192,24 @@ function Get-AudioNicknameFor {
 }
 
 function Test-DisplayNicknameDuplicates {
+    # Design: checks hardware-identity keys for collisions; pattern/guid checks removed
+    # because the new schema no longer stores those fields.
     $state = Get-State; if (-not $state.displays) { return }
-    $seenPat = @{}; $seenGuid = @{}
+    $seenPort = @{}   # "adapterLUID|targetId" -> nick
+    $seenEdid = @{}   # "mfr|product|conn" -> nick
     foreach ($nick in $state.displays.PSObject.Properties.Name) {
         $e = $state.displays.$nick
-        if ($e.pattern) {
-            if ($seenPat.ContainsKey($e.pattern)) {
-                Write-Log "Duplicate pattern '$($e.pattern)': nicknames '$($seenPat[$e.pattern])' and '$nick'." -Level WARN
-            } else { $seenPat[$e.pattern] = $nick }
+        if ($e.adapterLUID -and $e.targetId) {
+            $k = "$($e.adapterLUID)|$($e.targetId)"
+            if ($seenPort.ContainsKey($k)) {
+                Write-Log "Duplicate GPU port ($k): nicknames '$($seenPort[$k])' and '$nick'." -Level WARN
+            } else { $seenPort[$k] = $nick }
         }
-        if ($e.guid) {
-            if ($seenGuid.ContainsKey($e.guid)) {
-                Write-Log "Duplicate guid '$($e.guid)': nicknames '$($seenGuid[$e.guid])' and '$nick'." -Level WARN
-            } else { $seenGuid[$e.guid] = $nick }
+        if ($e.edidManufactureId -and $e.edidProductCodeId) {
+            $k = "$($e.edidManufactureId)|$($e.edidProductCodeId)|$($e.connectorInstance)"
+            if ($seenEdid.ContainsKey($k)) {
+                Write-Log "Duplicate EDID identity ($k): nicknames '$($seenEdid[$k])' and '$nick'." -Level WARN
+            } else { $seenEdid[$k] = $nick }
         }
     }
 }
@@ -1199,15 +1260,42 @@ function Get-DisplayDeviceGuid {
     return $null
 }
 
+function Resolve-WmiSerial {
+    param([string]$MonitorDevicePath, [hashtable]$WmiMap)
+    # MonitorDevicePath: \\?\DISPLAY#HWID#INST&UID...#{GUID}
+    # WMI InstanceName:  DISPLAY\HWID\INST_N
+    if (-not $MonitorDevicePath -or $WmiMap.Count -eq 0) { return '' }
+    $parts = ($MonitorDevicePath -replace '^\\\\\?\\', '') -split '#'
+    if ($parts.Count -lt 3) { return '' }
+    $hwId = $parts[1]
+    $inst = ($parts[2] -split '&UID')[0]
+    foreach ($key in $WmiMap.Keys) {
+        $kp = $key -split '\\'
+        if ($kp.Count -ge 3 -and $kp[1] -eq $hwId -and ($kp[2] -replace '_\d+$', '') -eq $inst) {
+            return $WmiMap[$key]
+        }
+    }
+    return ''
+}
+
 function Get-AllDisplayPaths {
     <#
     .SYNOPSIS
         Returns every display path (active+inactive) with resolved names,
-        GDI device name, current mode, DPI, HDR, position.
+        GDI device name, current mode, DPI, HDR, position, and serial number.
     #>
     [DisplayNative+DISPLAYCONFIG_PATH_INFO[]]$paths = $null
     [DisplayNative+DISPLAYCONFIG_MODE_INFO[]]$modes  = $null
     [DisplayNative]::GetAllPaths([DisplayNative]::QDC_ALL_PATHS, [ref]$paths, [ref]$modes)
+
+    $wmiMap = @{}
+    try {
+        Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $serial = ($_.SerialNumberID | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ }) -join ''
+                if ($serial) { $wmiMap[$_.InstanceName] = $serial }
+            }
+    } catch {}
 
     $result = @()
     foreach ($path in $paths) {
@@ -1262,6 +1350,8 @@ function Get-AllDisplayPaths {
             TargetAvailable   = [bool]$path.targetInfo.targetAvailable
             OutputTechnology  = ConvertTo-OutputTechnologyName -Value $path.targetInfo.outputTechnology
             ConnectorInstance = $devInfo.connectorInstance
+            EdidManufactureId = [int]$devInfo.edidManufactureId
+            EdidProductCodeId = [int]$devInfo.edidProductCodeId
             AdapterLUID       = "$($path.targetInfo.adapterId.HighPart)-$($path.targetInfo.adapterId.LowPart)"
             TargetId          = $path.targetInfo.id
             SourceAdapterLUID = "$($path.sourceInfo.adapterId.HighPart)-$($path.sourceInfo.adapterId.LowPart)"
@@ -1278,6 +1368,7 @@ function Get-AllDisplayPaths {
             HdrEnabled        = $hdrEnabled
             MonitorDevicePath = $devInfo.monitorDevicePath
             DeviceGuid        = Get-DisplayDeviceGuid -DevicePath $devInfo.monitorDevicePath
+            SerialNumber      = Resolve-WmiSerial -MonitorDevicePath $devInfo.monitorDevicePath -WmiMap $wmiMap
             Rotation          = $path.targetInfo.rotation
         }
     }
@@ -1296,6 +1387,60 @@ function Get-ActiveDisplayNames {
     return $names
 }
 
+function Resolve-DisplayPathForNickname {
+    <#
+    .SYNOPSIS
+        Returns the current active display path object for a nickname, resolved
+        purely by hardware identity (adapterLUID+targetId first, EDID second).
+        Returns $null if the physical monitor is not currently connected/active.
+    #>
+    # Design: single resolution point for all profile-apply and save-profile code.
+    # Callers never need FriendlyName matching — hardware keys are unambiguous.
+    param([Parameter(Mandatory)][string]$Nickname)
+    $entry = (Get-State).displays.$Nickname
+    if (-not $entry) { return $null }
+
+    $allPaths = Get-AllDisplayPaths | Where-Object { $_.Active }
+
+    # Tier 1: exact GPU port
+    if ($entry.adapterLUID -and $entry.targetId) {
+        $m = $allPaths | Where-Object {
+            $_.AdapterLUID -eq $entry.adapterLUID -and [string]$_.TargetId -eq [string]$entry.targetId
+        } | Select-Object -First 1
+        if ($m) { return $m }
+    }
+
+    # Tier 2: EDID + connector instance
+    if ([int]$entry.edidManufactureId -ne 0 -and [int]$entry.edidProductCodeId -ne 0) {
+        $m = $allPaths | Where-Object {
+            $_.EdidManufactureId -eq [int]$entry.edidManufactureId -and
+            $_.EdidProductCodeId -eq [int]$entry.edidProductCodeId -and
+            $_.ConnectorInstance -eq [int]$entry.connectorInstance -and
+            (-not $entry.serial -or -not $_.SerialNumber -or $_.SerialNumber -eq $entry.serial)
+        } | Select-Object -First 1
+        if ($m) { return $m }
+    }
+
+    return $null
+}
+
+function Get-HardwareKeyForNickname {
+    <#
+    .SYNOPSIS
+        Returns the "@ADAPTER:HIGH-LOW:TARGETID" hardware key string for a nickname.
+        This key is understood by all DisplayNative C# methods (ConfigureTopology,
+        EnableMonitorByName, SetPrimaryByName, etc.) and bypasses FriendlyName matching,
+        which is ambiguous for identical monitor models.
+        Returns $null if the nickname has no stored hardware identity.
+    #>
+    # Design: the @ADAPTER: key format routes by LUID+TargetId inside MatchPath()
+    # — the single C# match predicate that accepts both hardware keys and legacy substrings.
+    param([Parameter(Mandatory)][string]$Nickname)
+    $entry = (Get-State).displays.$Nickname
+    if (-not $entry -or -not $entry.adapterLUID -or -not $entry.targetId) { return $null }
+    return "@ADAPTER:$($entry.adapterLUID):$($entry.targetId)"
+}
+
 #endregion SECTION: Display_CCD_Low
 
 # =============================================================================
@@ -1303,7 +1448,18 @@ function Get-ActiveDisplayNames {
 # =============================================================================
 
 function Test-DisplayActive {
+    # Design: @ADAPTER: keys route directly to hardware identity without FriendlyName lookup.
+    # Legacy FriendlyName substring patterns still work for callers that haven't been updated.
     param([Parameter(Mandatory)][string]$Pattern)
+    if ($Pattern.StartsWith('@ADAPTER:')) {
+        $parts = $Pattern.Substring(9).Split(':')
+        if ($parts.Count -eq 2) {
+            $al = $parts[0]; $tid = $parts[1]
+            return [bool](Get-AllDisplayPaths | Where-Object {
+                $_.Active -and $_.AdapterLUID -eq $al -and [string]$_.TargetId -eq $tid
+            })
+        }
+    }
     return [bool](Get-ActiveDisplayNames | Where-Object { $_ -match [regex]::Escape($Pattern) })
 }
 
@@ -1355,7 +1511,12 @@ function Set-DisplayPrimaryByPattern {
         $ret = [DisplayNative]::SetPrimaryByName($Pattern)
         if ($ret -ge 0) {
             Start-Sleep -Milliseconds 1500
-            $confirmed = [bool](Get-AllDisplayPaths | Where-Object { $_.FriendlyName -match [regex]::Escape($Pattern) -and $_.Primary })
+            $confirmed = if ($Pattern.StartsWith('@ADAPTER:')) {
+                $kp = $Pattern.Substring(9).Split(':')
+                [bool](Get-AllDisplayPaths | Where-Object { $_.AdapterLUID -eq $kp[0] -and [string]$_.TargetId -eq $kp[1] -and $_.Primary })
+            } else {
+                [bool](Get-AllDisplayPaths | Where-Object { $_.FriendlyName -match [regex]::Escape($Pattern) -and $_.Primary })
+            }
             if ($confirmed) { Write-Log "'$Pattern' confirmed as primary." -Level OK; return $true }
             Write-Log "Not yet confirmed as primary. Retrying..." -Level WARN
         } else { Write-Log "SetPrimaryByName ret $ret. Retrying..." -Level WARN }
@@ -1388,10 +1549,13 @@ function Show-ActiveDisplays {
 }
 
 function Enable-AllKnownDisplays {
+    # Design: use hardware key (@ADAPTER:) so identical-model monitors are routed unambiguously.
     $state = Get-State
     if (-not $state.displays) { Write-Log "No display nicknames registered." -Level WARN; return }
     foreach ($nick in $state.displays.PSObject.Properties.Name) {
-        Enable-DisplayByPattern -Pattern $state.displays.$nick.pattern | Out-Null
+        $hwKey = Get-HardwareKeyForNickname -Nickname $nick
+        if ($hwKey) { Enable-DisplayByPattern -Pattern $hwKey | Out-Null }
+        else { Write-Log "No hardware identity stored for '$nick', skipping." -Level WARN }
     }
 }
 
@@ -1756,19 +1920,20 @@ function Save-ProfileInteractive {
         the current live state. -ResolutionPrompt controls whether to interactively
         override the resolution ('Console', 'Gui', 'None').
     #>
+    # Design: path lookup uses Resolve-DisplayPathForNickname (hardware identity) instead of
+    # FriendlyName pattern matching, so two identical monitors are distinguished correctly.
     param(
         [Parameter(Mandatory)][string]$Name,
         [ValidateSet('Console','Gui','None')][string]$ResolutionPrompt = 'Console'
     )
-    $state     = Get-State
-    $allPaths  = Get-AllDisplayPaths
+    $state = Get-State
 
     # Detect clone topology: displays sharing the same SourceAdapterLUID+SourceId are mirrored.
+    # Use Resolve-DisplayPathForNickname so identical-model monitors are matched by hardware identity.
     $sourceToNicks = @{}
     if ($state.displays) {
         foreach ($nick in $state.displays.PSObject.Properties.Name) {
-            $pat = $state.displays.$nick.pattern
-            $pi  = $allPaths | Where-Object { $_.Active -and $_.FriendlyName -match [regex]::Escape($pat) } | Select-Object -First 1
+            $pi = Resolve-DisplayPathForNickname -Nickname $nick
             if ($pi) {
                 $srcKey = "$($pi.SourceAdapterLUID)|$($pi.SourceId)"
                 if (-not $sourceToNicks.ContainsKey($srcKey)) { $sourceToNicks[$srcKey] = @() }
@@ -1776,14 +1941,14 @@ function Save-ProfileInteractive {
             }
         }
     }
-    $mirrorOfMap = @{}  # nick → mirrorOf nick (null = extend/source)
+    $mirrorOfMap = @{}  # nick -> mirrorOf nick (null = extend/source)
     foreach ($srcKey in $sourceToNicks.Keys) {
         $grp = $sourceToNicks[$srcKey]
         if ($grp.Count -lt 2) { continue }
         # Primary display in the group is the clone source; others mirror it
         $srcNick = $grp | Where-Object {
-            $pi2 = $allPaths | Where-Object { $_.Active -and $_.FriendlyName -match [regex]::Escape($state.displays.$_.pattern) -and $_.Primary } | Select-Object -First 1
-            $pi2 -ne $null
+            $pi2 = Resolve-DisplayPathForNickname -Nickname $_
+            $pi2 -and $pi2.Primary
         } | Select-Object -First 1
         if (-not $srcNick) { $srcNick = $grp[0] }
         foreach ($n in $grp) { if ($n -ne $srcNick) { $mirrorOfMap[$n] = $srcNick } }
@@ -1792,10 +1957,8 @@ function Save-ProfileInteractive {
     $displaySpecs = @()
     if ($state.displays) {
         foreach ($nick in $state.displays.PSObject.Properties.Name) {
-            $entry   = $state.displays.$nick
-            $pattern = $entry.pattern
-            $pathInfo = $allPaths | Where-Object { $_.FriendlyName -match [regex]::Escape($pattern) } | Select-Object -First 1
-            $active   = $pathInfo -and $pathInfo.Active
+            $pathInfo = Resolve-DisplayPathForNickname -Nickname $nick
+            $active   = $null -ne $pathInfo
             $primary  = $pathInfo -and $pathInfo.Primary
 
             # Snapshot current resolution/refresh
@@ -1809,8 +1972,8 @@ function Save-ProfileInteractive {
             # Allow override via interactive prompts
             if ($active -and $ResolutionPrompt -ne 'None') {
                 $override = switch ($ResolutionPrompt) {
-                    'Console' { Read-ResolutionForDisplay -Nickname $nick -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate -Pattern $pattern }
-                    'Gui'     { Show-ResolutionPickerDialog -Nickname $nick -Pattern $pattern -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate }
+                    'Console' { Read-ResolutionForDisplay -Nickname $nick -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate -Pattern $pathInfo.FriendlyName }
+                    'Gui'     { Show-ResolutionPickerDialog -Nickname $nick -Pattern $pathInfo.GdiDeviceName -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate }
                 }
                 if ($override) { $width = $override.Width; $height = $override.Height; $refreshRate = $override.Hz }
             }
@@ -1900,14 +2063,16 @@ function Invoke-Profile {
     # ConfigureTopology explicitly de-conflicts sources for extend displays.
     Write-Log "[1/4] Configuring display topology..." -Level STEP
 
-    # First pass: find which displays are mirrors of another (mirrorOf field)
-    $mirrorTargets = @{}  # sourceNick → @(mirrorPattern, ...)
+    # First pass: find which displays are mirrors of another (mirrorOf field).
+    # Design: use hardware keys (@ADAPTER:) so identical-model monitors are unambiguous.
+    $mirrorTargets = @{}  # sourceNick -> @(hwKey, ...)
     foreach ($d in $prof.displays) {
         if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
         $mo = $d.mirrorOf
         if ($mo -and $dispNicks.ContainsKey($mo)) {
             if (-not $mirrorTargets.ContainsKey($mo)) { $mirrorTargets[$mo] = @() }
-            $mirrorTargets[$mo] += $dispNicks[$d.nickname].pattern
+            $hwKey2 = Get-HardwareKeyForNickname -Nickname $d.nickname
+            if ($hwKey2) { $mirrorTargets[$mo] += $hwKey2 }
         }
     }
 
@@ -1919,13 +2084,14 @@ function Invoke-Profile {
         if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
         $mo = $d.mirrorOf
         if ($mo -and $dispNicks.ContainsKey($mo)) { continue }  # handled as part of clone group
-        $pat = $dispNicks[$d.nickname].pattern
+        $hwKey = Get-HardwareKeyForNickname -Nickname $d.nickname
+        if (-not $hwKey) { Write-Log "No hardware key for '$($d.nickname)', skipping." -Level WARN; continue }
         if ($mirrorTargets.ContainsKey($d.nickname)) {
             # This display is the source of a clone group
-            $grp = @($pat) + $mirrorTargets[$d.nickname]
+            $grp = @($hwKey) + $mirrorTargets[$d.nickname]
             [void]$cloneGroupsList.Add([string[]]$grp)
         } else {
-            [void]$extendPatterns.Add($pat)
+            [void]$extendPatterns.Add($hwKey)
         }
     }
 
@@ -1938,31 +2104,44 @@ function Invoke-Profile {
     Write-Log "[2/4] Setting primary display..." -Level STEP
     $primaryEntry = $prof.displays | Where-Object { $_.primary } | Select-Object -First 1
     if ($primaryEntry -and $dispNicks.ContainsKey($primaryEntry.nickname)) {
-        Set-DisplayPrimaryByPattern -Pattern $dispNicks[$primaryEntry.nickname].pattern | Out-Null
+        $primaryKey = Get-HardwareKeyForNickname -Nickname $primaryEntry.nickname
+        if ($primaryKey) {
+            Set-DisplayPrimaryByPattern -Pattern $primaryKey | Out-Null
+        } else { Write-Log "No hardware key for primary '$($primaryEntry.nickname)'." -Level WARN }
     } else { Write-Log "No primary display defined in profile." -Level WARN }
 
     # ── Step 3: Resolution, DPI, HDR per display ──
+    # Design: resolve each nickname to its current live path object via hardware identity.
+    # GdiDeviceName comes from the path, so no FriendlyName matching is needed for resolution.
     Write-Log "[3/4] Applying resolution / DPI / HDR..." -Level STEP
     foreach ($d in $prof.displays) {
         if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
-        $pattern = $dispNicks[$d.nickname].pattern
+        $path = Resolve-DisplayPathForNickname -Nickname $d.nickname
+        if (-not $path) { Write-Log "Nickname '$($d.nickname)' not connected, skipping settings." -Level WARN; continue }
 
-        # Resolution
-        if ($d.width -and $d.height -and $d.refreshRate) {
-            Set-DisplayModeForPattern -Pattern $pattern -Width $d.width -Height $d.height -Hz $d.refreshRate | Out-Null
+        if ($d.width -and $d.height -and $d.refreshRate -and $path.GdiDeviceName) {
+            Set-DisplayModeForGdiDevice -GdiDeviceName $path.GdiDeviceName -Width $d.width -Height $d.height -Hz $d.refreshRate | Out-Null
         }
 
-        # DPI (dpiScaling is the legacy field name)
         $effectiveDpi = if ($null -ne $d.dpiPercent -and $d.dpiPercent -gt 0) { $d.dpiPercent }
                         elseif ($null -ne $d.dpiScaling -and $d.dpiScaling -gt 0) { $d.dpiScaling }
                         else { $null }
         if ($null -ne $effectiveDpi) {
-            Set-DisplayDpi -Pattern $pattern -Percent $effectiveDpi | Out-Null
+            $luidParts = $path.SourceAdapterLUID -split '-'
+            $srcLuid = New-Object DisplayNative+LUID
+            $srcLuid.HighPart = [int]$luidParts[0]; $srcLuid.LowPart = [uint32]$luidParts[1]
+            $ok = [DisplayNative]::SetDpiPercent($srcLuid, $path.SourceId, $effectiveDpi)
+            if ($ok) { Write-Log "DPI $effectiveDpi% set on '$($d.nickname)'." -Level OK }
+            else     { Write-Log "Failed DPI on '$($d.nickname)'." -Level ERROR }
         }
 
-        # HDR
         if ($null -ne $d.hdr) {
-            Set-DisplayHdr -Pattern $pattern -Enabled ([bool]$d.hdr) | Out-Null
+            $luidParts = $path.AdapterLUID -split '-'
+            $tgtLuid = New-Object DisplayNative+LUID
+            $tgtLuid.HighPart = [int]$luidParts[0]; $tgtLuid.LowPart = [uint32]$luidParts[1]
+            $ok = [DisplayNative]::SetHdrEnabled($tgtLuid, [uint32]$path.TargetId, [bool]$d.hdr)
+            if ($ok) { Write-Log "HDR $($d.hdr) set on '$($d.nickname)'." -Level OK }
+            else     { Write-Log "Failed HDR on '$($d.nickname)'." -Level ERROR }
         }
     }
 
@@ -1996,13 +2175,15 @@ function Start-DeviceIdentificationWizard {
     Test-AudioNicknameDuplicates
 
     # ── Displays ──
+    # Design: active-only so hardware identity (adapterLUID+targetId) is always valid and
+    # EDID fields are populated. Inactive paths may have stale or zero EDID data.
     Write-Host ""
-    Write-Host "-- Displays (all known, active and inactive) --" -ForegroundColor Yellow
-    $rawDisplays = Get-AllDisplayPaths | Where-Object { $_.FriendlyName }
+    Write-Host "-- Displays (active only) --" -ForegroundColor Yellow
+    $rawDisplays = Get-AllDisplayPaths | Where-Object { $_.Active -and $_.FriendlyName }
 
-    # Collapse duplicate CCD paths (same adapter+target+guid+name) down to one entry
+    # Collapse duplicate CCD paths (same adapter+target+name) down to one entry
     $displayGroups = $rawDisplays | Group-Object -Property {
-        "$($_.AdapterLUID)|$($_.TargetId)|$($_.DeviceGuid)|$($_.FriendlyName)"
+        "$($_.AdapterLUID)|$($_.TargetId)|$($_.FriendlyName)"
     }
     $displays = foreach ($g in $displayGroups) {
         $best = $g.Group | Sort-Object @{E={-not $_.Active}}, @{E={-not $_.TargetAvailable}} | Select-Object -First 1
@@ -2011,14 +2192,19 @@ function Start-DeviceIdentificationWizard {
 
     $i = 0; $displayList = @()
     foreach ($d in $displays) {
-        $status  = if ($d.Active) { if ($d.Primary) {"active, PRIMARY"} else {"active"} } else {"inactive"}
-        $avail   = if ($d.TargetAvailable) { "cabled" } else { "NOT cabled" }
-        $nick    = Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId)
+        $status  = if ($d.Primary) {"active, PRIMARY"} else {"active"}
+        $nick    = Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid `
+                       -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId) `
+                       -ConnectorInstance $d.ConnectorInstance `
+                       -EdidManufactureId $d.EdidManufactureId -EdidProductCodeId $d.EdidProductCodeId `
+                       -Serial $d.SerialNumber
         $nickTag = if ($nick) { "  [nickname: $nick]" } else { "" }
-        $modeStr = if ($d.Active -and $d.Width) { " $($d.Width)x$($d.Height)@$($d.RefreshHz)Hz" } else { "" }
-        Write-Host ("  [{0}] {1}{2}  ({3}, {4})" -f $i, $d.FriendlyName, $modeStr, $status, $avail) -NoNewline
+        $modeStr = if ($d.Width) { " $($d.Width)x$($d.Height)@$($d.RefreshHz)Hz" } else { "" }
+        Write-Host ("  [{0}] {1}{2}  ({3})" -f $i, $d.FriendlyName, $modeStr, $status) -NoNewline
         if ($nick) { Write-Host $nickTag -ForegroundColor Green } else { Write-Host "" }
         Write-Host ("       via {0}, conn#{1}, adapter {2}" -f $d.OutputTechnology, $d.ConnectorInstance, $d.AdapterLUID) -ForegroundColor DarkGray
+        Write-Host ("       EDID mfr=$($d.EdidManufactureId) prod=$($d.EdidProductCodeId)") -ForegroundColor DarkGray
+        if ($d.SerialNumber)      { Write-Host "       serial: $($d.SerialNumber)" -ForegroundColor DarkGray }
         if ($d.MonitorDevicePath) { Write-Host "       path: $($d.MonitorDevicePath)" -ForegroundColor DarkGray }
         if ($d.DuplicateCount -gt 1) { Write-Host "       ($($d.DuplicateCount) duplicate paths collapsed)" -ForegroundColor DarkGray }
         $displayList += $d; $i++
@@ -2069,14 +2255,21 @@ function Start-DeviceIdentificationWizard {
             $idx = [int]$choice
             if ($idx -lt 0 -or $idx -ge $displayList.Count) { Write-Host "Invalid display index." -ForegroundColor Red; continue }
             $dev = $displayList[$idx]
-            $existingNick = Get-DisplayNicknameFor -FriendlyName $dev.FriendlyName -Guid $dev.DeviceGuid -AdapterLUID $dev.AdapterLUID -TargetId ([string]$dev.TargetId)
+            $existingNick = Get-DisplayNicknameFor -FriendlyName $dev.FriendlyName -Guid $dev.DeviceGuid `
+                                -AdapterLUID $dev.AdapterLUID -TargetId ([string]$dev.TargetId) `
+                                -ConnectorInstance $dev.ConnectorInstance `
+                                -EdidManufactureId $dev.EdidManufactureId -EdidProductCodeId $dev.EdidProductCodeId `
+                                -Serial $dev.SerialNumber
             $suffix = if ($existingNick) { " [currently: $existingNick]" } else { "" }
             $nickname = Read-Host "  Nickname for '$($dev.FriendlyName)'$suffix"
             if ([string]::IsNullOrWhiteSpace($nickname)) { continue }
-            $pattern = Read-Host "  Match pattern [default: '$($dev.FriendlyName)']"
-            if ([string]::IsNullOrWhiteSpace($pattern)) { $pattern = $dev.FriendlyName }
+            # No pattern prompt: matching is by hardware identity (adapterLUID+targetId / EDID)
             if ($existingNick -and $existingNick -ne $nickname) { Remove-Nickname -Kind displays -Nickname $existingNick }
-            Register-DisplayNickname -Nickname $nickname -Pattern $pattern -Guid $dev.DeviceGuid -AdapterLUID $dev.AdapterLUID -TargetId ([string]$dev.TargetId)
+            Register-DisplayNickname -Nickname $nickname -FriendlyName $dev.FriendlyName `
+                -AdapterLUID $dev.AdapterLUID -TargetId ([string]$dev.TargetId) `
+                -ConnectorInstance $dev.ConnectorInstance `
+                -EdidManufactureId $dev.EdidManufactureId -EdidProductCodeId $dev.EdidProductCodeId `
+                -Serial $dev.SerialNumber
             Test-DisplayNicknameDuplicates
         }
         else { Write-Host "Unrecognized input." -ForegroundColor Red }
@@ -2275,11 +2468,9 @@ function Show-ResolutionPickerGuiForAllDisplays {
     if (-not $state.displays -or @($state.displays.PSObject.Properties).Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("No display nicknames registered. Run 'Identify Devices' first.") | Out-Null; return
     }
-    $allPaths = Get-AllDisplayPaths
     foreach ($nick in $state.displays.PSObject.Properties.Name) {
-        $pat  = $state.displays.$nick.pattern
-        $path = $allPaths | Where-Object { $_.Active -and $_.FriendlyName -match [regex]::Escape($pat) } | Select-Object -First 1
-        [void](Show-ResolutionPickerDialog -Nickname $nick -Pattern $pat `
+        $path = Resolve-DisplayPathForNickname -Nickname $nick
+        [void](Show-ResolutionPickerDialog -Nickname $nick -Pattern ($path.GdiDeviceName ?? $path.FriendlyName) `
             -CurrentWidth  ($path.Width)    `
             -CurrentHeight ($path.Height)   `
             -CurrentHz     ($path.RefreshHz)`
@@ -2293,6 +2484,118 @@ function Show-ResolutionPickerGuiForAllDisplays {
 #region SECTION: GUI_Identification_Wizard
 # =============================================================================
 
+function Show-MonitorIdentifyOverlays {
+    <#
+    .SYNOPSIS
+        Flashes a numbered, full-screen overlay on every active monitor (like Windows Identify).
+        Shows nickname (if assigned), friendly name, GDI device, resolution, and serial.
+        Dismisses on click, any key, or after 5 seconds. Safe to call from within ShowDialog.
+    #>
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+
+    $activePaths = Get-AllDisplayPaths | Where-Object { $_.Active -and $_.GdiDeviceName }
+    $screens     = [System.Windows.Forms.Screen]::AllScreens
+
+    $overlayForms = [System.Collections.Generic.List[System.Windows.Forms.Form]]::new()
+    $idx = 0
+    foreach ($path in $activePaths) {
+        $screen = $screens | Where-Object { $_.DeviceName -eq $path.GdiDeviceName } | Select-Object -First 1
+        if (-not $screen) { continue }
+        $idx++
+
+        $nick  = if ($path.FriendlyName) {
+            Get-DisplayNicknameFor -FriendlyName $path.FriendlyName -Guid $path.DeviceGuid `
+                -AdapterLUID $path.AdapterLUID -TargetId ([string]$path.TargetId) -Serial $path.SerialNumber
+        } else { $null }
+        $label = if ($nick) { $nick } elseif ($path.FriendlyName) { $path.FriendlyName } else { $path.GdiDeviceName }
+        $sub   = "$($path.GdiDeviceName)  |  $($path.Width)x$($path.Height)@$($path.RefreshHz)Hz"
+        if ($path.SerialNumber) { $sub += "  |  S/N: $($path.SerialNumber)" }
+
+        $form = New-Object System.Windows.Forms.Form
+        $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+        $form.TopMost         = $true
+        $form.BackColor       = [System.Drawing.Color]::Black
+        $form.Opacity         = 0.82
+        # StartPosition must be Manual before Bounds is set; without it WinForms
+        # ignores the explicit coordinates and places the form on the primary screen.
+        $form.StartPosition   = [System.Windows.Forms.FormStartPosition]::Manual
+        $form.Bounds          = $screen.Bounds
+        $form.KeyPreview      = $true
+        $form.ShowInTaskbar   = $false
+
+        $lblNum  = New-Object System.Windows.Forms.Label
+        $lblNum.Text      = "$idx"
+        $lblNum.Font      = New-Object System.Drawing.Font('Segoe UI', 110, [System.Drawing.FontStyle]::Bold)
+        $lblNum.ForeColor = [System.Drawing.Color]::White
+        $lblNum.BackColor = [System.Drawing.Color]::Transparent
+        $lblNum.AutoSize  = $true
+
+        $lblName  = New-Object System.Windows.Forms.Label
+        $lblName.Text      = $label
+        $lblName.Font      = New-Object System.Drawing.Font('Segoe UI', 28, [System.Drawing.FontStyle]::Bold)
+        $lblName.ForeColor = [System.Drawing.Color]::White
+        $lblName.BackColor = [System.Drawing.Color]::Transparent
+        $lblName.AutoSize  = $true
+
+        $lblSub  = New-Object System.Windows.Forms.Label
+        $lblSub.Text      = $sub
+        $lblSub.Font      = New-Object System.Drawing.Font('Segoe UI', 13)
+        $lblSub.ForeColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
+        $lblSub.BackColor = [System.Drawing.Color]::Transparent
+        $lblSub.AutoSize  = $true
+
+        $lblHint  = New-Object System.Windows.Forms.Label
+        $lblHint.Text      = 'Click or press any key to dismiss'
+        $lblHint.Font      = New-Object System.Drawing.Font('Segoe UI', 11)
+        $lblHint.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 110)
+        $lblHint.BackColor = [System.Drawing.Color]::Transparent
+        $lblHint.AutoSize  = $true
+
+        $form | Add-Member -NotePropertyName _n -NotePropertyValue $lblNum  -Force
+        $form | Add-Member -NotePropertyName _t -NotePropertyValue $lblName -Force
+        $form | Add-Member -NotePropertyName _s -NotePropertyValue $lblSub  -Force
+        $form | Add-Member -NotePropertyName _h -NotePropertyValue $lblHint -Force
+        $form.Controls.AddRange(@($lblNum, $lblName, $lblSub, $lblHint))
+
+        $form.Add_Load({
+            $w = $this.ClientSize.Width; $h = $this.ClientSize.Height
+            $this._n.Left = [int](($w - $this._n.Width) / 2)
+            $this._n.Top  = [int]($h / 2 - $this._n.Height - 14)
+            $this._t.Left = [int](($w - $this._t.Width) / 2)
+            $this._t.Top  = $this._n.Bottom + 14
+            $this._s.Left = [int](($w - $this._s.Width) / 2)
+            $this._s.Top  = $this._t.Bottom + 10
+            $this._h.Left = [int](($w - $this._h.Width) / 2)
+            $this._h.Top  = $h - 52
+        })
+        $form.Add_Click({ $this.Close() })
+        $form.Add_KeyDown({ $this.Close() })
+
+        $overlayForms.Add($form)
+    }
+
+    if ($overlayForms.Count -eq 0) { return }
+
+    $script:_identForms = $overlayForms
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 5000
+    $script:_identTimer = $timer
+    $timer.Add_Tick({
+        $script:_identTimer.Stop()
+        foreach ($f in $script:_identForms) { if (-not $f.IsDisposed) { $f.Close() } }
+        [System.Windows.Forms.Application]::Exit()
+    })
+
+    foreach ($f in $overlayForms) { $f.Show() }
+    $timer.Start()
+    # Pump messages ourselves — avoids the "second message loop" error when called from ShowDialog
+    while ($overlayForms | Where-Object { -not $_.IsDisposed -and $_.Visible }) {
+        [System.Windows.Forms.Application]::DoEvents()
+        [System.Threading.Thread]::Sleep(16)
+    }
+    $timer.Stop()
+}
+
 function Show-DeviceIdentificationGui {
     <#
     .SYNOPSIS WinForms device identification wizard — no console popup. #>
@@ -2301,8 +2604,8 @@ function Show-DeviceIdentificationGui {
     Test-DisplayNicknameDuplicates
     Test-AudioNicknameDuplicates
 
-    # Enumerate + deduplicate displays
-    $rawDisplays   = Get-AllDisplayPaths | Where-Object { $_.FriendlyName }
+    # Enumerate + deduplicate displays — active only (inactive ports have no meaningful hardware identity)
+    $rawDisplays   = Get-AllDisplayPaths | Where-Object { $_.Active -and $_.FriendlyName }
     $displayGroups = $rawDisplays | Group-Object { "$($_.AdapterLUID)|$($_.TargetId)|$($_.DeviceGuid)|$($_.FriendlyName)" }
     $dispList = @(foreach ($g in $displayGroups) {
         $best = $g.Group | Sort-Object @{E={-not $_.Active}},@{E={-not $_.TargetAvailable}} | Select-Object -First 1
@@ -2335,10 +2638,11 @@ function Show-DeviceIdentificationGui {
     $lvD = New-Object System.Windows.Forms.ListView
     $lvD.Dock = 'Fill'; $lvD.View = 'Details'
     $lvD.FullRowSelect = $true; $lvD.GridLines = $true; $lvD.MultiSelect = $false
-    [void]$lvD.Columns.Add("Name",     200)
+    [void]$lvD.Columns.Add("Name",     185)
     [void]$lvD.Columns.Add("Status",    95)
-    [void]$lvD.Columns.Add("Mode",     130)
-    [void]$lvD.Columns.Add("Nickname", 195)
+    [void]$lvD.Columns.Add("Mode",     115)
+    [void]$lvD.Columns.Add("Conn#",     50)
+    [void]$lvD.Columns.Add("Nickname", 205)
     $tabD.Controls.Add($lvD)
 
     $tabA = New-Object System.Windows.Forms.TabPage
@@ -2351,15 +2655,18 @@ function Show-DeviceIdentificationGui {
     $pnlAudioFilter.BorderStyle = 'FixedSingle'
     $tabA.Controls.Add($pnlAudioFilter)
 
-    $chkShowDups = New-Object System.Windows.Forms.CheckBox
-    $chkShowDups.Text = "Show duplicates"; $chkShowDups.AutoSize = $true
-    $chkShowDups.Top = 6; $chkShowDups.Left = 6; $chkShowDups.Checked = $false
-    $pnlAudioFilter.Controls.Add($chkShowDups)
-
+    # "Show disabled" is first; "Also show duplicates" is second and independent.
+    # They must be separate: a duplicate device can be disabled, so ANDing both filters
+    # would require checking both boxes to see disabled duplicates — confusing and wrong.
     $chkShowDisabled = New-Object System.Windows.Forms.CheckBox
     $chkShowDisabled.Text = "Show disabled"; $chkShowDisabled.AutoSize = $true
-    $chkShowDisabled.Top = 6; $chkShowDisabled.Left = 180; $chkShowDisabled.Checked = $false
+    $chkShowDisabled.Top = 6; $chkShowDisabled.Left = 6; $chkShowDisabled.Checked = $false
     $pnlAudioFilter.Controls.Add($chkShowDisabled)
+
+    $chkShowDups = New-Object System.Windows.Forms.CheckBox
+    $chkShowDups.Text = "Also show duplicates"; $chkShowDups.AutoSize = $true
+    $chkShowDups.Top = 6; $chkShowDups.Left = 180; $chkShowDups.Checked = $false
+    $pnlAudioFilter.Controls.Add($chkShowDups)
 
     $lvA = New-Object System.Windows.Forms.ListView
     $lvA.Dock = 'Fill'; $lvA.View = 'Details'
@@ -2386,21 +2693,41 @@ function Show-DeviceIdentificationGui {
     $btnClearNick.Width = 150; $btnClearNick.Height = 34
     $form.Controls.Add($btnClearNick)
 
+    $btnIdentify = New-Object System.Windows.Forms.Button
+    $btnIdentify.Text = "Identify..."; $btnIdentify.Top = 324; $btnIdentify.Left = 368
+    $btnIdentify.Width = 110; $btnIdentify.Height = 34
+    $form.Controls.Add($btnIdentify)
+
     $btnDone = New-Object System.Windows.Forms.Button
     $btnDone.Text = "Done"; $btnDone.Top = 324; $btnDone.Left = 560
     $btnDone.Width = 112; $btnDone.Height = 34
     $form.Controls.Add($btnDone)
 
     # Script-block "methods" so closures in event handlers can invoke them via & operator
+    # Pre-compute which FriendlyNames are shared by multiple monitors (identical models)
+    $nameCount = @{}
+    foreach ($d in $dispList) { $nameCount[$d.FriendlyName] = ($nameCount[$d.FriendlyName] ?? 0) + 1 }
+
     $refreshDisplays = {
         $lvD.Items.Clear()
         foreach ($d in $dispList) {
-            $nick   = Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId)
+            $nick   = if ($d.FriendlyName) {
+                Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid `
+                    -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId) `
+                    -ConnectorInstance $d.ConnectorInstance `
+                    -EdidManufactureId $d.EdidManufactureId -EdidProductCodeId $d.EdidProductCodeId `
+                    -Serial $d.SerialNumber
+            } else { $null }
             $status = if ($d.Active) { if ($d.Primary) { "active, PRIMARY" } else { "active" } } else { "inactive" }
             $mode   = if ($d.Active -and $d.Width) { "$($d.Width)x$($d.Height)@$($d.RefreshHz)Hz" } else { "" }
-            $item   = New-Object System.Windows.Forms.ListViewItem($d.FriendlyName)
+            # When multiple monitors share the same model name, append connector instance so they're distinguishable
+            $displayName = if ($nameCount[$d.FriendlyName] -gt 1) {
+                "$($d.FriendlyName) [conn#$($d.ConnectorInstance)]"
+            } else { $d.FriendlyName }
+            $item = New-Object System.Windows.Forms.ListViewItem($displayName)
             [void]$item.SubItems.Add($status)
             [void]$item.SubItems.Add($mode)
+            [void]$item.SubItems.Add($d.ConnectorInstance)
             [void]$item.SubItems.Add($(if ($nick) { $nick } else { "" }))
             $item.Tag = $d
             if ($nick) { $item.ForeColor = [System.Drawing.Color]::DarkGreen }
@@ -2414,14 +2741,22 @@ function Show-DeviceIdentificationGui {
         # Count for checkbox labels (always from full list)
         $dupCount  = @($audioList | Where-Object { $_.DuplicateCount -gt 1 }).Count
         $disCount  = @($audioList | Where-Object { $_.State -ne 1 }).Count
-        $chkShowDups.Text     = "Show duplicates ($dupCount)"
         $chkShowDisabled.Text = "Show disabled ($disCount)"
+        $chkShowDups.Text     = "Also show duplicates ($dupCount)"
 
-        # Apply filters: hide duplicated-name devices unless opted in;
-        # hide non-active (disabled/notpresent/unplugged) unless opted in.
+        # Filters are independent. "Also show duplicates" overrides the disabled filter
+        # for duplicate devices: if you asked to see duplicates you get all of them,
+        # whether they are active or disabled. Otherwise the disabled gate applies alone.
+        # This avoids the confusing situation where showDups has no visible effect unless
+        # showDisabled is also checked (because the only duplicates on this system happen
+        # to be disabled virtual endpoints).
         $filtered = $audioList | Where-Object {
-            ($chkShowDups.Checked     -or $_.DuplicateCount -le 1) -and
-            ($chkShowDisabled.Checked -or $_.State -eq 1)
+            $isDup = $_.DuplicateCount -gt 1
+            # Pass the duplicate gate: non-dups always pass; dups need showDups checked.
+            ($chkShowDups.Checked -or -not $isDup) -and
+            # Pass the disabled gate: active devices always pass; disabled need showDisabled
+            # checked — UNLESS showDups is checked and this device is a dup (showDups wins).
+            ($chkShowDisabled.Checked -or $_.State -eq 1 -or ($chkShowDups.Checked -and $isDup))
         }
         $tabA.Text = "Audio ($(@($filtered).Count))"
 
@@ -2441,19 +2776,29 @@ function Show-DeviceIdentificationGui {
             elseif ($nick)          { $item.ForeColor = [System.Drawing.Color]::DarkGreen }
             [void]$lvA.Items.Add($item)
         }
+        # Two non-interactive blank rows at the bottom so the action-button overlay
+        # at the bottom of the panel does not obscure the last real list item.
+        # Without these, scrolling to the bottom leaves the lowest device hidden behind
+        # the "Set default" / "Set nickname" buttons.
+        1..2 | ForEach-Object {
+            $pad = New-Object System.Windows.Forms.ListViewItem("")
+            $pad.ForeColor = [System.Drawing.Color]::Transparent
+            $pad.Tag = $null
+            [void]$lvA.Items.Add($pad)
+        }
     }
 
-    # Nickname input dialog — receives $ParentForm as param to stay window-constrained
+    # Nickname input dialog — receives $ParentForm as param to stay window-constrained.
+    # Design: Pattern field removed — matching is by hardware identity, not FriendlyName substring.
     $showNicknameDialog = {
         param(
             [string]$Title,
             [string]$CurrentNick,
-            [string]$DefaultPattern,
             [System.Windows.Forms.Form]$ParentForm
         )
         $dlg = New-Object System.Windows.Forms.Form
         $dlg.Text = $Title
-        $dlg.ClientSize = New-Object System.Drawing.Size(440, 148)
+        $dlg.ClientSize = New-Object System.Drawing.Size(440, 110)
         $dlg.StartPosition = 'CenterParent'; $dlg.FormBorderStyle = 'FixedDialog'
         $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
 
@@ -2463,30 +2808,25 @@ function Show-DeviceIdentificationGui {
         $txtNick.Top = 11; $txtNick.Left = 90; $txtNick.Width = 330; $txtNick.Text = $CurrentNick
         $dlg.Controls.Add($txtNick)
 
-        $lbl3 = New-Object System.Windows.Forms.Label; $lbl3.Text = "Pattern:"
-        $lbl3.AutoSize = $true; $lbl3.Top = 44; $lbl3.Left = 10; $dlg.Controls.Add($lbl3)
-        $txtPat = New-Object System.Windows.Forms.TextBox
-        $txtPat.Top = 41; $txtPat.Left = 90; $txtPat.Width = 330; $txtPat.Text = $DefaultPattern
-        $dlg.Controls.Add($txtPat)
-
-        $lblHelp = New-Object System.Windows.Forms.Label
-        $lblHelp.Text = "Pattern is a substring matched against the device friendly name."
-        $lblHelp.AutoSize = $true; $lblHelp.Top = 68; $lblHelp.Left = 10
-        $lblHelp.ForeColor = [System.Drawing.Color]::Gray; $dlg.Controls.Add($lblHelp)
+        $lblNotes = New-Object System.Windows.Forms.Label; $lblNotes.Text = "Notes:"
+        $lblNotes.AutoSize = $true; $lblNotes.Top = 44; $lblNotes.Left = 10; $dlg.Controls.Add($lblNotes)
+        $txtNotes = New-Object System.Windows.Forms.TextBox
+        $txtNotes.Top = 41; $txtNotes.Left = 90; $txtNotes.Width = 330
+        $dlg.Controls.Add($txtNotes)
 
         $btnOk = New-Object System.Windows.Forms.Button; $btnOk.Text = "Save"
-        $btnOk.Top = 95; $btnOk.Left = 120; $btnOk.Width = 90; $btnOk.Height = 30
+        $btnOk.Top = 70; $btnOk.Left = 120; $btnOk.Width = 90; $btnOk.Height = 30
         $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $dlg.AcceptButton = $btnOk; $dlg.Controls.Add($btnOk)
 
         $btnCan = New-Object System.Windows.Forms.Button; $btnCan.Text = "Cancel"
-        $btnCan.Top = 95; $btnCan.Left = 225; $btnCan.Width = 90; $btnCan.Height = 30
+        $btnCan.Top = 70; $btnCan.Left = 225; $btnCan.Width = 90; $btnCan.Height = 30
         $btnCan.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
         $dlg.CancelButton = $btnCan; $dlg.Controls.Add($btnCan)
 
         $res = $dlg.ShowDialog($ParentForm)
         if ($res -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($txtNick.Text)) {
-            return [ordered]@{ Nickname = $txtNick.Text.Trim(); Pattern = $txtPat.Text.Trim() }
+            return [ordered]@{ Nickname = $txtNick.Text.Trim(); Notes = $txtNotes.Text.Trim() }
         }
         return $null
     }
@@ -2499,21 +2839,26 @@ function Show-DeviceIdentificationGui {
                     [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null; return
             }
             $d    = $lvD.SelectedItems[0].Tag
-            $nick = Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId)
+            $nick = Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid `
+                        -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId) `
+                        -ConnectorInstance $d.ConnectorInstance `
+                        -EdidManufactureId $d.EdidManufactureId -EdidProductCodeId $d.EdidProductCodeId `
+                        -Serial $d.SerialNumber
             $res  = & $showNicknameDialog `
-                -Title          "Nickname: $($d.FriendlyName)" `
-                -CurrentNick    $nick `
-                -DefaultPattern $d.FriendlyName `
-                -ParentForm     $form
+                -Title       "Nickname: $($d.FriendlyName)" `
+                -CurrentNick $nick `
+                -ParentForm  $form
             if ($res) {
                 if ($nick -and $nick -ne $res.Nickname) { Remove-Nickname -Kind displays -Nickname $nick }
-                Register-DisplayNickname -Nickname $res.Nickname -Pattern $res.Pattern `
-                    -Guid $d.DeviceGuid -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId)
+                Register-DisplayNickname -Nickname $res.Nickname -Notes $res.Notes `
+                    -FriendlyName $d.FriendlyName -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId) `
+                    -ConnectorInstance $d.ConnectorInstance -EdidManufactureId $d.EdidManufactureId `
+                    -EdidProductCodeId $d.EdidProductCodeId -Serial $d.SerialNumber
                 Test-DisplayNicknameDuplicates
                 & $refreshDisplays
             }
         } else {
-            if (-not $lvA.SelectedItems.Count) {
+            if (-not $lvA.SelectedItems.Count -or -not $lvA.SelectedItems[0].Tag) {
                 [System.Windows.Forms.MessageBox]::Show("Select an audio device first.", "No selection",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null; return
@@ -2521,13 +2866,12 @@ function Show-DeviceIdentificationGui {
             $a    = $lvA.SelectedItems[0].Tag
             $nick = Get-AudioNicknameFor -Name $a.FriendlyName -Type $a.Type -DeviceId $a.Id
             $res  = & $showNicknameDialog `
-                -Title          "Nickname: $($a.FriendlyName) ($($a.Type))" `
-                -CurrentNick    $nick `
-                -DefaultPattern $a.FriendlyName `
-                -ParentForm     $form
+                -Title       "Nickname: $($a.FriendlyName) ($($a.Type))" `
+                -CurrentNick $nick `
+                -ParentForm  $form
             if ($res) {
                 if ($nick -and $nick -ne $res.Nickname) { Remove-Nickname -Kind audio -Nickname $nick }
-                Register-AudioNickname -Nickname $res.Nickname -Pattern $res.Pattern -Type $a.Type -DeviceId $a.Id
+                Register-AudioNickname -Nickname $res.Nickname -Pattern $a.FriendlyName -Type $a.Type -DeviceId $a.Id
                 Test-AudioNicknameDuplicates
                 & $refreshAudio
             }
@@ -2538,15 +2882,21 @@ function Show-DeviceIdentificationGui {
         if ($tabs.SelectedIndex -eq 0) {
             if (-not $lvD.SelectedItems.Count) { return }
             $d    = $lvD.SelectedItems[0].Tag
-            $nick = Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId)
+            $nick = Get-DisplayNicknameFor -FriendlyName $d.FriendlyName -Guid $d.DeviceGuid `
+                        -AdapterLUID $d.AdapterLUID -TargetId ([string]$d.TargetId) `
+                        -ConnectorInstance $d.ConnectorInstance `
+                        -EdidManufactureId $d.EdidManufactureId -EdidProductCodeId $d.EdidProductCodeId `
+                        -Serial $d.SerialNumber
             if ($nick) { Remove-Nickname -Kind displays -Nickname $nick; & $refreshDisplays }
         } else {
-            if (-not $lvA.SelectedItems.Count) { return }
+            if (-not $lvA.SelectedItems.Count -or -not $lvA.SelectedItems[0].Tag) { return }
             $a    = $lvA.SelectedItems[0].Tag
             $nick = Get-AudioNicknameFor -Name $a.FriendlyName -Type $a.Type -DeviceId $a.Id
             if ($nick) { Remove-Nickname -Kind audio -Nickname $nick; & $refreshAudio }
         }
     })
+
+    $btnIdentify.Add_Click({ Show-MonitorIdentifyOverlays })
 
     $lvD.Add_DoubleClick({ $btnSetNick.PerformClick() })
     $lvA.Add_DoubleClick({ $btnSetNick.PerformClick() })
@@ -3014,7 +3364,7 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Host "Displays:" -ForegroundColor Yellow
         if ($state.displays) {
             $state.displays.PSObject.Properties | ForEach-Object {
-                Write-Host "  $($_.Name) -> $($_.Value.pattern)"
+                Write-Host "  $($_.Name) -> $($_.Value.friendlyName) [adapter $($_.Value.adapterLUID), target $($_.Value.targetId)]"
             }
         }
         Write-Host "Audio:" -ForegroundColor Yellow
