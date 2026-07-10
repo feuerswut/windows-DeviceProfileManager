@@ -36,13 +36,14 @@
 [CmdletBinding(DefaultParameterSetName = 'Gui')]
 param(
     [Parameter(ParameterSetName = 'Gui')]    [switch]$Gui,
-    [Parameter(ParameterSetName = 'ApplyProfile', Mandatory)][string]$Profile,
+    [Parameter(ParameterSetName = 'ApplyProfile', Mandatory)][string]$HwProfile,
     [Parameter(ParameterSetName = 'ListProfiles')]  [switch]$ListProfiles,
     [Parameter(ParameterSetName = 'ListDevices')]   [switch]$ListDevices,
     [Parameter(ParameterSetName = 'Identify')]      [switch]$Identify,
     [Parameter(ParameterSetName = 'SetVolumeAll', Mandatory)][ValidateRange(0,100)][int]$SetVolumeAll,
     [Parameter(ParameterSetName = 'SaveProfile', Mandatory)][string]$SaveProfileAs,
     [Parameter(ParameterSetName = 'Help')][Alias('h')][switch]$Help,
+    [switch]$DebugMode,   # enable verbose debug output to console + log
     [Parameter(ValueFromRemainingArguments, DontShow)][string[]]$RemainingArgs
 )
 
@@ -54,6 +55,7 @@ $Script:RootDir   = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Pare
 $Script:ConfigDir = Join-Path $RootDir 'config'
 $Script:StateFile = Join-Path $ConfigDir 'devices.json'
 $Script:LogFile   = Join-Path $ConfigDir 'orchestrator.log'
+$Script:DebugMode = $true   # set by -DebugMode switch at CLI, or $Script:DebugMode = $true inline
 
 if (-not (Test-Path $ConfigDir)) { New-Item -Path $ConfigDir -ItemType Directory -Force | Out-Null }
 
@@ -62,6 +64,13 @@ if (-not (Test-Path $ConfigDir)) { New-Item -Path $ConfigDir -ItemType Directory
 # =============================================================================
 #region SECTION: Logging
 # =============================================================================
+
+function Write-DebugLog {
+    param([Parameter(Mandatory)][string]$Message)
+    if (-not $Script:DebugMode) { return }
+    Write-Host "[DEBUG] $Message" -ForegroundColor DarkCyan
+    try { Add-Content -Path $Script:LogFile -Value ("{0:yyyy-MM-dd HH:mm:ss} [DEBUG] {1}" -f (Get-Date), $Message) -ErrorAction SilentlyContinue } catch {}
+}
 
 function Write-Log {
     param(
@@ -628,91 +637,106 @@ public static class DisplayNative
     // extendPatterns: each display claims a unique GPU source (extended desktop).
     // cloneGroups: each inner string[] shares one source (mirror); first element is the source display.
     // Displays not mentioned are implicitly deactivated. Defaults to extend if cloneGroups is null/empty.
+    // Correct approach per Win32 docs: query all paths+modes, toggle ACTIVE flags in-place,
+    // resubmit the SAME buffer — never pass an empty modes array with SDC_USE_SUPPLIED_DISPLAY_CONFIG.
     public static int ConfigureTopology(string[] extendPatterns, string[][] cloneGroups)
     {
         DISPLAYCONFIG_PATH_INFO[] allPaths; DISPLAYCONFIG_MODE_INFO[] allModes;
         GetAllPaths(QDC_ALL_PATHS, out allPaths, out allModes);
 
-        var result = new List<DISPLAYCONFIG_PATH_INFO>();
-        var claimedSources = new HashSet<string>();
+        // Step 1: clear every ACTIVE flag
+        for (int i = 0; i < allPaths.Length; i++)
+            allPaths[i].flags &= ~DISPLAYCONFIG_PATH_ACTIVE;
 
-        // Process clone groups: all displays in each group share one source
+        var claimedSources = new HashSet<string>();
+        var activatedIdx   = new HashSet<int>();
+
+        // Helper: indices of allPaths matching pattern, targetAvailable first
+        Func<string, List<int>> findIndices = pattern =>
+        {
+            var avail   = new List<int>();
+            var unavail = new List<int>();
+            for (int i = 0; i < allPaths.Length; i++)
+            {
+                if (!MatchPath(allPaths[i], pattern)) continue;
+                if (allPaths[i].targetInfo.targetAvailable != 0) avail.Add(i);
+                else unavail.Add(i);
+            }
+            avail.AddRange(unavail);
+            return avail;
+        };
+
+        // Step 2: clone groups — members share the same source
         if (cloneGroups != null)
         {
             foreach (var group in cloneGroups)
             {
                 if (group == null || group.Length == 0) continue;
-                bool groupHasSrc = false;
-                DISPLAYCONFIG_PATH_SOURCE_INFO sharedSrc = default(DISPLAYCONFIG_PATH_SOURCE_INFO);
-                string sharedKey = null;
+                string sharedSrcKey = null;
 
-                foreach (var pattern in group)
+                for (int m = 0; m < group.Length; m++)
                 {
-                    var cands = FindPathCandidates(allPaths, pattern);
-                    if (cands.Count == 0) continue;
-                    DISPLAYCONFIG_PATH_INFO tp = cands[0];
+                    var idxs = findIndices(group[m]);
+                    if (idxs.Count == 0) continue;
+                    int chosen = -1;
 
-                    if (!groupHasSrc)
+                    if (m == 0)
                     {
-                        bool foundSrc = false;
-                        foreach (var c in cands)
+                        // Source of clone group: pick any unclaimed source
+                        foreach (int i in idxs)
                         {
-                            string k = SourceKey(c.sourceInfo);
-                            if (claimedSources.Add(k))
-                            {
-                                tp = c; sharedSrc = c.sourceInfo; sharedKey = k; groupHasSrc = true; foundSrc = true; break;
-                            }
+                            string k = SourceKey(allPaths[i].sourceInfo);
+                            if (claimedSources.Add(k)) { chosen = i; sharedSrcKey = k; break; }
                         }
-                        if (!foundSrc) continue;
+                        if (chosen < 0 && idxs.Count > 0) { chosen = idxs[0]; sharedSrcKey = SourceKey(allPaths[chosen].sourceInfo); }
                     }
                     else
                     {
-                        foreach (var c in cands) { if (SourceKey(c.sourceInfo) == sharedKey) { tp = c; break; } }
+                        // Mirror member: find path that already shares the source
+                        foreach (int i in idxs)
+                            if (SourceKey(allPaths[i].sourceInfo) == sharedSrcKey) { chosen = i; break; }
+                        if (chosen < 0 && idxs.Count > 0) chosen = idxs[0]; // fallback: ALLOW_CHANGES handles
                     }
 
-                    tp.flags |= DISPLAYCONFIG_PATH_ACTIVE;
-                    tp.sourceInfo = sharedSrc;
-                    tp.sourceInfo.modeInfoIdx = 0xFFFFFFFF;
-                    tp.targetInfo.modeInfoIdx = 0xFFFFFFFF;
-                    result.Add(tp);
+                    if (chosen < 0) continue;
+                    allPaths[chosen].flags |= DISPLAYCONFIG_PATH_ACTIVE;
+                    activatedIdx.Add(chosen);
                 }
             }
         }
 
-        // Process extend displays: each claims a unique source
+        // Step 3: extend displays — each gets a unique source
         if (extendPatterns != null)
         {
             foreach (var pattern in extendPatterns)
             {
-                var cands = FindPathCandidates(allPaths, pattern);
-                bool added = false;
-                foreach (var c in cands)
+                var idxs = findIndices(pattern);
+                int chosen = -1;
+                // Prefer a path whose source is not yet claimed (guarantees extend, no accidental mirror)
+                foreach (int i in idxs)
                 {
-                    string k = SourceKey(c.sourceInfo);
-                    if (claimedSources.Add(k))
-                    {
-                        var tp = c;
-                        tp.flags |= DISPLAYCONFIG_PATH_ACTIVE;
-                        tp.sourceInfo.modeInfoIdx = 0xFFFFFFFF;
-                        tp.targetInfo.modeInfoIdx = 0xFFFFFFFF;
-                        result.Add(tp); added = true; break;
-                    }
+                    if (activatedIdx.Contains(i)) continue;
+                    string k = SourceKey(allPaths[i].sourceInfo);
+                    if (claimedSources.Add(k)) { chosen = i; break; }
                 }
-                if (!added && cands.Count > 0)
-                {
-                    var tp = cands[0];
-                    tp.flags |= DISPLAYCONFIG_PATH_ACTIVE;
-                    tp.sourceInfo.modeInfoIdx = 0xFFFFFFFF;
-                    tp.targetInfo.modeInfoIdx = 0xFFFFFFFF;
-                    result.Add(tp);
-                }
+                // Fallback: first non-activated path; SDC_ALLOW_CHANGES resolves source conflict
+                if (chosen < 0)
+                    foreach (int i in idxs)
+                        if (!activatedIdx.Contains(i)) { chosen = i; break; }
+
+                if (chosen < 0) continue;
+                allPaths[chosen].flags |= DISPLAYCONFIG_PATH_ACTIVE;
+                activatedIdx.Add(chosen);
             }
         }
 
-        if (result.Count == 0) return -1;
-        uint flags2 = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE
-                    | SDC_ALLOW_CHANGES | SDC_ALLOW_PATH_ORDER_CHANGES;
-        return SetDisplayConfig((uint)result.Count, result.ToArray(), 0, new DISPLAYCONFIG_MODE_INFO[0], flags2);
+        if (activatedIdx.Count == 0) return -1;
+
+        // Step 4: submit FULL path buffer + REAL mode buffer.
+        // SDC_USE_SUPPLIED_DISPLAY_CONFIG with empty modes = Error 87 — always pass allModes.
+        // SDC_ALLOW_PATH_ORDER_CHANGES is only valid with SDC_TOPOLOGY_SUPPLIED, not here.
+        uint flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES;
+        return SetDisplayConfig((uint)allPaths.Length, allPaths, (uint)allModes.Length, allModes, flags);
     }
 }
 '@
@@ -1343,12 +1367,21 @@ function Get-AllDisplayPaths {
             $hdrEnabled   = $ci.HDREnabled
         } catch {}
 
+        # Synthesize a FriendlyName for internal/headless displays that have no EDID name.
+        $outTech = ConvertTo-OutputTechnologyName -Value $path.targetInfo.outputTechnology
+        $friendlyName = $devInfo.monitorFriendlyDeviceName
+        if ([string]::IsNullOrEmpty($friendlyName) -and $isActive -and $gdiName) {
+            $gdiShort = $gdiName -replace '^\\\\\.\\', ''  # "DISPLAY1" from "\\.\DISPLAY1"
+            $friendlyName = if ($outTech -eq 'Internal') { "Built-in Display ($gdiShort)" } else { $gdiShort }
+            Write-DebugLog "Synthesized display name '$friendlyName' (OutputTech: $outTech, gdi: $gdiName)"
+        }
+
         $result += [PSCustomObject]@{
-            FriendlyName      = $devInfo.monitorFriendlyDeviceName
+            FriendlyName      = $friendlyName
             Active            = $isActive
             Primary           = $isPrimary
             TargetAvailable   = [bool]$path.targetInfo.targetAvailable
-            OutputTechnology  = ConvertTo-OutputTechnologyName -Value $path.targetInfo.outputTechnology
+            OutputTechnology  = $outTech
             ConnectorInstance = $devInfo.connectorInstance
             EdidManufactureId = [int]$devInfo.edidManufactureId
             EdidProductCodeId = [int]$devInfo.edidProductCodeId
@@ -1565,6 +1598,8 @@ function Enable-AllKnownDisplays {
 #region SECTION: Display_Resolution — EnumDisplaySettings / ChangeDisplaySettings
 # =============================================================================
 
+# Resolution labels: matching is by height ±5% + aspect ratio ±10%. The actual mode
+# dimensions from EnumDisplaySettings replace the preset values when a fuzzy match is found.
 $Script:ResolutionPresets = [ordered]@{
     '1080p  (1920x1080)'      = @{ Width = 1920; Height = 1080 }
     '1440p  (2560x1440)'      = @{ Width = 2560; Height = 1440 }
@@ -1586,6 +1621,7 @@ function Get-DisplayModesForGdiDevice {
             $unique += [PSCustomObject]@{ Width = $m.dmPelsWidth; Height = $m.dmPelsHeight; Hz = $m.dmDisplayFrequency }
         }
     }
+    Write-DebugLog "Get-DisplayModesForGdiDevice '$GdiDeviceName': $($unique.Count) unique modes"
     return $unique
 }
 
@@ -1595,30 +1631,138 @@ function Get-CurrentDisplayModeForGdiDevice {
     return [PSCustomObject]@{ Width = $dm.dmPelsWidth; Height = $dm.dmPelsHeight; Hz = $dm.dmDisplayFrequency }
 }
 
+function Find-BestModeForGdiDevice {
+    <#
+    .SYNOPSIS
+        Find the best supported mode on a GDI device for a target resolution and Hz.
+        Resolution matching: exact first, then same aspect ratio (within 10%) closest height.
+        Hz matching: within HzTolerance (default 2) of target, then closest available.
+        Returns a PSCustomObject {Width, Height, Hz} or $null if no modes available.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GdiDeviceName,
+        [uint32]$TargetWidth  = 0,
+        [uint32]$TargetHeight = 0,
+        [uint32]$TargetHz     = 0,
+        [int]$HzTolerance     = 2
+    )
+    $modes = Get-DisplayModesForGdiDevice -GdiDeviceName $GdiDeviceName
+    if ($modes.Count -eq 0) { Write-DebugLog "Find-BestModeForGdiDevice: no modes on '$GdiDeviceName'"; return $null }
+
+    # --- Resolution candidates ---
+    $resCands = if ($TargetWidth -gt 0 -and $TargetHeight -gt 0) {
+        # Exact match first
+        $exact = $modes | Where-Object { $_.Width -eq $TargetWidth -and $_.Height -eq $TargetHeight }
+        if ($exact) { $exact }
+        else {
+            # Fuzzy: same aspect ratio ±10%, height within ±5%
+            $tAR = $TargetWidth / $TargetHeight
+            $modes | Where-Object {
+                $_.Height -ge ($TargetHeight * 0.95) -and $_.Height -le ($TargetHeight * 1.05) -and
+                [Math]::Abs(($_.Width / $_.Height) - $tAR) / $tAR -le 0.10
+            } | Sort-Object { [Math]::Abs([int]$_.Height - [int]$TargetHeight) }
+        }
+    } else { $modes }
+
+    if (-not $resCands -or @($resCands).Count -eq 0) {
+        Write-DebugLog "Find-BestModeForGdiDevice: no resolution candidates for ${TargetWidth}x${TargetHeight} on '$GdiDeviceName'"
+        return $null
+    }
+
+    # --- Hz selection within candidates ---
+    $best = if ($TargetHz -gt 0) {
+        # Prefer exact or within-tolerance, then closest
+        $within = $resCands | Where-Object { [Math]::Abs([int]$_.Hz - [int]$TargetHz) -le $HzTolerance }
+        if ($within) {
+            $within | Sort-Object { [Math]::Abs([int]$_.Hz - [int]$TargetHz) } | Select-Object -First 1
+        } else {
+            $resCands | Sort-Object { [Math]::Abs([int]$_.Hz - [int]$TargetHz) } | Select-Object -First 1
+        }
+    } else {
+        # No Hz target: pick highest available
+        $resCands | Sort-Object Hz -Descending | Select-Object -First 1
+    }
+
+    Write-DebugLog "Find-BestModeForGdiDevice: target ${TargetWidth}x${TargetHeight}@${TargetHz}Hz -> best $($best.Width)x$($best.Height)@$($best.Hz)Hz"
+    return $best
+}
+
 function Set-DisplayModeForGdiDevice {
     <#
-    .SYNOPSIS Low-level: set resolution+refresh on a specific GDI device. #>
+    .SYNOPSIS Low-level: set resolution+refresh on a specific GDI device.
+    Uses fuzzy matching to find the closest supported mode within HzTolerance. #>
     param(
         [Parameter(Mandatory)][string]$GdiDeviceName,
         [Parameter(Mandatory)][uint32]$Width,
         [Parameter(Mandatory)][uint32]$Height,
-        [Parameter(Mandatory)][uint32]$Hz
+        [Parameter(Mandatory)][uint32]$Hz,
+        [int]$HzTolerance = 2
     )
+    $best = Find-BestModeForGdiDevice -GdiDeviceName $GdiDeviceName -TargetWidth $Width -TargetHeight $Height -TargetHz $Hz -HzTolerance $HzTolerance
+    if ($best) { $Width = $best.Width; $Height = $best.Height; $Hz = $best.Hz }
     $ret = [DisplayNative]::SetDisplayMode($GdiDeviceName, $Width, $Height, $Hz)
     if ($ret -eq [DisplayNative]::DISP_CHANGE_SUCCESSFUL) {
         Write-Log "Mode ${Width}x${Height}@${Hz}Hz set on '$GdiDeviceName'." -Level OK; return $true
     }
-    Write-Log "ChangeDisplaySettingsEx returned $ret for '$GdiDeviceName'." -Level ERROR; return $false
+    Write-Log "ChangeDisplaySettingsEx returned $ret for '${GdiDeviceName}' (${Width}x${Height}@${Hz}Hz)." -Level ERROR; return $false
+}
+
+function Set-DisplayResolutionForGdiDevice {
+    <#
+    .SYNOPSIS Set only the resolution (WxH) on a GDI device, preserving current framerate. #>
+    param(
+        [Parameter(Mandatory)][string]$GdiDeviceName,
+        [Parameter(Mandatory)][uint32]$Width,
+        [Parameter(Mandatory)][uint32]$Height
+    )
+    $cur = Get-CurrentDisplayModeForGdiDevice -GdiDeviceName $GdiDeviceName
+    $curHz = if ($cur.Hz -gt 0) { $cur.Hz } else { 60 }
+    $best = Find-BestModeForGdiDevice -GdiDeviceName $GdiDeviceName -TargetWidth $Width -TargetHeight $Height -TargetHz $curHz
+    if (-not $best) { Write-Log "No mode near ${Width}x${Height} on '$GdiDeviceName'." -Level WARN; return $false }
+    Write-DebugLog "Set-DisplayResolutionForGdiDevice '$GdiDeviceName': applying $($best.Width)x$($best.Height)@$($best.Hz)Hz"
+    $ret = [DisplayNative]::SetDisplayMode($GdiDeviceName, $best.Width, $best.Height, $best.Hz)
+    if ($ret -eq [DisplayNative]::DISP_CHANGE_SUCCESSFUL) {
+        Write-Log "Resolution $($best.Width)x$($best.Height) set on '$GdiDeviceName'." -Level OK; return $true
+    }
+    Write-Log "ChangeDisplaySettingsEx returned $ret (resolution step) for '$GdiDeviceName'." -Level ERROR; return $false
+}
+
+function Set-DisplayFrameRateForGdiDevice {
+    <#
+    .SYNOPSIS Set only the framerate on a GDI device, preserving current resolution. #>
+    param(
+        [Parameter(Mandatory)][string]$GdiDeviceName,
+        [Parameter(Mandatory)][uint32]$Hz,
+        [int]$HzTolerance = 2
+    )
+    $cur = Get-CurrentDisplayModeForGdiDevice -GdiDeviceName $GdiDeviceName
+    if (-not $cur.Width -or -not $cur.Height) { Write-Log "Cannot read current mode for '$GdiDeviceName'." -Level WARN; return $false }
+    $best = Find-BestModeForGdiDevice -GdiDeviceName $GdiDeviceName -TargetWidth $cur.Width -TargetHeight $cur.Height -TargetHz $Hz -HzTolerance $HzTolerance
+    if (-not $best) { Write-Log "No mode near $($cur.Width)x$($cur.Height)@${Hz}Hz on '$GdiDeviceName'." -Level WARN; return $false }
+    Write-DebugLog "Set-DisplayFrameRateForGdiDevice '$GdiDeviceName': applying $($best.Hz)Hz (current res $($cur.Width)x$($cur.Height))"
+    $ret = [DisplayNative]::SetDisplayMode($GdiDeviceName, $best.Width, $best.Height, $best.Hz)
+    if ($ret -eq [DisplayNative]::DISP_CHANGE_SUCCESSFUL) {
+        Write-Log "Frame rate $($best.Hz)Hz set on '$GdiDeviceName'." -Level OK; return $true
+    }
+    Write-Log "ChangeDisplaySettingsEx returned $ret (framerate step) for '$GdiDeviceName'." -Level ERROR; return $false
 }
 
 function Get-GdiDeviceNameForPattern {
     <#
-    .SYNOPSIS Mid-level: find the GDI device name (\\.\DISPLAY1 etc.) for an active display matching Pattern. #>
+    .SYNOPSIS Mid-level: find the GDI device name (\\.\DISPLAY1 etc.) for an active display matching Pattern.
+    Accepts FriendlyName substrings, synthesized names, or raw GDI paths (\\.\DISPLAYn). #>
     param([Parameter(Mandatory)][string]$Pattern)
     $all = Get-AllDisplayPaths
-    $match = $all | Where-Object { $_.Active -and $_.FriendlyName -match [regex]::Escape($Pattern) } | Select-Object -First 1
-    if (-not $match) { return $null }
-    return $match.GdiDeviceName
+    # Direct GDI path passed (e.g. "\\.\DISPLAY1") -- validate it's active and return as-is
+    if ($Pattern -match '^\\\\\.\\DISPLAY\d+$') {
+        $m = $all | Where-Object { $_.Active -and $_.GdiDeviceName -eq $Pattern } | Select-Object -First 1
+        if ($m) { Write-DebugLog "Get-GdiDeviceNameForPattern: GDI direct match '$Pattern'"; return $Pattern }
+    }
+    # FriendlyName substring match (including synthesized names for internal displays)
+    $m = $all | Where-Object { $_.Active -and $_.FriendlyName -and $_.FriendlyName -match [regex]::Escape($Pattern) } | Select-Object -First 1
+    if ($m) { Write-DebugLog "Get-GdiDeviceNameForPattern: FriendlyName match '$Pattern' -> '$($m.GdiDeviceName)'"; return $m.GdiDeviceName }
+    Write-DebugLog "Get-GdiDeviceNameForPattern: no match for '$Pattern' among $(($all | Where-Object { $_.Active } | Select-Object -ExpandProperty FriendlyName) -join ', ')"
+    return $null
 }
 
 function Get-DisplayModesForPattern {
@@ -1645,19 +1789,81 @@ function Set-DisplayModeForPattern {
 }
 
 function Get-SupportedResolutionPresets {
+    <#
+    .SYNOPSIS
+        Returns preset labels whose target resolution has at least one matching mode.
+        Matching is fuzzy: height within 5%, aspect ratio within 10%.
+        The returned hashtable values use the ACTUAL mode dimensions (not preset dimensions),
+        so callers get accurate Width/Height for downstream mode enumeration.
+    #>
     param([Parameter(Mandatory)][array]$Modes)
     $r = [ordered]@{}
     foreach ($label in $Script:ResolutionPresets.Keys) {
-        $p = $Script:ResolutionPresets[$label]
-        if ($Modes | Where-Object { $_.Width -eq $p.Width -and $_.Height -eq $p.Height }) { $r[$label] = $p }
+        $p   = $Script:ResolutionPresets[$label]
+        $tAR = $p.Width / $p.Height
+        $best = $Modes | Where-Object {
+            $_.Height -ge ($p.Height * 0.95) -and $_.Height -le ($p.Height * 1.05) -and
+            [Math]::Abs(($_.Width / $_.Height) - $tAR) / $tAR -le 0.10
+        } | Sort-Object { [Math]::Abs([int]$_.Height - [int]$p.Height) } | Select-Object -First 1
+        if ($best) {
+            Write-DebugLog "Preset '$label' -> matched mode $($best.Width)x$($best.Height)"
+            $r[$label] = @{ Width = $best.Width; Height = $best.Height }
+        }
     }
     return $r
 }
 
 function Get-SupportedFrameRates {
+    <#
+    .SYNOPSIS
+        Returns which FrameRatePresets the display supports at a given resolution.
+        Hz matching is fuzzy: a mode at 59Hz satisfies the 60Hz preset (tolerance 2Hz).
+    #>
     param([Parameter(Mandatory)][array]$Modes, [Parameter(Mandatory)][uint32]$Width, [Parameter(Mandatory)][uint32]$Height)
     $available = $Modes | Where-Object { $_.Width -eq $Width -and $_.Height -eq $Height } | Select-Object -ExpandProperty Hz -Unique
-    return $Script:FrameRatePresets | Where-Object { $available -contains $_ }
+    Write-DebugLog "Get-SupportedFrameRates for ${Width}x${Height}: available Hz = $($available -join ', ')"
+    return $Script:FrameRatePresets | Where-Object {
+        $preset = [int]$_
+        [bool]($available | Where-Object { [Math]::Abs([int]$_ - $preset) -le 2 })
+    }
+}
+
+function Get-UniqueResolutionLabels {
+    <#
+    .SYNOPSIS
+        Returns unique "WxH" strings from a modes array, sorted by height descending.
+        Single source of truth used by both Show-ResolutionPickerDialog and the profile
+        editor — ensures both always show the same set of resolutions in the same order.
+        Design: no preset filtering; every resolution the driver reports is included (720p,
+        900p, 1080p, ...) so the user is never surprised by missing entries.
+    #>
+    param([Parameter(Mandatory)][array]$Modes)
+    $seen = @{}
+    $list = [System.Collections.Generic.List[string]]::new()
+    foreach ($m in ($Modes | Sort-Object -Property Height -Descending)) {
+        $lbl = "$($m.Width)x$($m.Height)"
+        if (-not $seen.ContainsKey($lbl)) { $seen[$lbl] = $true; [void]$list.Add($lbl) }
+    }
+    return $list.ToArray()
+}
+
+function Get-UniqueHzLabels {
+    <#
+    .SYNOPSIS
+        Returns unique integer Hz strings from a modes array, sorted descending.
+        When Width+Height are given, filters to that resolution first (used by the
+        picker's per-resolution Hz sync). When omitted, returns Hz across all modes
+        (used by the profile editor's shared Hz column).
+        Design: integer-rounded so "59.94" and "60.00" both appear as "60".
+    #>
+    param(
+        [Parameter(Mandatory)][array]$Modes,
+        [uint32]$Width = 0, [uint32]$Height = 0
+    )
+    $src = if ($Width -gt 0 -and $Height -gt 0) {
+        $Modes | Where-Object { $_.Width -eq $Width -and $_.Height -eq $Height }
+    } else { $Modes }
+    return @($src | ForEach-Object { [int][Math]::Round($_.Hz) } | Sort-Object -Unique -Descending | ForEach-Object { [string]$_ })
 }
 
 #endregion SECTION: Display_Resolution
@@ -1793,10 +1999,10 @@ function Resolve-AudioDeviceByPattern {
         [Parameter(Mandatory)][ValidateSet('Playback','Recording')][string]$Type
     )
     $devices = Get-AllAudioDevices
-    $matches  = $devices | Where-Object { $_.Type -eq $Type -and $_.FriendlyName -match [regex]::Escape($Pattern) }
-    if ($matches.Count -eq 1) { return $matches }
-    if ($matches.Count -eq 0) { Write-Log "No $Type device matching '$Pattern'."                            -Level ERROR }
-    else                      { Write-Log "Ambiguous: $($matches.Count) $Type devices match '$Pattern'."   -Level ERROR }
+    $devicematches  = $devices | Where-Object { $_.Type -eq $Type -and $_.FriendlyName -match [regex]::Escape($Pattern) }
+    if ($devicematches.Count -eq 1) { return $devicematches }
+    if ($devicematches.Count -eq 0) { Write-Log "No $Type device matching '$Pattern'."                            -Level ERROR }
+    else                      { Write-Log "Ambiguous: $($devicematches.Count) $Type devices match '$Pattern'."   -Level ERROR }
     return $null
 }
 
@@ -1969,11 +2175,12 @@ function Save-ProfileInteractive {
                 $refreshRate = $pathInfo.RefreshHz
             }
 
-            # Allow override via interactive prompts
+            # Allow override via interactive prompts. Always pass GdiDeviceName so mode
+            # enumeration works for internal displays that have no FriendlyName in CCD.
             if ($active -and $ResolutionPrompt -ne 'None') {
                 $override = switch ($ResolutionPrompt) {
-                    'Console' { Read-ResolutionForDisplay -Nickname $nick -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate -Pattern $pathInfo.FriendlyName }
-                    'Gui'     { Show-ResolutionPickerDialog -Nickname $nick -Pattern $pathInfo.GdiDeviceName -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate }
+                    'Console' { Read-ResolutionForDisplay -Nickname $nick -GdiDeviceName $pathInfo.GdiDeviceName -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate }
+                    'Gui'     { Show-ResolutionPickerDialog -Nickname $nick -GdiDeviceName $pathInfo.GdiDeviceName -CurrentWidth $width -CurrentHeight $height -CurrentHz $refreshRate }
                 }
                 if ($override) { $width = $override.Width; $height = $override.Height; $refreshRate = $override.Hz }
             }
@@ -2065,9 +2272,10 @@ function Invoke-Profile {
 
     # First pass: find which displays are mirrors of another (mirrorOf field).
     # Design: use hardware keys (@ADAPTER:) so identical-model monitors are unambiguous.
+    # active=null means "(don't change)" — still include in topology so the display stays active.
     $mirrorTargets = @{}  # sourceNick -> @(hwKey, ...)
     foreach ($d in $prof.displays) {
-        if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
+        if ($d.active -eq $false -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
         $mo = $d.mirrorOf
         if ($mo -and $dispNicks.ContainsKey($mo)) {
             if (-not $mirrorTargets.ContainsKey($mo)) { $mirrorTargets[$mo] = @() }
@@ -2081,7 +2289,7 @@ function Invoke-Profile {
     $cloneGroupsList = [System.Collections.Generic.List[string[]]]::new()
 
     foreach ($d in $prof.displays) {
-        if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
+        if ($d.active -eq $false -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
         $mo = $d.mirrorOf
         if ($mo -and $dispNicks.ContainsKey($mo)) { continue }  # handled as part of clone group
         $hwKey = Get-HardwareKeyForNickname -Nickname $d.nickname
@@ -2111,18 +2319,73 @@ function Invoke-Profile {
     } else { Write-Log "No primary display defined in profile." -Level WARN }
 
     # ── Step 3: Resolution, DPI, HDR per display ──
-    # Design: resolve each nickname to its current live path object via hardware identity.
-    # GdiDeviceName comes from the path, so no FriendlyName matching is needed for resolution.
+    # Pass 1: apply all. Pass 2: verify. Retry failed up to 2 more times.
     Write-Log "[3/4] Applying resolution / DPI / HDR..." -Level STEP
+
+    # Build the list of displays needing resolution work (re-resolved fresh after topology/primary)
+    $dispWork = [System.Collections.Generic.List[object]]::new()
     foreach ($d in $prof.displays) {
-        if (-not $d.active -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
+        if ($d.active -eq $false -or -not $dispNicks.ContainsKey($d.nickname)) { continue }
         $path = Resolve-DisplayPathForNickname -Nickname $d.nickname
-        if (-not $path) { Write-Log "Nickname '$($d.nickname)' not connected, skipping settings." -Level WARN; continue }
-
-        if ($d.width -and $d.height -and $d.refreshRate -and $path.GdiDeviceName) {
-            Set-DisplayModeForGdiDevice -GdiDeviceName $path.GdiDeviceName -Width $d.width -Height $d.height -Hz $d.refreshRate | Out-Null
+        if (-not $path) {
+            if ($null -ne $d.active) { Write-Log "Nickname '$($d.nickname)' not connected, skipping settings." -Level WARN }
+            continue
         }
+        [void]$dispWork.Add([PSCustomObject]@{ D = $d; Path = $path })
+    }
 
+    # Apply resolution + Hz for all displays (one pass)
+    foreach ($item in $dispWork) {
+        $d = $item.D; $path = $item.Path
+        Write-DebugLog "Invoke-Profile pass1: '$($d.nickname)' on GDI '$($path.GdiDeviceName)'"
+        if ($path.GdiDeviceName) {
+            if ($d.width -and $d.height) {
+                Set-DisplayResolutionForGdiDevice -GdiDeviceName $path.GdiDeviceName -Width $d.width -Height $d.height | Out-Null
+            }
+            if ($d.refreshRate) {
+                Set-DisplayFrameRateForGdiDevice -GdiDeviceName $path.GdiDeviceName -Hz $d.refreshRate | Out-Null
+            }
+        }
+    }
+
+    # Verify and retry failed resolution items (up to 2 retries)
+    $needsRes = $dispWork | Where-Object { $_.D.width -and $_.D.height -and $_.Path.GdiDeviceName }
+    for ($retry = 1; $retry -le 2; $retry++) {
+        if (-not $needsRes -or @($needsRes).Count -eq 0) { break }
+        Start-Sleep -Milliseconds 400
+        $stillFailed = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $needsRes) {
+            $d = $item.D; $path = $item.Path
+            # Re-resolve GDI name in case it shifted after primary change
+            $freshPath = Resolve-DisplayPathForNickname -Nickname $d.nickname
+            $gdi = if ($freshPath -and $freshPath.GdiDeviceName) { $freshPath.GdiDeviceName } else { $path.GdiDeviceName }
+            $cur = Get-CurrentDisplayModeForGdiDevice -GdiDeviceName $gdi
+            $wantHz = if ($d.refreshRate) { [int][Math]::Round($d.refreshRate) } else { 0 }
+            $gotHz  = [int][Math]::Round($cur.Hz)
+            $resOk  = ($cur.Width -eq $d.width -and $cur.Height -eq $d.height)
+            $hzOk   = ($wantHz -eq 0 -or [Math]::Abs($gotHz - $wantHz) -le 2)
+            if ($resOk -and $hzOk) {
+                Write-Log "Resolution $($d.width)x$($d.height)@$($gotHz)Hz confirmed on '$($d.nickname)'." -Level OK
+            } else {
+                Write-Log "Resolution mismatch on '$($d.nickname)' (got $($cur.Width)x$($cur.Height)@${gotHz}Hz), retry $retry..." -Level WARN
+                Write-DebugLog "Retry $retry for '$($d.nickname)' on '$gdi'"
+                if ($d.width -and $d.height) { Set-DisplayResolutionForGdiDevice -GdiDeviceName $gdi -Width $d.width -Height $d.height | Out-Null }
+                if ($d.refreshRate) { Set-DisplayFrameRateForGdiDevice -GdiDeviceName $gdi -Hz $d.refreshRate | Out-Null }
+                [void]$stillFailed.Add($item)
+            }
+        }
+        $needsRes = $stillFailed
+    }
+    if ($needsRes -and @($needsRes).Count -gt 0) {
+        foreach ($item in $needsRes) {
+            $cur = Get-CurrentDisplayModeForGdiDevice -GdiDeviceName $item.Path.GdiDeviceName
+            Write-Log "Could not apply $($item.D.width)x$($item.D.height)@$($item.D.refreshRate)Hz on '$($item.D.nickname)' (final: $($cur.Width)x$($cur.Height)@$([int][Math]::Round($cur.Hz))Hz)." -Level ERROR
+        }
+    }
+
+    # DPI and HDR (no retry — these rarely fail and are harder to verify)
+    foreach ($item in $dispWork) {
+        $d = $item.D; $path = $item.Path
         $effectiveDpi = if ($null -ne $d.dpiPercent -and $d.dpiPercent -gt 0) { $d.dpiPercent }
                         elseif ($null -ne $d.dpiScaling -and $d.dpiScaling -gt 0) { $d.dpiScaling }
                         else { $null }
@@ -2136,12 +2399,16 @@ function Invoke-Profile {
         }
 
         if ($null -ne $d.hdr) {
-            $luidParts = $path.AdapterLUID -split '-'
-            $tgtLuid = New-Object DisplayNative+LUID
-            $tgtLuid.HighPart = [int]$luidParts[0]; $tgtLuid.LowPart = [uint32]$luidParts[1]
-            $ok = [DisplayNative]::SetHdrEnabled($tgtLuid, [uint32]$path.TargetId, [bool]$d.hdr)
-            if ($ok) { Write-Log "HDR $($d.hdr) set on '$($d.nickname)'." -Level OK }
-            else     { Write-Log "Failed HDR on '$($d.nickname)'." -Level ERROR }
+            if (-not $path.HdrSupported) {
+                Write-DebugLog "HDR not supported on '$($d.nickname)', skipping HDR setting."
+            } else {
+                $luidParts = $path.AdapterLUID -split '-'
+                $tgtLuid = New-Object DisplayNative+LUID
+                $tgtLuid.HighPart = [int]$luidParts[0]; $tgtLuid.LowPart = [uint32]$luidParts[1]
+                $ok = [DisplayNative]::SetHdrEnabled($tgtLuid, [uint32]$path.TargetId, [bool]$d.hdr)
+                if ($ok) { Write-Log "HDR $($d.hdr) set on '$($d.nickname)'." -Level OK }
+                else     { Write-Log "Failed HDR on '$($d.nickname)'." -Level WARN }
+            }
         }
     }
 
@@ -2152,7 +2419,7 @@ function Invoke-Profile {
             Write-Log "Audio nickname '$($a.nickname)' not registered. Skipping." -Level WARN; continue
         }
         $entry = $audioNicks[$a.nickname]
-        if ($a.setDefault) { Set-AudioDeviceDefaultByPattern -Pattern $entry.pattern -Type $entry.type | Out-Null }
+        if ($a.setDefault -eq $true) { Set-AudioDeviceDefaultByPattern -Pattern $entry.pattern -Type $entry.type | Out-Null }
         if ($null -ne $a.volume) { Set-AudioDeviceVolumeByPattern -Pattern $entry.pattern -Type $entry.type -Volume $a.volume | Out-Null }
     }
 
@@ -2179,11 +2446,12 @@ function Start-DeviceIdentificationWizard {
     # EDID fields are populated. Inactive paths may have stale or zero EDID data.
     Write-Host ""
     Write-Host "-- Displays (active only) --" -ForegroundColor Yellow
-    $rawDisplays = Get-AllDisplayPaths | Where-Object { $_.Active -and $_.FriendlyName }
+    # Active-only; FriendlyName is now always set (synthesized for internal displays).
+    $rawDisplays = Get-AllDisplayPaths | Where-Object { $_.Active }
 
-    # Collapse duplicate CCD paths (same adapter+target+name) down to one entry
+    # Collapse duplicate CCD paths (same adapter+target) down to one entry
     $displayGroups = $rawDisplays | Group-Object -Property {
-        "$($_.AdapterLUID)|$($_.TargetId)|$($_.FriendlyName)"
+        "$($_.AdapterLUID)|$($_.TargetId)"
     }
     $displays = foreach ($g in $displayGroups) {
         $best = $g.Group | Sort-Object @{E={-not $_.Active}}, @{E={-not $_.TargetAvailable}} | Select-Object -First 1
@@ -2301,7 +2569,8 @@ function Read-ResolutionForDisplay {
     .SYNOPSIS Console picker: resolution + refresh rate for one display. Returns @{Width;Height;Hz} or $null. #>
     param(
         [Parameter(Mandatory)][string]$Nickname,
-        [Parameter(Mandatory)][string]$Pattern,
+        [string]$Pattern,
+        [string]$GdiDeviceName,    # preferred: direct GDI path bypasses FriendlyName lookup
         [uint32]$CurrentWidth, [uint32]$CurrentHeight, [uint32]$CurrentHz
     )
     Write-Host ""
@@ -2309,7 +2578,9 @@ function Read-ResolutionForDisplay {
     $setRes = Read-Host "Override resolution for '$Nickname' (current: $cur)? (y/N)"
     if ($setRes -ne 'y' -and $setRes -ne 'Y') { return $null }
 
-    $modes = Get-DisplayModesForPattern -Pattern $Pattern
+    $modes = if ($GdiDeviceName) { Get-DisplayModesForGdiDevice -GdiDeviceName $GdiDeviceName }
+             elseif ($Pattern)   { Get-DisplayModesForPattern -Pattern $Pattern }
+             else                { @() }
     if ($modes.Count -eq 0) {
         Write-Log "Could not query modes for '$Nickname' - enter manually." -Level WARN
         $w = [uint32](Read-Host "  Width (e.g. 1920)")
@@ -2351,7 +2622,8 @@ function Show-ResolutionPickerDialog {
     #>
     param(
         [Parameter(Mandatory)][string]$Nickname,
-        [Parameter(Mandatory)][string]$Pattern,
+        [string]$Pattern,
+        [string]$GdiDeviceName,    # preferred over Pattern: direct GDI path bypasses FriendlyName lookup
         [uint32]$CurrentWidth, [uint32]$CurrentHeight, [uint32]$CurrentHz,
         [switch]$ApplyNow
     )
@@ -2400,10 +2672,25 @@ function Show-ResolutionPickerDialog {
 
     function SyncResCombo {
         $comboRes.Items.Clear()
-        $script:RP_Presets = if ($script:RP_Modes.Count -gt 0) { Get-SupportedResolutionPresets -Modes $script:RP_Modes } else { $Script:ResolutionPresets }
-        if ($script:RP_Presets.Count -eq 0) { $script:RP_Presets = $Script:ResolutionPresets }
+        # Build resolution list via shared Get-UniqueResolutionLabels (all Windows modes,
+        # sorted descending by height). Falls back to named presets when query failed.
+        $script:RP_Presets = [ordered]@{}
+        if ($script:RP_Modes.Count -gt 0) {
+            foreach ($lbl in (Get-UniqueResolutionLabels -Modes $script:RP_Modes)) {
+                $parts = $lbl -split 'x'
+                $script:RP_Presets[$lbl] = @{ Width = [uint32]$parts[0]; Height = [uint32]$parts[1] }
+            }
+        } else {
+            $script:RP_Presets = $Script:ResolutionPresets
+        }
         foreach ($label in $script:RP_Presets.Keys) { [void]$comboRes.Items.Add($label) }
-        if ($comboRes.Items.Count -gt 0) { $comboRes.SelectedIndex = 0 }
+        # Pre-select the entry matching the current display resolution.
+        $selIdx = 0
+        if ($CurrentWidth -and $CurrentHeight -and $comboRes.Items.Count -gt 0) {
+            $found = $comboRes.Items.IndexOf("${CurrentWidth}x${CurrentHeight}")
+            if ($found -ge 0) { $selIdx = $found }
+        }
+        if ($comboRes.Items.Count -gt 0) { $comboRes.SelectedIndex = $selIdx }
         SyncRateCombo
     }
 
@@ -2411,12 +2698,24 @@ function Show-ResolutionPickerDialog {
         $comboRate.Items.Clear()
         if (-not $comboRes.SelectedItem) { return }
         $chosenRes = $script:RP_Presets[$comboRes.SelectedItem]
+        # Hz filtered to the selected resolution via shared Get-UniqueHzLabels.
+        # Falls back to FrameRatePresets when no live modes available.
         $rates = if ($script:RP_Modes.Count -gt 0) {
-            Get-SupportedFrameRates -Modes $script:RP_Modes -Width $chosenRes.Width -Height $chosenRes.Height
-        } else { $Script:FrameRatePresets }
-        if (-not $rates -or @($rates).Count -eq 0) { $rates = @(60) }
+            Get-UniqueHzLabels -Modes $script:RP_Modes -Width $chosenRes.Width -Height $chosenRes.Height
+        } else { $Script:FrameRatePresets | ForEach-Object { [string]$_ } }
+        if (-not $rates -or @($rates).Count -eq 0) { $rates = @("60") }
         foreach ($hz in $rates) { [void]$comboRate.Items.Add("$hz Hz") }
-        $comboRate.SelectedIndex = 0
+        # Pre-select Hz closest to current refresh rate.
+        $selIdx = 0
+        if ($CurrentHz -and $comboRate.Items.Count -gt 0) {
+            $bestDiff = [int]::MaxValue
+            for ($i = 0; $i -lt $comboRate.Items.Count; $i++) {
+                $itemHz = [int]($comboRate.Items[$i] -replace '\s*Hz$', '')
+                $diff   = [Math]::Abs($itemHz - [int]$CurrentHz)
+                if ($diff -lt $bestDiff) { $bestDiff = $diff; $selIdx = $i }
+            }
+        }
+        $comboRate.SelectedIndex = $selIdx
     }
 
     $btnApply = New-Object System.Windows.Forms.Button
@@ -2436,7 +2735,10 @@ function Show-ResolutionPickerDialog {
         }
         $chosenRes = $script:RP_Presets[$comboRes.SelectedItem]
         $chosenHz  = [uint32]($comboRate.SelectedItem -replace '\s*Hz$', '')
-        if ($ApplyNow) { Set-DisplayModeForPattern -Pattern $Pattern -Width $chosenRes.Width -Height $chosenRes.Height -Hz $chosenHz | Out-Null }
+        if ($ApplyNow) {
+            $gdiForApply = if ($GdiDeviceName) { $GdiDeviceName } else { Get-GdiDeviceNameForPattern -Pattern $Pattern }
+            if ($gdiForApply) { Set-DisplayModeForGdiDevice -GdiDeviceName $gdiForApply -Width $chosenRes.Width -Height $chosenRes.Height -Hz $chosenHz | Out-Null }
+        }
         $script:RP_Result = @{ Width = [uint32]$chosenRes.Width; Height = [uint32]$chosenRes.Height; Hz = $chosenHz }
         $form.DialogResult = [System.Windows.Forms.DialogResult]::OK; $form.Close()
     })
@@ -2447,11 +2749,18 @@ function Show-ResolutionPickerDialog {
         # Load modes after form is visible so UI doesn't freeze
         $lblStatus.Text = "Querying supported modes..."
         [System.Windows.Forms.Application]::DoEvents()
-        $script:RP_Modes = Get-DisplayModesForPattern -Pattern $Pattern
+        $script:RP_Modes = if ($GdiDeviceName) {
+            Write-DebugLog "ResolutionPicker: loading modes via GDI path '$GdiDeviceName'"
+            Get-DisplayModesForGdiDevice -GdiDeviceName $GdiDeviceName
+        } elseif ($Pattern) {
+            Write-DebugLog "ResolutionPicker: loading modes via pattern '$Pattern'"
+            Get-DisplayModesForPattern -Pattern $Pattern
+        } else { @() }
+        Write-DebugLog "ResolutionPicker: got $($script:RP_Modes.Count) modes"
         $lblStatus.Text = if ($script:RP_Modes.Count -gt 0) {
-            "Filtered to $($script:RP_Modes.Count) modes reported by Windows."
+            "$($script:RP_Modes.Count) modes available from Windows."
         } else {
-            "Could not query modes - showing common presets."
+            "Could not query display modes - showing common presets."
         }
         SyncResCombo
     })
@@ -2470,7 +2779,8 @@ function Show-ResolutionPickerGuiForAllDisplays {
     }
     foreach ($nick in $state.displays.PSObject.Properties.Name) {
         $path = Resolve-DisplayPathForNickname -Nickname $nick
-        [void](Show-ResolutionPickerDialog -Nickname $nick -Pattern ($path.GdiDeviceName ?? $path.FriendlyName) `
+        $resPattern = if ($null -ne $path.GdiDeviceName) { $path.GdiDeviceName } else { $path.FriendlyName }
+        [void](Show-ResolutionPickerDialog -Nickname $nick -Pattern $resPattern `
             -CurrentWidth  ($path.Width)    `
             -CurrentHeight ($path.Height)   `
             -CurrentHz     ($path.RefreshHz)`
@@ -2497,11 +2807,11 @@ function Show-MonitorIdentifyOverlays {
     $screens     = [System.Windows.Forms.Screen]::AllScreens
 
     $overlayForms = [System.Collections.Generic.List[System.Windows.Forms.Form]]::new()
-    $idx = 0
     foreach ($path in $activePaths) {
         $screen = $screens | Where-Object { $_.DeviceName -eq $path.GdiDeviceName } | Select-Object -First 1
         if (-not $screen) { continue }
-        $idx++
+        # Extract number from \\.\DISPLAY1 -> "1" to match what Windows Device Settings shows
+        $dispNum = $path.GdiDeviceName -replace '^\\\\\.\\DISPLAY', ''
 
         $nick  = if ($path.FriendlyName) {
             Get-DisplayNicknameFor -FriendlyName $path.FriendlyName -Guid $path.DeviceGuid `
@@ -2524,7 +2834,7 @@ function Show-MonitorIdentifyOverlays {
         $form.ShowInTaskbar   = $false
 
         $lblNum  = New-Object System.Windows.Forms.Label
-        $lblNum.Text      = "$idx"
+        $lblNum.Text      = $dispNum
         $lblNum.Font      = New-Object System.Drawing.Font('Segoe UI', 110, [System.Drawing.FontStyle]::Bold)
         $lblNum.ForeColor = [System.Drawing.Color]::White
         $lblNum.BackColor = [System.Drawing.Color]::Transparent
@@ -2706,7 +3016,10 @@ function Show-DeviceIdentificationGui {
     # Script-block "methods" so closures in event handlers can invoke them via & operator
     # Pre-compute which FriendlyNames are shared by multiple monitors (identical models)
     $nameCount = @{}
-    foreach ($d in $dispList) { $nameCount[$d.FriendlyName] = ($nameCount[$d.FriendlyName] ?? 0) + 1 }
+    foreach ($d in $dispList) {
+        $cur = if ($nameCount.ContainsKey($d.FriendlyName)) { $nameCount[$d.FriendlyName] } else { 0 }
+        $nameCount[$d.FriendlyName] = $cur + 1
+    }
 
     $refreshDisplays = {
         $lvD.Items.Clear()
@@ -2945,11 +3258,11 @@ function Show-ProfileSwitcherGui {
     $lblHint.Font = New-Object System.Drawing.Font($form.Font.FontFamily, 8)
     $form.Controls.Add($lblHint)
 
-    function Refresh-ProfileList {
+    function Update-ProfileList {
         $listBox.Items.Clear()
         foreach ($p in (Get-Profiles)) { $listBox.Items.Add($p) | Out-Null }
     }
-    Refresh-ProfileList
+    Update-ProfileList
 
     # ── Active displays status ────────────────────────────────────────────
     $lblActive = New-Object System.Windows.Forms.Label
@@ -2962,11 +3275,11 @@ function Show-ProfileSwitcherGui {
     $txtStatus.Font = New-Object System.Drawing.Font("Consolas", 8)
     $form.Controls.Add($txtStatus)
 
-    function Refresh-Status {
+    function Update-Status {
         $names = Get-ActiveDisplayNames
         $txtStatus.Text = if ($names) { ($names | ForEach-Object { "  $_" }) -join "`r`n" } else { "  (none)" }
     }
-    Refresh-Status
+    Update-Status
 
     # ── Buttons row 1 ────────────────────────────────────────────────────
     $btnApply     = New-Object System.Windows.Forms.Button
@@ -3023,16 +3336,16 @@ function Show-ProfileSwitcherGui {
                 [System.Windows.Forms.Application]::DoEvents()
             }
         } catch { $outputBox.AppendText("ERROR: $($_.Exception.Message)`r`n") }
-        Refresh-Status
+        Update-Status
     })
 
     $btnIdentify.Add_Click({
         Show-DeviceIdentificationGui
-        Refresh-ProfileList; Refresh-Status
+        Update-ProfileList; Update-Status
         & $updateButtonStates
     })
 
-    $btnRefresh.Add_Click({ Refresh-ProfileList; Refresh-Status })
+    $btnRefresh.Add_Click({ Update-ProfileList; Update-Status })
 
     $listBox.Add_DoubleClick({
         if (-not $listBox.SelectedItem) { return }
@@ -3062,15 +3375,25 @@ function Show-ProfileSwitcherGui {
         $tabFriendly = New-Object System.Windows.Forms.TabPage; $tabFriendly.Text = "Profile Editor"
         $outerTabs.TabPages.Add($tabFriendly)
 
-        $resOptions = @(
-            "(don't change)",
-            "1920x1080 @ 60Hz",  "1920x1080 @ 120Hz",  "1920x1080 @ 144Hz",
-            "2560x1440 @ 60Hz",  "2560x1440 @ 120Hz",  "2560x1440 @ 144Hz", "2560x1440 @ 165Hz",
-            "3840x2160 @ 60Hz",  "3840x2160 @ 120Hz",  "3840x2160 @ 144Hz",
-            "7680x4320 @ 60Hz"
-        )
+        # Build resolution/Hz options by re-querying every currently active display directly.
+        # Design: use Get-AllDisplayPaths (active only) → Get-DisplayModesForGdiDevice per display,
+        # NOT the saved JSON values — so the editor always offers every mode Windows reports
+        # (720p, 900p, 1080p, ...), identical to what Show-ResolutionPickerDialog shows.
+        # Get-UniqueResolutionLabels / Get-UniqueHzLabels are the shared helpers used by both UIs.
+        $activeStOptions = @("On", "Off", "(don't change)")
         $dpiOptions = @("(don't change)", "100%","125%","150%","175%","200%","225%","250%","300%","350%","400%","450%","500%")
         $hdrOptions = @("(don't change)", "On", "Off")
+        $allModesList = [System.Collections.Generic.List[object]]::new()
+        foreach ($ap in (Get-AllDisplayPaths | Where-Object { $_.Active -and $_.GdiDeviceName })) {
+            foreach ($m2 in (Get-DisplayModesForGdiDevice -GdiDeviceName $ap.GdiDeviceName)) {
+                [void]$allModesList.Add($m2)
+            }
+        }
+        $allModes   = $allModesList.ToArray()
+        $resLabels  = if ($allModes.Count -gt 0) { Get-UniqueResolutionLabels -Modes $allModes } else { @() }
+        $hzLabels   = if ($allModes.Count -gt 0) { Get-UniqueHzLabels -Modes $allModes } else { @() }
+        $resOptions = @("(don't change)") + $resLabels
+        $hzOptions  = @("(don't change)") + $hzLabels
 
         # --- Displays DataGridView ---
         $lblDispSec = New-Object System.Windows.Forms.Label
@@ -3090,31 +3413,39 @@ function Show-ProfileSwitcherGui {
 
         $colDNick    = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $colDNick.HeaderText = "Nickname"; $colDNick.Width = 90; $colDNick.ReadOnly = $true; $colDNick.Name = "Nickname"
-        $colDActive  = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
-        $colDActive.HeaderText = "Active"; $colDActive.Width = 52; $colDActive.Name = "Active"
+        $colDActive  = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+        $colDActive.HeaderText = "Active"; $colDActive.Width = 90; $colDActive.Name = "Active"; $colDActive.FlatStyle = 'Flat'
+        foreach ($o in $activeStOptions) { [void]$colDActive.Items.Add($o) }
         $colDPrimary = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
         $colDPrimary.HeaderText = "Primary"; $colDPrimary.Width = 55; $colDPrimary.Name = "Primary"
         $colDRes     = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
-        $colDRes.HeaderText = "Resolution"; $colDRes.Width = 175; $colDRes.Name = "Resolution"; $colDRes.FlatStyle = 'Flat'
+        $colDRes.HeaderText = "Resolution"; $colDRes.Width = 140; $colDRes.Name = "Resolution"; $colDRes.FlatStyle = 'Flat'
         foreach ($o in $resOptions) { [void]$colDRes.Items.Add($o) }
+        $colDHz      = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+        $colDHz.HeaderText = "Hz"; $colDHz.Width = 90; $colDHz.Name = "Hz"; $colDHz.FlatStyle = 'Flat'
+        foreach ($o in $hzOptions) { [void]$colDHz.Items.Add($o) }
         $colDDpi     = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
-        $colDDpi.HeaderText = "DPI"; $colDDpi.Width = 100; $colDDpi.Name = "DPI"; $colDDpi.FlatStyle = 'Flat'
+        $colDDpi.HeaderText = "DPI"; $colDDpi.Width = 90; $colDDpi.Name = "DPI"; $colDDpi.FlatStyle = 'Flat'
         foreach ($o in $dpiOptions) { [void]$colDDpi.Items.Add($o) }
         $colDHdr     = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
-        $colDHdr.HeaderText = "HDR"; $colDHdr.Width = 90; $colDHdr.Name = "HDR"; $colDHdr.FlatStyle = 'Flat'
+        $colDHdr.HeaderText = "HDR"; $colDHdr.Width = 70; $colDHdr.Name = "HDR"; $colDHdr.FlatStyle = 'Flat'
         foreach ($o in $hdrOptions) { [void]$colDHdr.Items.Add($o) }
         $colDMirror  = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
-        $colDMirror.HeaderText = "Mirror Of"; $colDMirror.Width = 100; $colDMirror.Name = "MirrorOf"; $colDMirror.FlatStyle = 'Flat'
+        $colDMirror.HeaderText = "Mirror Of"; $colDMirror.Width = 95; $colDMirror.Name = "MirrorOf"; $colDMirror.FlatStyle = 'Flat'
         [void]$colDMirror.Items.Add("(extend)")
         foreach ($d2 in $prof.displays) { [void]$colDMirror.Items.Add($d2.nickname) }
         [void]$dgvD.Columns.Add($colDNick); [void]$dgvD.Columns.Add($colDActive)
         [void]$dgvD.Columns.Add($colDPrimary); [void]$dgvD.Columns.Add($colDRes)
+        [void]$dgvD.Columns.Add($colDHz)
         [void]$dgvD.Columns.Add($colDDpi); [void]$dgvD.Columns.Add($colDHdr)
         [void]$dgvD.Columns.Add($colDMirror)
 
         foreach ($d in $prof.displays) {
-            $resStr = if ($d.width -and $d.height -and $d.refreshRate) { "$($d.width)x$($d.height) @ $($d.refreshRate)Hz" } else { "(don't change)" }
+            $activeStr = if ($d.active -eq $true) { "On" } elseif ($d.active -eq $false) { "Off" } else { "(don't change)" }
+            $resStr = if ($d.width -and $d.height) { "$($d.width)x$($d.height)" } else { "(don't change)" }
             if ($resStr -ne "(don't change)" -and $colDRes.Items.IndexOf($resStr) -lt 0) { [void]$colDRes.Items.Add($resStr) }
+            $hzStr  = if ($d.refreshRate) { [string][int][Math]::Round($d.refreshRate) } else { "(don't change)" }
+            if ($hzStr -ne "(don't change)" -and $colDHz.Items.IndexOf($hzStr) -lt 0) { [void]$colDHz.Items.Add($hzStr) }
             $dpiEffective = if ($null -ne $d.dpiPercent -and $d.dpiPercent -gt 0) { $d.dpiPercent }
                             elseif ($null -ne $d.dpiScaling -and $d.dpiScaling -gt 0) { $d.dpiScaling }
                             else { $null }
@@ -3122,7 +3453,7 @@ function Show-ProfileSwitcherGui {
             if ($dpiStr -ne "(don't change)" -and $colDDpi.Items.IndexOf($dpiStr) -lt 0) { [void]$colDDpi.Items.Add($dpiStr) }
             $hdrStr    = if ($null -eq $d.hdr) { "(don't change)" } elseif ([bool]$d.hdr) { "On" } else { "Off" }
             $mirrorStr = if ($d.mirrorOf -and $colDMirror.Items.IndexOf($d.mirrorOf) -ge 0) { $d.mirrorOf } else { "(extend)" }
-            [void]$dgvD.Rows.Add($d.nickname, [bool]$d.active, [bool]$d.primary, $resStr, $dpiStr, $hdrStr, $mirrorStr)
+            [void]$dgvD.Rows.Add($d.nickname, $activeStr, [bool]$d.primary, $resStr, $hzStr, $dpiStr, $hdrStr, $mirrorStr)
         }
 
         # --- Audio DataGridView ---
@@ -3143,15 +3474,17 @@ function Show-ProfileSwitcherGui {
 
         $colANick    = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $colANick.HeaderText = "Nickname"; $colANick.Width = 130; $colANick.ReadOnly = $true; $colANick.Name = "Nickname"
-        $colADefault = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
-        $colADefault.HeaderText = "Set Default"; $colADefault.Width = 78; $colADefault.Name = "SetDefault"
+        $colADefault = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
+        $colADefault.HeaderText = "Set Default"; $colADefault.Width = 130; $colADefault.Name = "SetDefault"; $colADefault.FlatStyle = 'Flat'
+        foreach ($o in $activeStOptions) { [void]$colADefault.Items.Add($o) }
         $colAVol     = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-        $colAVol.HeaderText = "Volume 0-100 (blank = don't change)"; $colAVol.Width = 250; $colAVol.Name = "Volume"
+        $colAVol.HeaderText = "Volume 0-100 (blank = don't change)"; $colAVol.Width = 258; $colAVol.Name = "Volume"
         [void]$dgvA.Columns.Add($colANick); [void]$dgvA.Columns.Add($colADefault); [void]$dgvA.Columns.Add($colAVol)
 
         foreach ($a in $prof.audio) {
+            $defStr = if ($a.setDefault -eq $true) { "On" } elseif ($a.setDefault -eq $false) { "Off" } else { "(don't change)" }
             $volStr = if ($null -ne $a.volume) { [string]$a.volume } else { "" }
-            [void]$dgvA.Rows.Add($a.nickname, [bool]$a.setDefault, $volStr)
+            [void]$dgvA.Rows.Add($a.nickname, $defStr, $volStr)
         }
 
         # --- Start Processes DataGridView ---
@@ -3229,7 +3562,7 @@ function Show-ProfileSwitcherGui {
                     $st3.profiles | Add-Member -NotePropertyName $profName -NotePropertyValue $parsed -Force
                     Save-State $st3
                     $editForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
-                    $editForm.Close(); Refresh-ProfileList
+                    $editForm.Close(); Update-ProfileList
                 } catch {
                     [System.Windows.Forms.MessageBox]::Show("Invalid JSON: $($_.Exception.Message)", "Error",
                         [System.Windows.Forms.MessageBoxButtons]::OK,
@@ -3240,11 +3573,16 @@ function Show-ProfileSwitcherGui {
                 $newDisp = @()
                 foreach ($row in $dgvD.Rows) {
                     $nick = $row.Cells["Nickname"].Value; if (-not $nick) { continue }
+                    $actVal = if ($row.Cells["Active"].Value) { $row.Cells["Active"].Value.ToString() } else { "(don't change)" }
+                    $activeBool = if ($actVal -eq "On") { $true } elseif ($actVal -eq "Off") { $false } else { $null }
                     $resVal = $row.Cells["Resolution"].Value
-                    $w = $h = $hz = $null
-                    if ($resVal -and $resVal -ne "(don't change)" -and $resVal -match '^(\d+)x(\d+)\s*@\s*(\d+)Hz$') {
-                        $w = [uint32]$Matches[1]; $h = [uint32]$Matches[2]; $hz = [uint32]$Matches[3]
+                    $w = $h = $null
+                    if ($resVal -and $resVal -ne "(don't change)" -and $resVal -match '^(\d+)x(\d+)$') {
+                        $w = [uint32]$Matches[1]; $h = [uint32]$Matches[2]
                     }
+                    $hzVal = $row.Cells["Hz"].Value
+                    $hz = $null
+                    if ($hzVal -and $hzVal -ne "(don't change)" -and $hzVal -match '^\d+$') { $hz = [uint32]$hzVal }
                     $dpiVal = $row.Cells["DPI"].Value
                     $dpiPct = $null
                     if ($dpiVal -and $dpiVal -ne "(don't change)" -and $dpiVal -match '^(\d+)%$') { $dpiPct = [uint32]$Matches[1] }
@@ -3254,7 +3592,7 @@ function Show-ProfileSwitcherGui {
                     $mo = if ($moVal -and $moVal -ne "(extend)" -and $moVal -ne $nick) { $moVal } else { $null }
                     $newDisp += [ordered]@{
                         nickname    = $nick
-                        active      = [bool]$row.Cells["Active"].Value
+                        active      = $activeBool
                         primary     = [bool]$row.Cells["Primary"].Value
                         width       = $w; height = $h; refreshRate = $hz
                         dpiPercent  = $dpiPct; hdr = $hdrBool; rotation = $null
@@ -3265,6 +3603,8 @@ function Show-ProfileSwitcherGui {
                 $newAudio = @()
                 foreach ($row in $dgvA.Rows) {
                     $nick = $row.Cells["Nickname"].Value; if (-not $nick) { continue }
+                    $defVal = if ($row.Cells["SetDefault"].Value) { $row.Cells["SetDefault"].Value.ToString() } else { "(don't change)" }
+                    $setDef = if ($defVal -eq "On") { $true } elseif ($defVal -eq "Off") { $false } else { $null }
                     $volRaw = $row.Cells["Volume"].Value
                     $vol    = $null
                     if (-not [string]::IsNullOrWhiteSpace($volRaw)) {
@@ -3273,7 +3613,7 @@ function Show-ProfileSwitcherGui {
                         }
                         $vol = [int]$volRaw
                     }
-                    $newAudio += [ordered]@{ nickname = $nick; setDefault = [bool]$row.Cells["SetDefault"].Value; volume = $vol }
+                    $newAudio += [ordered]@{ nickname = $nick; setDefault = $setDef; volume = $vol }
                 }
 
                 $newProcs = @()
@@ -3290,7 +3630,7 @@ function Show-ProfileSwitcherGui {
                 $st3.profiles | Add-Member -NotePropertyName $profName -NotePropertyValue $newProf -Force
                 Save-State $st3
                 $editForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
-                $editForm.Close(); Refresh-ProfileList
+                $editForm.Close(); Update-ProfileList
             }
         })
         $btnCancelEdit.Add_Click({ $editForm.Close() })
@@ -3313,7 +3653,7 @@ function Show-ProfileSwitcherGui {
         try {
             Save-ProfileInteractive -Name $name -ResolutionPrompt Gui *>&1 | ForEach-Object { $outputBox.AppendText("$_`r`n") }
         } catch { $outputBox.AppendText("ERROR: $($_.Exception.Message)`r`n") }
-        Refresh-ProfileList
+        Update-ProfileList
     })
 
     $btnDelete.Add_Click({
@@ -3325,7 +3665,7 @@ function Show-ProfileSwitcherGui {
             [System.Windows.Forms.MessageBoxIcon]::Warning)
         if ($conf -eq [System.Windows.Forms.DialogResult]::Yes) {
             Remove-Profile -Name $name
-            Refresh-ProfileList
+            Update-ProfileList
         }
     })
 
@@ -3339,6 +3679,8 @@ function Show-ProfileSwitcherGui {
 #region SECTION: CLI_Entry_Point
 # =============================================================================
 
+if ($DebugMode) { $Script:DebugMode = $true; Write-DebugLog "Debug mode enabled." }
+
 if ($Help -or ($RemainingArgs | Where-Object { $_ -match '^-{1,2}h(elp)?$' })) {
     Show-Help; return
 }
@@ -3349,7 +3691,7 @@ elseif ($RemainingArgs -and $RemainingArgs.Count -gt 0) {
 }
 
 switch ($PSCmdlet.ParameterSetName) {
-    'ApplyProfile' { Invoke-Profile -Name $Profile }
+    'ApplyProfile' { Invoke-Profile -Name $HwProfile }
     'ListProfiles' { Show-Profiles }
     'ListDevices'  {
         Write-Section "Active Displays"
