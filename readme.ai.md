@@ -4,6 +4,26 @@ Read this before editing the script. The file is ~2500 lines; use the grep patte
 
 ---
 
+## Architecture: three-layer display abstraction
+
+```
+Physical Monitor  <->  hardware identity  <->  Nickname  <->  Profile
+```
+
+| Layer | Identified by | Stored in |
+|---|---|---|
+| Physical | adapterLUID+targetId (runtime), edidManufactureId+edidProductCodeId+connectorInstance (stable) | resolved live |
+| Nickname | stable abstract name chosen by user | `devices.json .displays.<nick>` |
+| Profile | nickname references + settings | `devices.json .profiles.<name>` |
+
+**Design decisions:**
+- No FriendlyName pattern matching — patterns are ambiguous for identical monitor models.
+- Hardware identity has two tiers: GPU port (LUID+TargetId, session-stable) then EDID (stable across reboots on same port type).
+- The `@ADAPTER:HIGH-LOW:TARGETID` key format is accepted by all `DisplayNative` C# methods, enabling unambiguous routing to a specific physical port.
+- `Resolve-DisplayPathForNickname` is the single resolution point — all profile-apply and save-profile code uses it.
+
+---
+
 ## Section map
 
 Every logical block is wrapped with `#region SECTION: <Name>` / `#endregion SECTION: <Name>`.
@@ -87,12 +107,15 @@ Save-Profile                 → write to devices.json
 
 ### Display path resolution chain
 ```
-Pattern (substring of FriendlyName)
-  → Get-AllDisplayPaths       returns PSCustomObject with GdiDeviceName, DpiPercent, …
-  → Get-GdiDeviceNameForPattern
-  → [DisplayNative]::GetDisplayModes / SetDisplayMode   (EnumDisplaySettings / ChangeDisplaySettingsEx)
-  → [DisplayNative]::SetDpiPercent                      (DisplayConfigSetDeviceInfo DI_SET_DPI_SCALE)
-  → [DisplayNative]::SetHdrEnabled                      (DisplayConfigSetDeviceInfo DI_SET_HDR_STATE)
+Nickname
+  → Resolve-DisplayPathForNickname    hardware-identity lookup (Tier 1: LUID+TargetId, Tier 2: EDID)
+  → path.GdiDeviceName               direct GDI device name — no FriendlyName involved
+  → Set-DisplayModeForGdiDevice       EnumDisplaySettings / ChangeDisplaySettingsEx
+  → [DisplayNative]::SetDpiPercent    DisplayConfigSetDeviceInfo DI_SET_DPI_SCALE
+  → [DisplayNative]::SetHdrEnabled    DisplayConfigSetDeviceInfo DI_SET_HDR_STATE
+ConfigureTopology / EnableMonitorByName / SetPrimaryByName
+  → Get-HardwareKeyForNickname        "@ADAPTER:HIGH-LOW:TARGETID" key
+  → [DisplayNative] C# methods        MatchPath() routes by LUID+TargetId, not FriendlyName
 ```
 
 ---
@@ -103,11 +126,14 @@ Pattern (substring of FriendlyName)
 {
   "displays": {
     "<nickname>": {
-      "pattern":     "substring of FriendlyName",
-      "notes":       "",
-      "guid":        "GUID extracted from MonitorDevicePath",
-      "adapterLUID": "<high>-<low>",
-      "targetId":    "<uint>"
+      "notes":             "",
+      "friendlyName":      "HP E27q G4",        // display only, not used for matching
+      "adapterLUID":       "0-12345",            // Tier 1 match key (runtime GPU port)
+      "targetId":          "42",                 // Tier 1 match key
+      "connectorInstance": 4,                    // Tier 2 match key (0,1,2... per connector type)
+      "edidManufactureId": 8785,                 // Tier 2 match key (EDID vendor ID)
+      "edidProductCodeId": 12345,                // Tier 2 match key (EDID product code)
+      "serial":            "ABC123"              // Tier 2 refinement (optional)
     }
   },
   "audio": {
@@ -149,8 +175,8 @@ Pattern (substring of FriendlyName)
 
 ## Conventions
 
-- **Patterns** are plain substrings (not regex) matched with `[regex]::Escape()` — safe to use the full `FriendlyName` as the pattern value.
-- **Nicknames** are the stable internal key used in profiles. Patterns can change (monitor renamed); the nickname stays.
+- **Nicknames** are the stable internal key used in profiles. Physical monitors are resolved from nicknames via hardware identity (adapterLUID+targetId first, EDID second) — never by FriendlyName pattern.
+- **Hardware keys** (`@ADAPTER:HIGH-LOW:TARGETID`) are accepted by all `DisplayNative` C# methods. `Get-HardwareKeyForNickname` produces them; `MatchPath()` inside C# consumes them.
 - **DPI values** are constrained to `[DisplayNative]::DpiValues` = `{ 100,125,150,175,200,225,250,300,350,400,450,500 }`. Any other value will fail silently in `SetDpiPercent`.
 - **`dpiScaling`** is the legacy field name for `dpiPercent` in old profile entries — `Invoke-Profile` handles both transparently.
 - **Audio deduplication**: `Get-AllAudioDevices` returns every endpoint including inactive/virtual ones. Both wizards group by `FriendlyName|Type` and present the best representative (default > active). The `DuplicateCount` property is attached by the wizard; `AudioNative.GetAllDevices()` does not set it.
