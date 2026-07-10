@@ -3,6 +3,7 @@
 A CLI and GUI Windows PowerShell 5 tool to quickly save and apply Monitor + Audio configurations as named profiles.
 
 > **Requires Windows PowerShell 5.1 — incompatible with PowerShell 7.**
+> Requires C# (5.0 in v1)
 
 ---
 
