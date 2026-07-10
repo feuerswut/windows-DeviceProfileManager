@@ -605,10 +605,11 @@ public static class DisplayNative
             if (rest.Length == 2)
             {
                 var lp = rest[0].Split('-');
+                int hi; uint lo; uint tid;
                 if (lp.Length == 2 &&
-                    int.TryParse(lp[0],  out int  hi) &&
-                    uint.TryParse(lp[1], out uint lo) &&
-                    uint.TryParse(rest[1], out uint tid))
+                    int.TryParse(lp[0],  out hi) &&
+                    uint.TryParse(lp[1], out lo) &&
+                    uint.TryParse(rest[1], out tid))
                 {
                     return p.targetInfo.adapterId.HighPart == hi &&
                            p.targetInfo.adapterId.LowPart  == lo &&
