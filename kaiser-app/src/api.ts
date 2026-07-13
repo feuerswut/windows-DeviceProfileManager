@@ -19,8 +19,8 @@ export const api = {
     return invoke("list_displays");
   },
 
-  toggleDisplay(display_id: DisplayId): Promise<void> {
-    return invoke("toggle_display", { display_id });
+  toggleDisplay(displayId: DisplayId): Promise<void> {
+    return invoke("toggle_display", { displayId });
   },
 
   applyLayout(layout: Layout): Promise<void> {
@@ -47,23 +47,23 @@ export const api = {
     return invoke("list_audio_devices");
   },
 
-  setAudioVolume(device_id: string, volume: number): Promise<void> {
-    return invoke("set_audio_volume", { device_id, volume });
+  setAudioVolume(deviceId: string, volume: number): Promise<void> {
+    return invoke("set_audio_volume", { deviceId, volume });
   },
 
-  setAudioMute(device_id: string, muted: boolean): Promise<void> {
-    return invoke("set_audio_mute", { device_id, muted });
+  setAudioMute(deviceId: string, muted: boolean): Promise<void> {
+    return invoke("set_audio_mute", { deviceId, muted });
   },
 
-  setDefaultAudioDevice(device_id: string): Promise<void> {
-    return invoke("set_default_audio_device", { device_id });
+  setDefaultAudioDevice(deviceId: string): Promise<void> {
+    return invoke("set_default_audio_device", { deviceId });
   },
 
-  listDisplayModes(gdi_device_name: string): Promise<DisplayMode[]> {
-    return invoke("list_display_modes", { gdi_device_name });
+  listDisplayModes(gdiDeviceName: string): Promise<DisplayMode[]> {
+    return invoke("list_display_modes", { gdiDeviceName });
   },
 
-  setDisplayMode(gdi_device_name: string, mode: DisplayMode): Promise<void> {
-    return invoke("set_display_mode", { gdi_device_name, mode });
+  setDisplayMode(gdiDeviceName: string, mode: DisplayMode): Promise<void> {
+    return invoke("set_display_mode", { gdiDeviceName, mode });
   },
 };

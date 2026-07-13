@@ -2,7 +2,7 @@
 mod win32;
 
 #[cfg(target_os = "windows")]
-pub use win32::{list_display_modes, set_display_mode, DisplayMode};
+pub use win32::{get_current_display_mode, list_display_modes, set_display_mode, DisplayMode};
 
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]

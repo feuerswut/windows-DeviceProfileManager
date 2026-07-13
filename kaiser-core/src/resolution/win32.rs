@@ -86,6 +86,7 @@ pub fn set_display_mode(gdi_device_name: &str, mode: &DisplayMode) -> anyhow::Re
     }
 }
 
+#[allow(dead_code)]
 pub fn get_current_display_mode(gdi_device_name: &str) -> anyhow::Result<DisplayMode> {
     let device_wide = to_wide_null(gdi_device_name);
     let mut devmode = DEVMODEW::default();
