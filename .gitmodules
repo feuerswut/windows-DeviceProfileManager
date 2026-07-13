@@ -1,0 +1,3 @@
+[submodule "SetResolution"]
+	path = SetResolution
+	url = https://github.com/feuerswut/SetResolution
