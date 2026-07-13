@@ -1,0 +1,65 @@
+{
+  "format": 1,
+  "restore": {
+    "c:\\Users\\hasc9\\etc\\px\\SetResolutionAdapters\\SetResolutionAdapters.csproj": {}
+  },
+  "projects": {
+    "c:\\Users\\hasc9\\etc\\px\\SetResolutionAdapters\\SetResolutionAdapters.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "c:\\Users\\hasc9\\etc\\px\\SetResolutionAdapters\\SetResolutionAdapters.csproj",
+        "projectName": "SetResolutionAdapters",
+        "projectPath": "c:\\Users\\hasc9\\etc\\px\\SetResolutionAdapters\\SetResolutionAdapters.csproj",
+        "packagesPath": "C:\\Users\\hasc9\\.nuget\\packages\\",
+        "outputPath": "c:\\Users\\hasc9\\etc\\px\\SetResolutionAdapters\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\hasc9\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net472"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net472": {
+            "framework": "net472",
+            "targetAlias": "net472",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.300"
+      },
+      "frameworks": {
+        "net472": {
+          "framework": "net472",
+          "targetAlias": "net472",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            },
+            "Newtonsoft.Json": {
+              "target": "Package",
+              "version": "[13.0.3, )"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.301\\RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

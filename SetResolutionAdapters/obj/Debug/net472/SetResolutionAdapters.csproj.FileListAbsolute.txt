@@ -1,0 +1,12 @@
+C:\Users\hasc9\etc\px\SetResolutionAdapters\bin\Debug\net472\SetResolutionAdapters.dll
+C:\Users\hasc9\etc\px\SetResolutionAdapters\bin\Debug\net472\SetResolutionAdapters.pdb
+C:\Users\hasc9\etc\px\SetResolutionAdapters\bin\Debug\net472\Newtonsoft.Json.dll
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.csproj.AssemblyReference.cache
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.AssemblyInfoInputs.cache
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.AssemblyInfo.cs
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.csproj.CoreCompileInputs.cache
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.sourcelink.json
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResol.43DCE40B.Up2Date
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.dll
+C:\Users\hasc9\etc\px\SetResolutionAdapters\obj\Debug\net472\SetResolutionAdapters.pdb
