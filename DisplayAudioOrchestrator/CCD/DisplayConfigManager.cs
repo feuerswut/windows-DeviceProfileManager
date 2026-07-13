@@ -192,24 +192,72 @@ namespace DisplayAudioOrchestrator.CCD
 
             var gdiNames = BuildGdiMap(paths, numPaths);
 
-            for (int i = 0; i < numPaths; i++)
+            // QDC_ALL_PATHS returns one path per (source, target) connector pair.
+            // Group by (adapterId, sourceId) — each group is one GDI scanout plane.
+            // Windows requires exactly ONE active path per source in extend topology;
+            // marking multiple paths for the same source active causes ERROR_INVALID_PARAMETER (87).
+            var sourceGroups = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+            for (int i = 0; i < (int)numPaths; i++)
             {
-                string gdi = gdiNames.ContainsKey(i) ? gdiNames[i] : string.Empty;
+                string key = $"{paths[i].sourceInfo.adapterId.LowPart}_{paths[i].sourceInfo.adapterId.HighPart}_{paths[i].sourceInfo.id}";
+                if (!sourceGroups.ContainsKey(key)) sourceGroups[key] = new List<int>();
+                sourceGroups[key].Add(i);
+            }
 
-                bool shouldEnable  = enablePatterns  != null && enablePatterns.Length  > 0 && MatchesAny(gdi, enablePatterns);
-                bool shouldDisable = disablePatterns != null && disablePatterns.Length > 0 && MatchesAny(gdi, disablePatterns);
+            var activate = new HashSet<int>();
 
-                if (shouldEnable)
+            foreach (var grp in sourceGroups.Values)
+            {
+                string gdi = string.Empty;
+                foreach (int idx in grp)
+                    if (gdiNames.ContainsKey(idx) && !string.IsNullOrEmpty(gdiNames[idx]))
+                    { gdi = gdiNames[idx]; break; }
+
+                bool wantEnable  = !string.IsNullOrEmpty(gdi) && enablePatterns  != null && MatchesAny(gdi, enablePatterns);
+                bool wantDisable = !string.IsNullOrEmpty(gdi) && disablePatterns != null && MatchesAny(gdi, disablePatterns);
+
+                int currentActive = -1;
+                foreach (int idx in grp)
+                    if ((paths[idx].flags & DisplayConfigFlags.DISPLAYCONFIG_PATH_ACTIVE) != 0)
+                    { currentActive = idx; break; }
+
+                if (wantDisable) continue;
+
+                int best = -1;
+                if (wantEnable)
+                {
+                    // Prefer path to a connected monitor (targetAvailable), then
+                    // the already-active path, then the first path in the group.
+                    foreach (int idx in grp)
+                        if (paths[idx].targetInfo.targetAvailable != 0) { best = idx; break; }
+                    if (best < 0) best = currentActive >= 0 ? currentActive : grp[0];
+                }
+                else
+                {
+                    best = currentActive; // keep existing active path
+                }
+
+                if (best >= 0) activate.Add(best);
+            }
+
+            // Exactly one active path per source; all mode indices invalidated so
+            // SDC_TOPOLOGY_SUPPLIED lets Windows look up modes from its database.
+            for (int i = 0; i < (int)numPaths; i++)
+            {
+                if (activate.Contains(i))
                     paths[i].flags |= DisplayConfigFlags.DISPLAYCONFIG_PATH_ACTIVE;
-                else if (shouldDisable)
+                else
                     paths[i].flags &= ~DisplayConfigFlags.DISPLAYCONFIG_PATH_ACTIVE;
+
+                paths[i].sourceInfo.modeInfoIdx = 0xFFFFFFFF;
+                paths[i].targetInfo.modeInfoIdx = 0xFFFFFFFF;
             }
 
             uint setFlags = DisplayConfigFlags.SDC_APPLY |
-                            DisplayConfigFlags.SDC_USE_SUPPLIED_DISPLAY_CONFIG |
-                            DisplayConfigFlags.SDC_SAVE_TO_DATABASE |
+                            DisplayConfigFlags.SDC_TOPOLOGY_SUPPLIED |
+                            DisplayConfigFlags.SDC_ALLOW_PATH_ORDER_CHANGES |
                             DisplayConfigFlags.SDC_ALLOW_CHANGES;
-            rc = DisplayConfigNativeMethods.SetDisplayConfig(numPaths, paths, numModes, modes, setFlags);
+            rc = DisplayConfigNativeMethods.SetDisplayConfig(numPaths, paths, 0, null, setFlags);
             if (rc != 0) throw new InvalidOperationException($"SetDisplayConfig topology failed: {rc}");
         }
 

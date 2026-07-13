@@ -21,7 +21,7 @@ namespace DisplayAudioOrchestrator.GUI
         private TextBox  _txtOutput;
         private Button   _btnApply;
         private Button   _btnSave;
-        private Button   _btnDelete;
+        private Button   _btnEdit;
         private Button   _btnFlash;
         private Button   _btnBrowseDevices;
         private Label    _lblStatus;
@@ -71,12 +71,12 @@ namespace DisplayAudioOrchestrator.GUI
             _lstProfiles.DoubleClick += (s, e) => ApplySelectedProfile();
             grpProfiles.Controls.Add(_lstProfiles);
 
-            _btnApply  = new Button { Text = "Apply",  Left = 8,   Width = 95, Height = 28, Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
-            _btnDelete = new Button { Text = "Delete", Left = 109, Width = 95, Height = 28, Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
-            grpProfiles.Controls.AddRange(new Control[] { _btnApply, _btnDelete });
+            _btnApply = new Button { Text = "Apply",        Left = 8,   Width = 95, Height = 28, Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
+            _btnEdit  = new Button { Text = "Edit / Delete", Left = 109, Width = 95, Height = 28, Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
+            grpProfiles.Controls.AddRange(new Control[] { _btnApply, _btnEdit });
 
-            _btnApply.Click  += (s, e) => ApplySelectedProfile();
-            _btnDelete.Click += BtnDelete_Click;
+            _btnApply.Click += (s, e) => ApplySelectedProfile();
+            _btnEdit.Click  += BtnEdit_Click;
 
             // ── Right: output box ─────────────────────────────────────────────
             var grpOutput = new GroupBox
@@ -207,8 +207,8 @@ namespace DisplayAudioOrchestrator.GUI
             _lstProfiles.Items.Clear();
             foreach (var kv in _state.Profiles)
                 _lstProfiles.Items.Add(kv.Key);
-            _btnApply.Enabled  = _lstProfiles.Items.Count > 0;
-            _btnDelete.Enabled = _lstProfiles.Items.Count > 0;
+            _btnApply.Enabled = _lstProfiles.Items.Count > 0;
+            _btnEdit.Enabled  = _lstProfiles.Items.Count > 0;
         }
 
         private void RefreshStatus()
@@ -338,17 +338,33 @@ namespace DisplayAudioOrchestrator.GUI
             }
         }
 
-        // ── Delete profile ────────────────────────────────────────────────────
+        // ── Edit / Delete profile ─────────────────────────────────────────────
 
-        private void BtnDelete_Click(object sender, EventArgs e)
+        private void BtnEdit_Click(object sender, EventArgs e)
         {
             if (_lstProfiles.SelectedItem == null) return;
             string name = _lstProfiles.SelectedItem.ToString();
-            if (MessageBox.Show($"Delete profile '{name}'?", "Confirm", MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Question) != DialogResult.Yes) return;
-            _state.Profiles.Remove(name);
-            StateStore.Save(_state);
-            RefreshProfiles();
+            if (!_state.Profiles.TryGetValue(name, out var profile)) return;
+
+            using (var dlg = new ProfileEditorForm(name, profile))
+            {
+                dlg.ShowDialog(this);
+                switch (dlg.Action)
+                {
+                    case ProfileEditorForm.EditorAction.Saved:
+                        if (!dlg.NewName.Equals(name, StringComparison.Ordinal))
+                            _state.Profiles.Remove(name);
+                        _state.Profiles[dlg.NewName] = dlg.EditedProfile;
+                        StateStore.Save(_state);
+                        RefreshProfiles();
+                        break;
+                    case ProfileEditorForm.EditorAction.Deleted:
+                        _state.Profiles.Remove(name);
+                        StateStore.Save(_state);
+                        RefreshProfiles();
+                        break;
+                }
+            }
         }
 
         // ── Browse devices ────────────────────────────────────────────────────
