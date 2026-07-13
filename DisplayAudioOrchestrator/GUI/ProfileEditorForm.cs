@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using System.Windows.Forms;
-using DisplayAudioOrchestrator.CCD;
+using DisplayAudioOrchestrator.Audio;
 using DisplayAudioOrchestrator.Orchestrator;
 using SetResolutionAdapters;
 
@@ -17,16 +18,13 @@ namespace DisplayAudioOrchestrator.GUI
         public OrchestratorProfile EditedProfile { get; private set; }
 
         private readonly string _originalName;
-        private bool _suppressEvents;
-        private int  _currentDisplayIndex = -1;
-
-        private readonly List<ProfileDisplay>             _displayList;
-        private readonly Dictionary<string, List<DisplayModeInfo>> _modeCache;
+        private readonly List<DisplayDeviceInfo> _displayDevices;
+        private readonly List<AudioDeviceInfo>   _audioDevices;
+        private readonly Dictionary<string, List<DisplayModeInfo>> _modeCache =
+            new Dictionary<string, List<DisplayModeInfo>>(StringComparer.OrdinalIgnoreCase);
 
         private TextBox      _txtName;
-        private ListBox      _lstDisplays;
-        private Panel        _pnlDetail;
-        private ComboBox     _cmbGdi, _cmbActive, _cmbPrimary, _cmbResolution, _cmbHz, _cmbDpi, _cmbHdr;
+        private DataGridView _dgvDisplays;
         private DataGridView _dgvAudio;
         private DataGridView _dgvProcesses;
 
@@ -34,15 +32,28 @@ namespace DisplayAudioOrchestrator.GUI
 
         public ProfileEditorForm(string profileName, OrchestratorProfile profile)
         {
-            _originalName = profileName;
-            _displayList  = new List<ProfileDisplay>(profile.Displays ?? new List<ProfileDisplay>());
-            _modeCache    = new Dictionary<string, List<DisplayModeInfo>>(StringComparer.OrdinalIgnoreCase);
+            _originalName   = profileName;
+            _displayDevices = LoadDisplayDevices();
+            _audioDevices   = LoadAudioDevices();
             InitComponents();
             _txtName.Text = profileName;
-            RefreshDisplayList();
-            if (_displayList.Count > 0) SelectDisplay(0);
-            PopulateAudio(profile.Audio ?? new List<ProfileAudio>());
+            PopulateDisplays(profile.Displays       ?? new List<ProfileDisplay>());
+            PopulateAudio(profile.Audio             ?? new List<ProfileAudio>());
             PopulateProcesses(profile.StartProcesses ?? new List<StartProcess>());
+        }
+
+        // ── Device loading ────────────────────────────────────────────────────
+
+        private static List<DisplayDeviceInfo> LoadDisplayDevices()
+        {
+            try   { return DisplayManagerAdapter.GetAllDisplayDevices(); }
+            catch { return new List<DisplayDeviceInfo>(); }
+        }
+
+        private static List<AudioDeviceInfo> LoadAudioDevices()
+        {
+            try   { return AudioManager.GetAllDevices().Where(d => d.State == 1).ToList(); }
+            catch { return new List<AudioDeviceInfo>(); }
         }
 
         // ── Init ──────────────────────────────────────────────────────────────
@@ -68,14 +79,36 @@ namespace DisplayAudioOrchestrator.GUI
             var tabP = new TabPage("Processes");
             tabs.TabPages.AddRange(new TabPage[] { tabD, tabA, tabP });
 
-            InitDisplaysTab(tabD);
+            // Displays tab — monitor picker + dynamic resolution/hz combos
+            _dgvDisplays = CreateGrid();
+            _dgvDisplays.Columns.Add(MonitorCombo());
+            _dgvDisplays.Columns.Add(BoolCombo("Active",  "Active",  60));
+            _dgvDisplays.Columns.Add(BoolCombo("Primary", "Primary", 62));
+            _dgvDisplays.Columns.Add(DynCombo("Resolution", "Resolution", 115));
+            _dgvDisplays.Columns.Add(DynCombo("Hz", "Hz", 55));
+            _dgvDisplays.Columns.Add(TxtCol("DpiPercent", "DPI%", 52));
+            _dgvDisplays.Columns.Add(BoolCombo("Hdr", "HDR", 52));
+            _dgvDisplays.EditingControlShowing        += DgvDisplays_EditingControlShowing;
+            _dgvDisplays.CurrentCellDirtyStateChanged += (s, e) =>
+            {
+                if (_dgvDisplays.IsCurrentCellDirty && _dgvDisplays.CurrentCell?.ColumnIndex == 0)
+                    _dgvDisplays.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            AddGridWithButtons(tabD, _dgvDisplays);
 
+            // Audio tab — device picker, type auto-fills
             _dgvAudio = CreateGrid();
-            _dgvAudio.Columns.Add(TxtCol("Pattern", "Pattern (FriendlyName)", 260, true));
+            _dgvAudio.Columns.Add(AudioDeviceCombo());
             _dgvAudio.Columns.Add(TypeCombo());
             _dgvAudio.Columns.Add(BoolCombo("SetDefault", "Default", 65));
             _dgvAudio.Columns.Add(TxtCol("Volume", "Vol%", 52));
             _dgvAudio.Columns.Add(BoolCombo("Mute", "Mute", 55));
+            _dgvAudio.CurrentCellDirtyStateChanged += (s, e) =>
+            {
+                if (_dgvAudio.IsCurrentCellDirty && _dgvAudio.CurrentCell?.ColumnIndex == 0)
+                    _dgvAudio.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            _dgvAudio.CellValueChanged += DgvAudio_DeviceChanged;
             AddGridWithButtons(tabA, _dgvAudio);
 
             _dgvProcesses = CreateGrid();
@@ -98,80 +131,83 @@ namespace DisplayAudioOrchestrator.GUI
             Load   += (s, e) => DoLayout();
         }
 
-        private void InitDisplaysTab(TabPage tab)
+        // ── Column factories ──────────────────────────────────────────────────
+
+        private DataGridViewComboBoxColumn MonitorCombo()
         {
-            var split = new SplitContainer
+            var col = new DataGridViewComboBoxColumn
             {
-                Dock = DockStyle.Fill, Orientation = Orientation.Vertical,
-                SplitterDistance = 195, SplitterWidth = 5
+                Name = "Monitor", HeaderText = "Monitor",
+                FlatStyle = FlatStyle.Flat,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
             };
-            tab.Controls.Add(split);
-
-            // Left: list + buttons
-            _lstDisplays = new ListBox { Dock = DockStyle.Fill, Font = new Font("Segoe UI", 9f) };
-            _lstDisplays.SelectedIndexChanged += LstDisplays_SelectionChanged;
-            split.Panel1.Controls.Add(_lstDisplays);
-
-            var pnlListBtns = new Panel { Dock = DockStyle.Bottom, Height = 36 };
-            var btnAdd = new Button { Text = "Add",    Left = 4,  Top = 4, Width = 60, Height = 28 };
-            var btnRem = new Button { Text = "Remove", Left = 68, Top = 4, Width = 70, Height = 28 };
-            btnAdd.Click += BtnAddDisplay_Click;
-            btnRem.Click += BtnRemoveDisplay_Click;
-            pnlListBtns.Controls.AddRange(new Control[] { btnAdd, btnRem });
-            split.Panel1.Controls.Add(pnlListBtns);
-
-            // Right: detail fields
-            _pnlDetail = new Panel { Dock = DockStyle.Fill };
-            split.Panel2.Controls.Add(_pnlDetail);
-
-            int y = 10;
-            _cmbGdi     = DetailRow("GDI Name:", ref y, ComboBoxStyle.DropDown);
-            _cmbActive  = DetailRow("Active:",   ref y, items: BoolItems);
-            _cmbPrimary = DetailRow("Primary:",  ref y, items: BoolItems);
-            DetailSep(ref y);
-            _cmbResolution = DetailRow("Resolution:", ref y, ComboBoxStyle.DropDown);
-            _cmbHz         = DetailRow("Hz:",         ref y, ComboBoxStyle.DropDown);
-            DetailSep(ref y);
-
-            uint[] dpiVals = DisplayConfigFlags.DpiValues;
-            var dpiItems = new string[dpiVals.Length + 1];
-            dpiItems[0] = "";
-            for (int i = 0; i < dpiVals.Length; i++) dpiItems[i + 1] = dpiVals[i].ToString();
-            _cmbDpi = DetailRow("DPI%:", ref y, ComboBoxStyle.DropDown, dpiItems);
-            _cmbHdr = DetailRow("HDR:",  ref y, items: BoolItems);
-
-            _cmbGdi.DropDown += CmbGdi_DropDown;
-            _cmbGdi.Leave    += (s, e) => OnGdiChanged();
-            _cmbGdi.KeyDown  += (s, e) => { if (e.KeyCode == Keys.Enter) OnGdiChanged(); };
-
-            _cmbResolution.SelectedIndexChanged += CmbResolution_Changed;
-            _cmbResolution.Leave += (s, e) => { if (!_suppressEvents) CmbResolution_Changed(s, e); };
-
-            foreach (ComboBox c in new[] { _cmbActive, _cmbPrimary, _cmbHz, _cmbDpi, _cmbHdr })
-                c.SelectedIndexChanged += (s, e) => { if (!_suppressEvents) SaveDetailToList(); };
-            _cmbHz.Leave  += (s, e) => { if (!_suppressEvents) SaveDetailToList(); };
-            _cmbDpi.Leave += (s, e) => { if (!_suppressEvents) SaveDetailToList(); };
-
-            _pnlDetail.Enabled = false;
+            foreach (var dev in _displayDevices)
+                col.Items.Add(FormatMonitor(dev));
+            return col;
         }
 
-        private ComboBox DetailRow(string label, ref int y,
-            ComboBoxStyle style = ComboBoxStyle.DropDownList, string[] items = null)
+        private DataGridViewComboBoxColumn AudioDeviceCombo()
         {
-            const int lblW = 85, ctrlX = 98, rowH = 26, gap = 6;
-            _pnlDetail.Controls.Add(new Label { Text = label, Left = 8, Top = y + 3, Width = lblW, Height = 20 });
-            var c = new ComboBox { Left = ctrlX, Top = y, Width = 260, Height = rowH, DropDownStyle = style, Tag = "dc" };
-            if (items != null) c.Items.AddRange(items);
-            _pnlDetail.Controls.Add(c);
-            y += rowH + gap;
-            return c;
+            var col = new DataGridViewComboBoxColumn
+            {
+                Name = "Device", HeaderText = "Device",
+                FlatStyle = FlatStyle.Flat,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
+            };
+            foreach (var dev in _audioDevices)
+                col.Items.Add(dev.FriendlyName);
+            return col;
         }
 
-        private void DetailSep(ref int y)
+        // Resolution and Hz items are populated per-row in EditingControlShowing
+        private static DataGridViewComboBoxColumn DynCombo(string name, string header, int width)
         {
-            y += 4;
-            _pnlDetail.Controls.Add(new Label { Left = 8, Top = y, Width = 300, Height = 1, BackColor = Color.Silver, Tag = "ds" });
-            y += 10;
+            return new DataGridViewComboBoxColumn
+            {
+                Name = name, HeaderText = header, Width = width, FlatStyle = FlatStyle.Flat
+            };
+        }
+
+        // ── Events ────────────────────────────────────────────────────────────
+
+        private void DgvDisplays_EditingControlShowing(object sender, DataGridViewEditingControlShowingEventArgs e)
+        {
+            if (!(e.Control is ComboBox cb)) return;
+            int col = _dgvDisplays.CurrentCell?.ColumnIndex ?? -1;
+            int row = _dgvDisplays.CurrentCell?.RowIndex   ?? -1;
+            if (row < 0) return;
+
+            if (col == 3) // Resolution — populate from modes of the selected monitor
+            {
+                string gdi  = ExtractGdi(CellStr(_dgvDisplays.Rows[row], 0));
+                var    seen = new SortedSet<string>(ResolutionComparer.Instance);
+                foreach (var m in GetModes(gdi))
+                    if (m.Width > 0 && m.Height > 0) seen.Add(FmtRes(m.Width, m.Height));
+                cb.DropDownStyle = ComboBoxStyle.DropDown;
+                cb.Items.Clear();
+                foreach (var r in seen) cb.Items.Add(r);
+            }
+            else if (col == 4) // Hz — populate from modes matching GDI + resolution
+            {
+                string gdi = ExtractGdi(CellStr(_dgvDisplays.Rows[row], 0));
+                string res = CellStr(_dgvDisplays.Rows[row], 3);
+                var seen = new SortedSet<int>(Comparer<int>.Create((a, b) => b.CompareTo(a)));
+                if (TryParseRes(res, out int rw, out int rh))
+                    foreach (var m in GetModes(gdi))
+                        if (m.Width == rw && m.Height == rh && m.Hz > 0) seen.Add(m.Hz);
+                cb.DropDownStyle = ComboBoxStyle.DropDown;
+                cb.Items.Clear();
+                foreach (var hz in seen) cb.Items.Add(hz.ToString());
+            }
+        }
+
+        // Auto-fill Type when an audio device is selected
+        private void DgvAudio_DeviceChanged(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.ColumnIndex != 0 || e.RowIndex < 0) return;
+            string name = CellStr(_dgvAudio.Rows[e.RowIndex], 0);
+            var dev = _audioDevices.FirstOrDefault(d => d.FriendlyName == name);
+            if (dev != null) _dgvAudio.Rows[e.RowIndex].Cells[1].Value = dev.Type;
         }
 
         // ── Layout ────────────────────────────────────────────────────────────
@@ -193,188 +229,47 @@ namespace DisplayAudioOrchestrator.GUI
                 pb.SetBounds(pad, h - btnH - pad, w - pad * 2, btnH);
                 if (pb.Controls.Count >= 3) pb.Controls[2].Left = pb.Width - 84;
             }
-            LayoutDetailPanel();
         }
 
-        private void LayoutDetailPanel()
+        // ── Populate ──────────────────────────────────────────────────────────
+
+        private void PopulateDisplays(List<ProfileDisplay> items)
         {
-            if (_pnlDetail == null) return;
-            int pw = _pnlDetail.ClientSize.Width;
-            if (pw < 40) return;
-            int ctrlW = Math.Max(60, pw - 98 - 12);
-            foreach (Control c in _pnlDetail.Controls)
+            foreach (var d in items)
             {
-                if      ("dc".Equals(c.Tag as string) && c is ComboBox) c.Width = ctrlW;
-                else if ("ds".Equals(c.Tag as string) && c is Label)    c.Width = pw - 16;
+                string res = d.Width != null && d.Height != null ? FmtRes(d.Width.Value, d.Height.Value) : string.Empty;
+                _dgvDisplays.Rows.Add(
+                    FormatMonitorByGdi(d.GdiName),
+                    BoolStr(d.Active),
+                    BoolStr(d.Primary),
+                    res,
+                    IntStr(d.Hz),
+                    IntStr(d.DpiPercent),
+                    BoolStr(d.Hdr));
             }
         }
 
-        // ── Display list management ───────────────────────────────────────────
-
-        private void RefreshDisplayList()
+        private void PopulateAudio(List<ProfileAudio> items)
         {
-            _suppressEvents = true;
-            _lstDisplays.BeginUpdate();
-            _lstDisplays.Items.Clear();
-            foreach (var d in _displayList)
-            {
-                string gdi = string.IsNullOrEmpty(d.GdiName) ? "(new)" : d.GdiName;
-                string res = d.Width != null && d.Height != null
-                    ? "  " + d.Width + "×" + d.Height + (d.Hz != null ? "@" + d.Hz : "")
-                    : "";
-                _lstDisplays.Items.Add(gdi + res);
-            }
-            if (_currentDisplayIndex >= 0 && _currentDisplayIndex < _lstDisplays.Items.Count)
-                _lstDisplays.SelectedIndex = _currentDisplayIndex;
-            _lstDisplays.EndUpdate();
-            _suppressEvents = false;
+            foreach (var a in items)
+                _dgvAudio.Rows.Add(
+                    a.Pattern ?? string.Empty,
+                    a.Type    ?? "Playback",
+                    BoolStr(a.SetDefault),
+                    IntStr(a.Volume),
+                    BoolStr(a.Mute));
         }
 
-        private void SelectDisplay(int idx)
+        private void PopulateProcesses(List<StartProcess> items)
         {
-            if (idx == _currentDisplayIndex && idx >= 0) return;
-            SaveDetailToList();
-            _currentDisplayIndex = idx;
-
-            if (idx < 0 || idx >= _displayList.Count)
-            {
-                _pnlDetail.Enabled = false;
-                return;
-            }
-            _pnlDetail.Enabled = true;
-            _suppressEvents = true;
-
-            var d = _displayList[idx];
-            _cmbGdi.Text = d.GdiName ?? string.Empty;
-            SetBoolCmb(_cmbActive,  d.Active);
-            SetBoolCmb(_cmbPrimary, d.Primary);
-            SetBoolCmb(_cmbHdr,     d.Hdr);
-
-            LoadResolutionCombo(d.GdiName);
-            string selRes = d.Width != null && d.Height != null ? FmtRes(d.Width.Value, d.Height.Value) : string.Empty;
-            SetTxt(_cmbResolution, selRes);
-            LoadHzCombo(selRes);
-            SetTxt(_cmbHz,  d.Hz?.ToString() ?? string.Empty);
-            SetTxt(_cmbDpi, d.DpiPercent?.ToString() ?? string.Empty);
-
-            _suppressEvents = false;
-            _lstDisplays.SelectedIndex = idx;
-        }
-
-        private void SaveDetailToList()
-        {
-            if (_currentDisplayIndex < 0 || _currentDisplayIndex >= _displayList.Count) return;
-            var d = _displayList[_currentDisplayIndex];
-            d.GdiName    = _cmbGdi.Text.Trim();
-            d.Active     = GetBoolCmb(_cmbActive);
-            d.Primary    = GetBoolCmb(_cmbPrimary);
-            d.Hdr        = GetBoolCmb(_cmbHdr);
-            d.DpiPercent = ParseInt(_cmbDpi.Text);
-            if (TryParseRes(_cmbResolution.Text, out int rw, out int rh)) { d.Width = rw; d.Height = rh; }
-            else { d.Width = null; d.Height = null; }
-            d.Hz = ParseInt(_cmbHz.Text);
-        }
-
-        private void LoadResolutionCombo(string gdiName)
-        {
-            _cmbResolution.Items.Clear();
-            if (string.IsNullOrWhiteSpace(gdiName)) return;
-            var seen = new SortedSet<string>(ResolutionComparer.Instance);
-            foreach (var m in GetModes(gdiName))
-                if (m.Width > 0 && m.Height > 0) seen.Add(FmtRes(m.Width, m.Height));
-            foreach (var r in seen) _cmbResolution.Items.Add(r);
-        }
-
-        private void LoadHzCombo(string resText)
-        {
-            _cmbHz.Items.Clear();
-            if (!TryParseRes(resText, out int rw, out int rh)) return;
-            var seen = new SortedSet<int>(Comparer<int>.Create((a, b) => b.CompareTo(a)));
-            foreach (var m in GetModes(_cmbGdi.Text.Trim()))
-                if (m.Width == rw && m.Height == rh && m.Hz > 0) seen.Add(m.Hz);
-            foreach (var hz in seen) _cmbHz.Items.Add(hz.ToString());
-        }
-
-        private List<DisplayModeInfo> GetModes(string gdi)
-        {
-            if (string.IsNullOrWhiteSpace(gdi)) return new List<DisplayModeInfo>();
-            if (!_modeCache.ContainsKey(gdi))
-            {
-                List<DisplayModeInfo> m;
-                try   { m = DisplayManagerAdapter.GetDisplayModes(gdi); }
-                catch { m = new List<DisplayModeInfo>(); }
-                _modeCache[gdi] = m;
-            }
-            return _modeCache[gdi];
-        }
-
-        private void OnGdiChanged()
-        {
-            if (_suppressEvents) return;
-            SaveDetailToList();
-            RefreshDisplayList();
-            LoadResolutionCombo(_cmbGdi.Text.Trim());
-        }
-
-        // ── Events ────────────────────────────────────────────────────────────
-
-        private void LstDisplays_SelectionChanged(object sender, EventArgs e)
-        {
-            if (_suppressEvents) return;
-            int idx = _lstDisplays.SelectedIndex;
-            if (idx != _currentDisplayIndex) SelectDisplay(idx);
-        }
-
-        private void CmbGdi_DropDown(object sender, EventArgs e)
-        {
-            if (_cmbGdi.Items.Count > 0) return;
-            try
-            {
-                foreach (var dev in DisplayManagerAdapter.GetAllDisplayDevices())
-                    _cmbGdi.Items.Add(dev.GdiName);
-            }
-            catch { }
-        }
-
-        private void CmbResolution_Changed(object sender, EventArgs e)
-        {
-            if (_suppressEvents) return;
-            string prevHz = _cmbHz.Text;
-            LoadHzCombo(_cmbResolution.Text);
-            if (!string.IsNullOrEmpty(prevHz) && _cmbHz.Items.Contains(prevHz))
-                SetTxt(_cmbHz, prevHz);
-            else if (_cmbHz.Items.Count > 0)
-                _cmbHz.SelectedIndex = 0;
-            SaveDetailToList();
-            RefreshDisplayList();
-        }
-
-        private void BtnAddDisplay_Click(object sender, EventArgs e)
-        {
-            SaveDetailToList();
-            _displayList.Add(new ProfileDisplay { GdiName = "DISPLAY" + (_displayList.Count + 1) });
-            _currentDisplayIndex = _displayList.Count - 1;
-            RefreshDisplayList();
-            SelectDisplay(_currentDisplayIndex);
-        }
-
-        private void BtnRemoveDisplay_Click(object sender, EventArgs e)
-        {
-            int idx = _currentDisplayIndex;
-            if (idx < 0 || idx >= _displayList.Count) return;
-            _displayList.RemoveAt(idx);
-            _currentDisplayIndex = -1;
-            RefreshDisplayList();
-            int next = Math.Min(idx, _displayList.Count - 1);
-            if (next >= 0) SelectDisplay(next);
-            else _pnlDetail.Enabled = false;
+            foreach (var p in items)
+                _dgvProcesses.Rows.Add(p.Path ?? string.Empty, p.Args ?? string.Empty, BoolStr(p.AsAdmin));
         }
 
         // ── Save / Delete ─────────────────────────────────────────────────────
 
         private void BtnSave_Click(object sender, EventArgs e)
         {
-            SaveDetailToList();
             string name = _txtName.Text.Trim();
             if (string.IsNullOrEmpty(name))
             {
@@ -383,7 +278,7 @@ namespace DisplayAudioOrchestrator.GUI
             }
             EditedProfile = new OrchestratorProfile
             {
-                Displays       = new List<ProfileDisplay>(_displayList),
+                Displays       = ReadDisplays(),
                 Audio          = ReadAudio(),
                 StartProcesses = ReadProcesses()
             };
@@ -400,19 +295,30 @@ namespace DisplayAudioOrchestrator.GUI
             Close();
         }
 
-        // ── Audio / Process grids ─────────────────────────────────────────────
+        // ── Read ──────────────────────────────────────────────────────────────
 
-        private void PopulateAudio(List<ProfileAudio> items)
+        private List<ProfileDisplay> ReadDisplays()
         {
-            foreach (var a in items)
-                _dgvAudio.Rows.Add(a.Pattern ?? string.Empty, a.Type ?? "Playback",
-                    BoolStr(a.SetDefault), IntStr(a.Volume), BoolStr(a.Mute));
-        }
-
-        private void PopulateProcesses(List<StartProcess> items)
-        {
-            foreach (var p in items)
-                _dgvProcesses.Rows.Add(p.Path ?? string.Empty, p.Args ?? string.Empty, BoolStr(p.AsAdmin));
+            var list = new List<ProfileDisplay>();
+            foreach (DataGridViewRow row in _dgvDisplays.Rows)
+            {
+                string gdi = ExtractGdi(CellStr(row, 0));
+                if (string.IsNullOrWhiteSpace(gdi)) continue;
+                int? rw = null, rh = null;
+                if (TryParseRes(CellStr(row, 3), out int pw, out int ph)) { rw = pw; rh = ph; }
+                list.Add(new ProfileDisplay
+                {
+                    GdiName    = gdi,
+                    Active     = ParseBool(CellStr(row, 1)),
+                    Primary    = ParseBool(CellStr(row, 2)),
+                    Width      = rw,
+                    Height     = rh,
+                    Hz         = ParseInt(CellStr(row, 4)),
+                    DpiPercent = ParseInt(CellStr(row, 5)),
+                    Hdr        = ParseBool(CellStr(row, 6))
+                });
+            }
+            return list;
         }
 
         private List<ProfileAudio> ReadAudio()
@@ -450,6 +356,44 @@ namespace DisplayAudioOrchestrator.GUI
                 });
             }
             return list;
+        }
+
+        // ── Mode cache ────────────────────────────────────────────────────────
+
+        private List<DisplayModeInfo> GetModes(string gdi)
+        {
+            if (string.IsNullOrWhiteSpace(gdi)) return new List<DisplayModeInfo>();
+            if (!_modeCache.TryGetValue(gdi, out var list))
+            {
+                try   { list = DisplayManagerAdapter.GetDisplayModes(gdi); }
+                catch { list = new List<DisplayModeInfo>(); }
+                _modeCache[gdi] = list;
+            }
+            return list;
+        }
+
+        // ── Display name helpers ──────────────────────────────────────────────
+
+        // "DISPLAY1 — Dell U2720Q" format
+        private static string FormatMonitor(DisplayDeviceInfo dev)
+        {
+            string name = dev.MonitorName;
+            if (string.IsNullOrWhiteSpace(name)) name = dev.DeviceString;
+            return string.IsNullOrWhiteSpace(name) ? dev.GdiName : dev.GdiName + " — " + name;
+        }
+
+        private string FormatMonitorByGdi(string gdiName)
+        {
+            var dev = _displayDevices.FirstOrDefault(d =>
+                string.Equals(d.GdiName, gdiName, StringComparison.OrdinalIgnoreCase));
+            return dev != null ? FormatMonitor(dev) : (gdiName ?? string.Empty);
+        }
+
+        private static string ExtractGdi(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            int sep = s.IndexOf(" — ");
+            return sep > 0 ? s.Substring(0, sep).Trim() : s.Trim();
         }
 
         // ── Grid factory ──────────────────────────────────────────────────────
@@ -525,30 +469,6 @@ namespace DisplayAudioOrchestrator.GUI
             return ix > 0 && ix < s.Length - 1
                 && int.TryParse(s.Substring(0, ix), out w)
                 && int.TryParse(s.Substring(ix + 1), out h);
-        }
-
-        private static void SetTxt(ComboBox c, string text)
-        {
-            if (c.DropDownStyle == ComboBoxStyle.DropDownList)
-            {
-                int idx = c.Items.IndexOf(text ?? string.Empty);
-                c.SelectedIndex = idx >= 0 ? idx : 0;
-            }
-            else
-                c.Text = text ?? string.Empty;
-        }
-
-        private static void SetBoolCmb(ComboBox c, bool? v)
-        {
-            int idx = v == null ? 0 : v.Value ? 1 : 2;
-            if (idx < c.Items.Count) c.SelectedIndex = idx;
-        }
-
-        private static bool? GetBoolCmb(ComboBox c)
-        {
-            if (c.SelectedIndex == 1) return true;
-            if (c.SelectedIndex == 2) return false;
-            return null;
         }
 
         private static string CellStr(DataGridViewRow row, int col)
