@@ -1,0 +1,10 @@
+C:\Users\hasc9\etc\px\SetResolutionReplacements\bin\Debug\net472\SetResolutionReplacements.dll
+C:\Users\hasc9\etc\px\SetResolutionReplacements\bin\Debug\net472\SetResolutionReplacements.pdb
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.csproj.AssemblyReference.cache
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.AssemblyInfoInputs.cache
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.AssemblyInfo.cs
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.csproj.CoreCompileInputs.cache
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.sourcelink.json
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.dll
+C:\Users\hasc9\etc\px\SetResolutionReplacements\obj\Debug\net472\SetResolutionReplacements.pdb
