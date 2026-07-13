@@ -3,49 +3,19 @@ using Newtonsoft.Json;
 
 // ============================================================
 // OrchestratorState — data model for devices.json.
-// Profiles are stored purely by GDI short name (DISPLAY1) with
-// FriendlyName kept for fallback resolution and human readability.
+// Displays are referenced by GDI short name (DISPLAY1) directly.
+// Audio devices are referenced by FriendlyName pattern + type directly.
+// No nickname indirection layer.
 // ============================================================
 
 namespace DisplayAudioOrchestrator.Orchestrator
 {
-    // ── Display nicknames (per-machine registry of physical displays) ─────────
-
-    public sealed class DisplayNickname
-    {
-        [JsonProperty("friendlyName")]
-        public string FriendlyName { get; set; }   // partial friendly name as registered
-
-        [JsonProperty("gdiName")]
-        public string GdiName      { get; set; }   // "DISPLAY1" — primary stable key
-
-        [JsonProperty("notes")]
-        public string Notes        { get; set; }
-    }
-
-    // ── Audio nicknames (per-machine registry of audio endpoints) ─────────────
-
-    public sealed class AudioNickname
-    {
-        [JsonProperty("pattern")]
-        public string Pattern  { get; set; }   // substring of FriendlyName to match
-
-        [JsonProperty("type")]
-        public string Type     { get; set; }   // "Playback" or "Recording"
-
-        [JsonProperty("deviceId")]
-        public string DeviceId { get; set; }   // stored for diagnostics only; not used for matching
-
-        [JsonProperty("notes")]
-        public string Notes    { get; set; }
-    }
-
     // ── Profile display entry ─────────────────────────────────────────────────
 
     public sealed class ProfileDisplay
     {
-        [JsonProperty("nickname")]
-        public string Nickname   { get; set; }
+        [JsonProperty("gdiName")]
+        public string GdiName    { get; set; }   // "DISPLAY1" — primary Windows display number
 
         [JsonProperty("active")]
         public bool?  Active     { get; set; }
@@ -72,15 +42,18 @@ namespace DisplayAudioOrchestrator.Orchestrator
         public int?   Rotation   { get; set; }
 
         [JsonProperty("mirrorOf")]
-        public string MirrorOf   { get; set; }   // nickname of display to mirror
+        public string MirrorOf   { get; set; }   // GDI name of display to mirror
     }
 
     // ── Profile audio entry ───────────────────────────────────────────────────
 
     public sealed class ProfileAudio
     {
-        [JsonProperty("nickname")]
-        public string Nickname   { get; set; }
+        [JsonProperty("pattern")]
+        public string Pattern    { get; set; }   // substring of FriendlyName to match
+
+        [JsonProperty("type")]
+        public string Type       { get; set; }   // "Playback" or "Recording"
 
         [JsonProperty("setDefault")]
         public bool?  SetDefault { get; set; }
@@ -124,14 +97,6 @@ namespace DisplayAudioOrchestrator.Orchestrator
 
     public sealed class DeviceState
     {
-        [JsonProperty("displays")]
-        public Dictionary<string, DisplayNickname> Displays { get; set; }
-            = new Dictionary<string, DisplayNickname>();
-
-        [JsonProperty("audio")]
-        public Dictionary<string, AudioNickname>   Audio    { get; set; }
-            = new Dictionary<string, AudioNickname>();
-
         [JsonProperty("profiles")]
         public Dictionary<string, OrchestratorProfile> Profiles { get; set; }
             = new Dictionary<string, OrchestratorProfile>();
