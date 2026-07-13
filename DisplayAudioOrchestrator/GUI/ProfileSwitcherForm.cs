@@ -46,7 +46,7 @@ namespace DisplayAudioOrchestrator.GUI
             StartPosition   = FormStartPosition.CenterScreen;
             MinimumSize     = new Size(560, 440);
 
-            const int actionH  = 80;
+            const int actionH  = 60;
             const int statusH  = 24;
             const int pad      = 8;
             const int profW    = 220;
@@ -144,7 +144,7 @@ namespace DisplayAudioOrchestrator.GUI
         {
             const int pad     = 8;
             const int profW   = 220;
-            const int actionH = 80;
+            const int actionH = 60;
             const int statusH = 24;
 
             int w = ClientSize.Width;

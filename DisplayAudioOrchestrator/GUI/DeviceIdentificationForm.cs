@@ -30,100 +30,73 @@ namespace DisplayAudioOrchestrator.GUI
         private void InitComponents()
         {
             Text            = "Device Identification Wizard";
-            ClientSize      = new Size(680, 420);
+            ClientSize      = new Size(680, 400);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition   = FormStartPosition.CenterScreen;
             MaximizeBox     = false;
 
-            _tabs = new TabControl { Left = 8, Top = 8, Width = 664, Height = 320 };
+            // Tabs fill the form; buttons + Close live inside each tab page's bottom panel.
+            _tabs = new TabControl { Left = 8, Top = 8, Width = 664, Height = 384 };
             Controls.Add(_tabs);
 
             // ── Displays tab ──────────────────────────────────────────────────
             var tabDisplays = new TabPage("Displays");
             _tabs.TabPages.Add(tabDisplays);
 
+            // Button panel docked to bottom of tab page; Close sits at the right edge.
+            var pnlDispBtns = new Panel { Dock = DockStyle.Bottom, Height = 42 };
+            tabDisplays.Controls.Add(pnlDispBtns);
+
             _lvDisplays = new ListView
             {
-                View          = View.Details,
-                FullRowSelect = true,
-                GridLines     = true,
-                Dock          = DockStyle.Fill
+                View = View.Details, FullRowSelect = true, GridLines = true, Dock = DockStyle.Fill
             };
-            _lvDisplays.Columns.Add("GDI Name",     80);
+            _lvDisplays.Columns.Add("GDI Name",      80);
             _lvDisplays.Columns.Add("Friendly Name", 180);
-            _lvDisplays.Columns.Add("Active",        50);
-            _lvDisplays.Columns.Add("Resolution",   100);
+            _lvDisplays.Columns.Add("Active",         50);
+            _lvDisplays.Columns.Add("Resolution",    110);
             _lvDisplays.Columns.Add("Nickname",      120);
             tabDisplays.Controls.Add(_lvDisplays);
 
-            var pnlDisplayButtons = new FlowLayoutPanel
-            {
-                Dock = DockStyle.None, Left = 8, Top = 330, Width = 664, Height = 40,
-                FlowDirection = FlowDirection.LeftToRight
-            };
-            Controls.Add(pnlDisplayButtons);
-
-            var btnIdentify = new Button { Text = "Flash Overlays", Width = 130, Height = 35 };
-            btnIdentify.Click += (s, e) =>
-            {
-                MonitorOverlayForm.ShowOverlays();
-                LoadData();
-            };
-            pnlDisplayButtons.Controls.Add(btnIdentify);
-
-            var btnRegisterDisplay = new Button { Text = "Register Nickname", Width = 140, Height = 35 };
+            var btnIdentify       = new Button { Text = "Flash Overlays",     Left =   4, Top = 6, Width = 118, Height = 30 };
+            var btnRegisterDisplay = new Button { Text = "Register Nickname", Left = 128, Top = 6, Width = 138, Height = 30 };
+            var btnRemoveDisplay  = new Button { Text = "Remove Nickname",    Left = 272, Top = 6, Width = 128, Height = 30 };
+            var btnRefreshD       = new Button { Text = "Refresh",            Left = 406, Top = 6, Width =  74, Height = 30 };
+            var btnCloseD         = new Button { Text = "Close",              Left = 568, Top = 6, Width =  78, Height = 30 };
+            btnIdentify.Click        += (s, e) => { MonitorOverlayForm.ShowOverlays(); LoadData(); };
             btnRegisterDisplay.Click += BtnRegisterDisplay_Click;
-            pnlDisplayButtons.Controls.Add(btnRegisterDisplay);
-
-            var btnRemoveDisplay = new Button { Text = "Remove Nickname", Width = 130, Height = 35 };
-            btnRemoveDisplay.Click += BtnRemoveDisplay_Click;
-            pnlDisplayButtons.Controls.Add(btnRemoveDisplay);
-
-            var btnRefresh = new Button { Text = "Refresh", Width = 80, Height = 35 };
-            btnRefresh.Click += (s, e) => LoadData();
-            pnlDisplayButtons.Controls.Add(btnRefresh);
+            btnRemoveDisplay.Click   += BtnRemoveDisplay_Click;
+            btnRefreshD.Click        += (s, e) => LoadData();
+            btnCloseD.Click          += (s, e) => Close();
+            pnlDispBtns.Controls.AddRange(new Control[] { btnIdentify, btnRegisterDisplay, btnRemoveDisplay, btnRefreshD, btnCloseD });
 
             // ── Audio tab ─────────────────────────────────────────────────────
             var tabAudio = new TabPage("Audio");
             _tabs.TabPages.Add(tabAudio);
 
+            var pnlAudBtns = new Panel { Dock = DockStyle.Bottom, Height = 42 };
+            tabAudio.Controls.Add(pnlAudBtns);
+
             _lvAudio = new ListView
             {
-                View          = View.Details,
-                FullRowSelect = true,
-                GridLines     = true,
-                Dock          = DockStyle.Fill
+                View = View.Details, FullRowSelect = true, GridLines = true, Dock = DockStyle.Fill
             };
             _lvAudio.Columns.Add("Type",          70);
             _lvAudio.Columns.Add("Friendly Name", 230);
-            _lvAudio.Columns.Add("Default",       55);
-            _lvAudio.Columns.Add("Volume",        60);
-            _lvAudio.Columns.Add("Nickname",      130);
+            _lvAudio.Columns.Add("Default",        55);
+            _lvAudio.Columns.Add("Volume",         60);
+            _lvAudio.Columns.Add("Nickname",       130);
             tabAudio.Controls.Add(_lvAudio);
 
-            var pnlAudioButtons = new FlowLayoutPanel
-            {
-                Dock = DockStyle.None, Left = 8, Top = 330, Width = 664, Height = 40,
-                FlowDirection = FlowDirection.LeftToRight
-            };
-            Controls.Add(pnlAudioButtons);
-
-            var btnRegisterAudio = new Button { Text = "Register Nickname", Width = 140, Height = 35 };
+            var btnRegisterAudio = new Button { Text = "Register Nickname", Left =   4, Top = 6, Width = 138, Height = 30 };
+            var btnRemoveAudio   = new Button { Text = "Remove Nickname",   Left = 148, Top = 6, Width = 128, Height = 30 };
+            var btnRefreshA      = new Button { Text = "Refresh",           Left = 282, Top = 6, Width =  74, Height = 30 };
+            var btnCloseA        = new Button { Text = "Close",             Left = 568, Top = 6, Width =  78, Height = 30 };
             btnRegisterAudio.Click += BtnRegisterAudio_Click;
-            pnlAudioButtons.Controls.Add(btnRegisterAudio);
-
-            var btnRemoveAudio = new Button { Text = "Remove Nickname", Width = 130, Height = 35 };
-            btnRemoveAudio.Click += BtnRemoveAudio_Click;
-            pnlAudioButtons.Controls.Add(btnRemoveAudio);
-
-            var btnRefreshAudio = new Button { Text = "Refresh", Width = 80, Height = 35 };
-            btnRefreshAudio.Click += (s, e) => LoadData();
-            pnlAudioButtons.Controls.Add(btnRefreshAudio);
-
-            // ── Bottom ────────────────────────────────────────────────────────
-            var btnClose = new Button { Text = "Close", Left = 590, Top = 382, Width = 80, Height = 30 };
-            btnClose.Click += (s, e) => Close();
-            Controls.Add(btnClose);
+            btnRemoveAudio.Click   += BtnRemoveAudio_Click;
+            btnRefreshA.Click      += (s, e) => LoadData();
+            btnCloseA.Click        += (s, e) => Close();
+            pnlAudBtns.Controls.AddRange(new Control[] { btnRegisterAudio, btnRemoveAudio, btnRefreshA, btnCloseA });
         }
 
         private void LoadData()
