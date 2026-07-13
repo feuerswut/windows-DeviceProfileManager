@@ -80,9 +80,9 @@ namespace DisplayAudioOrchestrator
                 var p = kv.Value;
                 Console.WriteLine($"  {kv.Key}");
                 foreach (var d in p.Displays)
-                    Console.WriteLine($"    display '{d.Nickname}' active={d.Active} {d.Width}x{d.Height}@{d.Hz}Hz dpi={d.DpiPercent} hdr={d.Hdr}");
+                    Console.WriteLine($"    display {d.GdiName} active={d.Active} {d.Width}x{d.Height}@{d.Hz}Hz dpi={d.DpiPercent} hdr={d.Hdr}");
                 foreach (var a in p.Audio)
-                    Console.WriteLine($"    audio   '{a.Nickname}' default={a.SetDefault} vol={a.Volume}");
+                    Console.WriteLine($"    audio   '{a.Pattern}' [{a.Type}] default={a.SetDefault} vol={a.Volume}");
             }
             Console.WriteLine();
         }

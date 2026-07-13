@@ -40,8 +40,7 @@ namespace DisplayAudioOrchestrator.Orchestrator
             {
                 string json = File.ReadAllText(path);
                 var state = JsonConvert.DeserializeObject<DeviceState>(json, Settings);
-                OrchestratorLogger.Debug($"StateStore: loaded {state.Profiles.Count} profiles, " +
-                    $"{state.Displays.Count} display nicknames, {state.Audio.Count} audio nicknames");
+                OrchestratorLogger.Debug($"StateStore: loaded {state.Profiles.Count} profiles");
                 return state ?? new DeviceState();
             }
             catch (Exception ex)

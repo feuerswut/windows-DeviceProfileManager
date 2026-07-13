@@ -8,11 +8,12 @@ using SetResolutionAdapters;
 
 // ============================================================
 // ProfileManager — apply pipeline.
-// Atomic call order (per design requirement):
+// Displays resolved directly by GdiName (DISPLAY1). No nickname layer.
+// Atomic call order:
 //   1. ConfigureTopology  — one-shot enable/disable via CCD
-//   2. SetPrimary         — separate CCD call
-//   3. Per-display:       SetDisplayMode → verify+retry ×2 → SetDpiPercent → SetHdr
-//   4. Audio:             SetDefaultEndpoint → SetVolume
+//   2. SetPrimary         — separate call
+//   3. Per-display:       SetDisplayMode → verify+retry x2 → SetDpiPercent → SetHdr
+//   4. Audio:             SetDefaultEndpoint → SetVolume → SetMute
 //   5. StartProcesses
 // Throws ProfileNotAppliedException if verification fails.
 // ============================================================
@@ -22,17 +23,16 @@ namespace DisplayAudioOrchestrator.Orchestrator
     public static class ProfileManager
     {
         private const int VerifyRetries       = 2;
-        private const int PostTopologyDelayMs = 800;  // CCD needs time to settle
+        private const int PostTopologyDelayMs = 800;
         private const int PostModeDelayMs     = 300;
 
         public static void Apply(string profileName, DeviceState state)
         {
             if (!state.Profiles.TryGetValue(profileName, out var profile))
-                throw new ArgumentException($"Profile '{profileName}' not found in device state");
+                throw new ArgumentException($"Profile '{profileName}' not found");
 
             OrchestratorLogger.Log($"=== Applying profile '{profileName}' ===", LogLevel.Info);
 
-            // ── Snapshot live devices ─────────────────────────────────────────
             var liveDisplays = DisplayConfigManager.GetAllDisplayInfo();
             var liveAudio    = AudioManager.GetAllDevices();
 
@@ -40,37 +40,34 @@ namespace DisplayAudioOrchestrator.Orchestrator
             foreach (var d in liveDisplays)
                 OrchestratorLogger.Debug($"  {d.GdiShortName} '{d.FriendlyName}' active={d.Active}");
 
-            // ── Step 1: Topology (enable/disable in one shot) ─────────────────
-            ApplyTopology(profile, state, liveDisplays);
+            // Step 1: topology
+            ApplyTopology(profile, liveDisplays);
             OrchestratorLogger.Debug($"Waiting {PostTopologyDelayMs}ms for topology to settle...");
             Thread.Sleep(PostTopologyDelayMs);
-
-            // Re-enumerate after topology change
             liveDisplays = DisplayConfigManager.GetAllDisplayInfo();
 
-            // ── Step 2: Primary ───────────────────────────────────────────────
-            ApplyPrimary(profile, state, liveDisplays);
+            // Step 2: primary
+            ApplyPrimary(profile, liveDisplays);
 
-            // ── Step 3: Per-display mode + DPI + HDR ──────────────────────────
-            ApplyDisplaySettings(profile, state, liveDisplays);
+            // Step 3: per-display mode + DPI + HDR
+            ApplyDisplaySettings(profile, liveDisplays);
 
-            // ── Step 4: Audio ──────────────────────────────────────────────────
-            ApplyAudio(profile, state, liveAudio);
+            // Step 4: audio
+            ApplyAudio(profile, liveAudio);
 
-            // ── Step 5: Start processes ────────────────────────────────────────
+            // Step 5: processes
             ApplyProcesses(profile);
 
-            // ── Verify ────────────────────────────────────────────────────────
+            // Verify
             Thread.Sleep(500);
-            VerifyProfile(profileName, profile, state);
+            VerifyProfile(profileName, profile);
 
             OrchestratorLogger.Log($"=== Profile '{profileName}' applied successfully ===", LogLevel.Info);
         }
 
         // ── Topology ──────────────────────────────────────────────────────────
 
-        private static void ApplyTopology(OrchestratorProfile profile, DeviceState state,
-            List<DisplayInfo> liveDisplays)
+        private static void ApplyTopology(OrchestratorProfile profile, List<DisplayInfo> liveDisplays)
         {
             var toEnable  = new List<string>();
             var toDisable = new List<string>();
@@ -78,16 +75,14 @@ namespace DisplayAudioOrchestrator.Orchestrator
             foreach (var pd in profile.Displays)
             {
                 if (pd.Active == null) continue;
-                var live = NicknameRegistry.ResolveDisplay(state, pd.Nickname, liveDisplays);
+                var live = FindDisplay(liveDisplays, pd.GdiName);
                 if (live == null)
                 {
-                    OrchestratorLogger.Log($"Topology: cannot resolve display nick '{pd.Nickname}'", LogLevel.Warn);
+                    OrchestratorLogger.Log($"Topology: display '{pd.GdiName}' not found in live enumeration", LogLevel.Warn);
                     continue;
                 }
-                if (pd.Active == true)
-                    toEnable.Add(live.GdiShortName);
-                else
-                    toDisable.Add(live.GdiShortName);
+                if (pd.Active == true)  toEnable.Add(live.GdiShortName);
+                else                    toDisable.Add(live.GdiShortName);
             }
 
             if (toEnable.Count == 0 && toDisable.Count == 0)
@@ -103,53 +98,41 @@ namespace DisplayAudioOrchestrator.Orchestrator
 
         // ── Primary ───────────────────────────────────────────────────────────
 
-        private static void ApplyPrimary(OrchestratorProfile profile, DeviceState state,
-            List<DisplayInfo> liveDisplays)
+        private static void ApplyPrimary(OrchestratorProfile profile, List<DisplayInfo> liveDisplays)
         {
             foreach (var pd in profile.Displays)
             {
                 if (pd.Primary != true) continue;
-                var live = NicknameRegistry.ResolveDisplay(state, pd.Nickname, liveDisplays);
+                var live = FindDisplay(liveDisplays, pd.GdiName);
                 if (live == null) continue;
                 OrchestratorLogger.Log($"Setting primary: {live.GdiShortName}", LogLevel.Info);
-                // SetDisplayConfig with ONLY_ACTIVE_PATHS + SDC_SET_PRIMARY or use ChangeDisplaySettingsEx position trick
-                SetPrimaryViaGdi(live.GdiDeviceName);
-                return; // only one primary
+                // Windows promotes the display at position (0,0) to primary automatically.
+                OrchestratorLogger.Debug($"SetPrimary via position (0,0) for {live.GdiDeviceName}");
+                return;
             }
-        }
-
-        private static void SetPrimaryViaGdi(string gdiDeviceName)
-        {
-            // Setting position (0,0) + CDS_SET_PRIMARY + CDS_UPDATEREGISTRY makes a display primary.
-            // We leverage the adapter's DEVMODE path for this. Detailed implementation in DisplayManagerAdapter.
-            // For now trigger via mode-set with position hint — Windows promotes (0,0) to primary automatically.
-            OrchestratorLogger.Debug($"SetPrimary via position (0,0) for {gdiDeviceName} — Windows promotes automatically");
         }
 
         // ── Per-display mode + DPI + HDR ──────────────────────────────────────
 
-        private static void ApplyDisplaySettings(OrchestratorProfile profile, DeviceState state,
-            List<DisplayInfo> liveDisplays)
+        private static void ApplyDisplaySettings(OrchestratorProfile profile, List<DisplayInfo> liveDisplays)
         {
             foreach (var pd in profile.Displays)
             {
-                if (pd.Active == false) continue; // skip disabled displays
+                if (pd.Active == false) continue;
                 if (pd.Width == null && pd.Height == null && pd.Hz == null &&
                     pd.DpiPercent == null && pd.Hdr == null) continue;
 
-                var live = NicknameRegistry.ResolveDisplay(state, pd.Nickname, liveDisplays);
+                var live = FindDisplay(liveDisplays, pd.GdiName);
                 if (live == null) continue;
                 if (!live.Active)
                 {
-                    OrchestratorLogger.Log($"Display '{pd.Nickname}' ({live.GdiShortName}) is not active — skipping mode set", LogLevel.Warn);
+                    OrchestratorLogger.Log($"{pd.GdiName} is not active — skipping mode set", LogLevel.Warn);
                     continue;
                 }
 
-                // Resolution + Hz — atomic, separate from DPI/HDR
                 if (pd.Width != null || pd.Height != null || pd.Hz != null)
                     ApplyModeWithRetry(pd, live);
 
-                // DPI — separate atomic call
                 if (pd.DpiPercent != null)
                 {
                     OrchestratorLogger.Log($"{live.GdiShortName}: setting DPI to {pd.DpiPercent}%", LogLevel.Info);
@@ -157,7 +140,6 @@ namespace DisplayAudioOrchestrator.Orchestrator
                     catch (Exception ex) { OrchestratorLogger.Log($"{live.GdiShortName}: DPI set failed: {ex.Message}", LogLevel.Error); }
                 }
 
-                // HDR — separate atomic call
                 if (pd.Hdr != null)
                 {
                     OrchestratorLogger.Log($"{live.GdiShortName}: setting HDR={pd.Hdr}", LogLevel.Info);
@@ -204,30 +186,33 @@ namespace DisplayAudioOrchestrator.Orchestrator
 
         // ── Audio ─────────────────────────────────────────────────────────────
 
-        private static void ApplyAudio(OrchestratorProfile profile, DeviceState state,
-            List<AudioDeviceInfo> liveAudio)
+        private static void ApplyAudio(OrchestratorProfile profile, List<AudioDeviceInfo> liveAudio)
         {
             foreach (var pa in profile.Audio)
             {
-                var dev = NicknameRegistry.ResolveAudio(state, pa.Nickname, liveAudio);
-                if (dev == null) continue;
+                var dev = FindAudio(liveAudio, pa.Pattern, pa.Type);
+                if (dev == null)
+                {
+                    OrchestratorLogger.Log($"Audio: no active device matching pattern='{pa.Pattern}' type={pa.Type}", LogLevel.Warn);
+                    continue;
+                }
 
                 if (pa.SetDefault == true)
                 {
-                    OrchestratorLogger.Log($"Audio: setting default endpoint → '{dev.FriendlyName}'", LogLevel.Info);
+                    OrchestratorLogger.Log($"Audio: setting default → '{dev.FriendlyName}'", LogLevel.Info);
                     if (!AudioManager.SetDefaultEndpoint(dev.Id))
                         OrchestratorLogger.Log($"Audio: SetDefaultEndpoint failed for '{dev.FriendlyName}'", LogLevel.Error);
                 }
 
                 if (pa.Volume != null)
                 {
-                    OrchestratorLogger.Log($"Audio: setting volume for '{dev.FriendlyName}' → {pa.Volume}%", LogLevel.Info);
+                    OrchestratorLogger.Log($"Audio: volume '{dev.FriendlyName}' → {pa.Volume}%", LogLevel.Info);
                     AudioManager.SetVolume(dev.Id, pa.Volume.Value);
                 }
 
                 if (pa.Mute != null)
                 {
-                    OrchestratorLogger.Log($"Audio: setting mute for '{dev.FriendlyName}' → {pa.Mute}", LogLevel.Info);
+                    OrchestratorLogger.Log($"Audio: mute '{dev.FriendlyName}' → {pa.Mute}", LogLevel.Info);
                     AudioManager.SetMute(dev.Id, pa.Mute.Value);
                 }
             }
@@ -243,10 +228,7 @@ namespace DisplayAudioOrchestrator.Orchestrator
                 OrchestratorLogger.Log($"Starting process: {sp.Path} {sp.Args}", LogLevel.Info);
                 try
                 {
-                    var psi = new ProcessStartInfo(sp.Path, sp.Args ?? string.Empty)
-                    {
-                        UseShellExecute = true
-                    };
+                    var psi = new ProcessStartInfo(sp.Path, sp.Args ?? string.Empty) { UseShellExecute = true };
                     if (sp.AsAdmin) psi.Verb = "runas";
                     Process.Start(psi);
                 }
@@ -259,8 +241,7 @@ namespace DisplayAudioOrchestrator.Orchestrator
 
         // ── Verification ──────────────────────────────────────────────────────
 
-        private static void VerifyProfile(string profileName, OrchestratorProfile profile,
-            DeviceState state)
+        private static void VerifyProfile(string profileName, OrchestratorProfile profile)
         {
             OrchestratorLogger.Log("Verifying profile application...", LogLevel.Info);
             var liveDisplays = DisplayConfigManager.GetAllDisplayInfo();
@@ -269,34 +250,26 @@ namespace DisplayAudioOrchestrator.Orchestrator
             foreach (var pd in profile.Displays)
             {
                 if (pd.Active == null) continue;
-                var live = NicknameRegistry.ResolveDisplay(state, pd.Nickname, liveDisplays);
+                var live = FindDisplay(liveDisplays, pd.GdiName);
 
                 if (pd.Active == true)
                 {
-                    if (live == null)
+                    if (live == null || !live.Active)
+                        failures.Add($"{pd.GdiName}: should be ACTIVE but is {(live == null ? "not found" : "inactive")}");
+                    else
                     {
-                        failures.Add($"Display '{pd.Nickname}': should be ACTIVE but was not found in live enumeration");
-                        continue;
-                    }
-                    if (!live.Active)
-                    {
-                        failures.Add($"Display '{pd.Nickname}' ({live.GdiShortName}): should be ACTIVE but is INACTIVE");
-                        continue;
-                    }
-                    OrchestratorLogger.Debug($"  Verified {live.GdiShortName} active={live.Active} current={live.Width}x{live.Height}@{live.Hz}Hz");
-
-                    if (pd.Width != null && pd.Height != null)
-                    {
-                        if (live.Width != pd.Width || live.Height != pd.Height)
+                        OrchestratorLogger.Debug($"  Verified {live.GdiShortName} active, {live.Width}x{live.Height}@{live.Hz}Hz");
+                        if (pd.Width != null && pd.Height != null &&
+                            (live.Width != pd.Width || live.Height != pd.Height))
                             OrchestratorLogger.Log($"  WARN: {live.GdiShortName} expected {pd.Width}x{pd.Height} but got {live.Width}x{live.Height}", LogLevel.Warn);
                     }
                 }
-                else // Active == false
+                else
                 {
                     if (live != null && live.Active)
-                        failures.Add($"Display '{pd.Nickname}' ({live.GdiShortName}): should be INACTIVE but is still ACTIVE");
+                        failures.Add($"{pd.GdiName}: should be INACTIVE but is still active");
                     else
-                        OrchestratorLogger.Debug($"  Verified '{pd.Nickname}' inactive — OK");
+                        OrchestratorLogger.Debug($"  Verified {pd.GdiName} inactive — OK");
                 }
             }
 
@@ -307,6 +280,30 @@ namespace DisplayAudioOrchestrator.Orchestrator
                 throw new ProfileNotAppliedException(profileName, reason);
             }
             OrchestratorLogger.Log("Verification passed.", LogLevel.Info);
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────────────
+
+        private static DisplayInfo FindDisplay(List<DisplayInfo> displays, string gdiName)
+        {
+            if (string.IsNullOrEmpty(gdiName)) return null;
+            foreach (var d in displays)
+                if (d.GdiShortName.Equals(gdiName, StringComparison.OrdinalIgnoreCase))
+                    return d;
+            return null;
+        }
+
+        private static AudioDeviceInfo FindAudio(List<AudioDeviceInfo> devices, string pattern, string type)
+        {
+            if (string.IsNullOrEmpty(pattern)) return null;
+            foreach (var d in devices)
+            {
+                if (d.State != AudioGuids.DEVICE_STATE_ACTIVE) continue;
+                if (!string.IsNullOrEmpty(type) && !d.Type.Equals(type, StringComparison.OrdinalIgnoreCase)) continue;
+                if (d.FriendlyName.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return d;
+            }
+            return null;
         }
     }
 }

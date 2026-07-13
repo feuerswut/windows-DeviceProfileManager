@@ -4,12 +4,10 @@ using System.Drawing;
 using System.Threading;
 using System.Windows.Forms;
 using DisplayAudioOrchestrator.CCD;
-using DisplayAudioOrchestrator.Orchestrator;
 
 // ============================================================
 // MonitorOverlayForm — fullscreen overlay on each active monitor.
-// Port of Show-MonitorIdentifyOverlays from PS1.
-// Shows GDI short name (DISPLAY1), nickname if registered, resolution.
+// Shows GDI short name number, friendly name, and resolution.
 // Dismisses on click, key, or after 5 seconds.
 // ============================================================
 
@@ -80,7 +78,7 @@ namespace DisplayAudioOrchestrator.GUI
             _lblHint.Top  = h - 52;
         }
 
-        protected override void OnClick(EventArgs e)   { base.OnClick(e);   Close(); }
+        protected override void OnClick(EventArgs e)      { base.OnClick(e);   Close(); }
         protected override void OnKeyDown(KeyEventArgs e) { base.OnKeyDown(e); Close(); }
     }
 
@@ -89,7 +87,6 @@ namespace DisplayAudioOrchestrator.GUI
         public static void ShowOverlays()
         {
             var displays = DisplayConfigManager.GetAllDisplayInfo();
-            var state    = StateStore.Load();
             var screens  = Screen.AllScreens;
 
             var overlays = new List<SingleMonitorOverlay>();
@@ -101,7 +98,6 @@ namespace DisplayAudioOrchestrator.GUI
                 Screen screen = null;
                 foreach (var s in screens)
                 {
-                    string sName = s.DeviceName.TrimStart('\\', '.', '\\');
                     if (s.DeviceName.Equals(d.GdiDeviceName, StringComparison.OrdinalIgnoreCase) ||
                         s.DeviceName.EndsWith(d.GdiShortName, StringComparison.OrdinalIgnoreCase))
                     {
@@ -112,24 +108,8 @@ namespace DisplayAudioOrchestrator.GUI
                 if (screen == null) continue;
 
                 string dispNum = d.GdiShortName.Replace("DISPLAY", string.Empty);
-
-                // Find nickname
-                string label = d.GdiShortName;
-                foreach (var kv in state.Displays)
-                {
-                    var reg = kv.Value;
-                    if (d.GdiShortName.Equals(reg.GdiName, StringComparison.OrdinalIgnoreCase) ||
-                        (!string.IsNullOrEmpty(reg.FriendlyName) && d.FriendlyName != null &&
-                         d.FriendlyName.IndexOf(reg.FriendlyName, StringComparison.OrdinalIgnoreCase) >= 0))
-                    {
-                        label = kv.Key + " — " + (d.FriendlyName ?? d.GdiShortName);
-                        break;
-                    }
-                }
-                if (label == d.GdiShortName && d.FriendlyName != null)
-                    label = d.FriendlyName;
-
-                string sub = $"{d.GdiDeviceName}  |  {d.Width}x{d.Height}@{d.Hz}Hz";
+                string label   = d.FriendlyName ?? d.GdiShortName;
+                string sub     = $"{d.GdiDeviceName}  |  {d.Width}x{d.Height}@{d.Hz}Hz";
 
                 overlays.Add(new SingleMonitorOverlay(screen, dispNum, label, sub));
             }

@@ -9,7 +9,6 @@ using DisplayAudioOrchestrator.Orchestrator;
 
 // ============================================================
 // ProfileSwitcherForm — main GUI window.
-// Port of Show-ProfileSwitcherGui from PS1.
 // Subscribes to OrchestratorLogger.LogEvent for WARN+ERROR output box.
 // All log levels always go to Console (handled by the logger itself).
 // ============================================================
@@ -23,8 +22,8 @@ namespace DisplayAudioOrchestrator.GUI
         private Button   _btnApply;
         private Button   _btnSave;
         private Button   _btnDelete;
-        private Button   _btnIdentify;
-        private Button   _btnListDevices;
+        private Button   _btnFlash;
+        private Button   _btnBrowseDevices;
         private Label    _lblStatus;
         private DeviceState _state;
 
@@ -46,10 +45,10 @@ namespace DisplayAudioOrchestrator.GUI
             StartPosition   = FormStartPosition.CenterScreen;
             MinimumSize     = new Size(560, 440);
 
-            const int actionH  = 60;
-            const int statusH  = 24;
-            const int pad      = 8;
-            const int profW    = 220;
+            const int actionH = 60;
+            const int statusH = 24;
+            const int pad     = 8;
+            const int profW   = 220;
 
             // ── Left: profile list ────────────────────────────────────────────
             var grpProfiles = new GroupBox
@@ -60,7 +59,6 @@ namespace DisplayAudioOrchestrator.GUI
                 Width  = profW,
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Bottom
             };
-            // Height set in Resize handler
             Controls.Add(grpProfiles);
 
             _lstProfiles = new ListBox
@@ -117,13 +115,13 @@ namespace DisplayAudioOrchestrator.GUI
             _btnSave = new Button { Text = "Save Current State as Profile...", Left = 0,   Top = 8, Width = 230, Height = 30 };
             _btnSave.Click += BtnSave_Click;
 
-            _btnIdentify = new Button { Text = "Flash Monitor Overlays", Left = 238, Top = 8, Width = 180, Height = 30 };
-            _btnIdentify.Click += (s, e) => MonitorOverlayForm.ShowOverlays();
+            _btnFlash = new Button { Text = "Flash Monitor Overlays", Left = 238, Top = 8, Width = 170, Height = 30 };
+            _btnFlash.Click += (s, e) => MonitorOverlayForm.ShowOverlays();
 
-            _btnListDevices = new Button { Text = "Identify / Register Devices...", Left = 426, Top = 8, Width = 210, Height = 30 };
-            _btnListDevices.Click += BtnListDevices_Click;
+            _btnBrowseDevices = new Button { Text = "Browse Devices...", Left = 416, Top = 8, Width = 140, Height = 30 };
+            _btnBrowseDevices.Click += BtnBrowseDevices_Click;
 
-            pnlActions.Controls.AddRange(new Control[] { _btnSave, _btnIdentify, _btnListDevices });
+            pnlActions.Controls.AddRange(new Control[] { _btnSave, _btnFlash, _btnBrowseDevices });
 
             // ── Status label ──────────────────────────────────────────────────
             _lblStatus = new Label
@@ -135,7 +133,6 @@ namespace DisplayAudioOrchestrator.GUI
             };
             Controls.Add(_lblStatus);
 
-            // Layout is driven by Resize so all panels stay proportional
             Resize += (s, e) => DoLayout();
             Load   += (s, e) => DoLayout();
         }
@@ -152,15 +149,12 @@ namespace DisplayAudioOrchestrator.GUI
 
             int topH = h - actionH - statusH - pad * 3;
 
-            // Profile group
             var grpProfiles = Controls[0] as GroupBox;
             if (grpProfiles != null)
             {
                 grpProfiles.SetBounds(pad, pad, profW, topH);
-                // list fills group minus buttons at bottom
                 if (grpProfiles.Controls.Count > 0)
                     grpProfiles.Controls[0].SetBounds(8, 18, profW - 18, topH - 62);
-                // Apply / Delete buttons sit at bottom of group
                 if (grpProfiles.Controls.Count >= 3)
                 {
                     grpProfiles.Controls[1].Top = topH - 36;
@@ -168,7 +162,6 @@ namespace DisplayAudioOrchestrator.GUI
                 }
             }
 
-            // Output group
             var grpOutput = Controls.Count > 1 ? Controls[1] as GroupBox : null;
             if (grpOutput != null)
             {
@@ -178,12 +171,10 @@ namespace DisplayAudioOrchestrator.GUI
                     grpOutput.Controls[0].SetBounds(8, 18, grpOutput.Width - 18, topH - 36);
             }
 
-            // Actions panel
             var pnlActions = Controls.Count > 2 ? Controls[2] as Panel : null;
             if (pnlActions != null)
                 pnlActions.SetBounds(pad, pad + topH + pad, w - pad * 2, actionH);
 
-            // Status label
             var lbl = Controls.Count > 3 ? Controls[3] as Label : null;
             if (lbl != null)
                 lbl.SetBounds(pad, h - statusH - pad, w - pad * 2, statusH);
@@ -193,16 +184,11 @@ namespace DisplayAudioOrchestrator.GUI
 
         private void OnLogEvent(string message, LogLevel level)
         {
-            if (level < LogLevel.Warn) return; // output box only gets WARN+ERROR
+            if (level < LogLevel.Warn) return;
 
             Action append = () =>
             {
                 if (IsDisposed || !IsHandleCreated) return;
-                Color clr = level == LogLevel.Error ? Color.FromArgb(255, 100, 100)
-                          : Color.FromArgb(255, 220, 100);
-
-                // Append colored text via RichTextBox — but since we use TextBox,
-                // just append plain text with level prefix.
                 _txtOutput.AppendText(message + Environment.NewLine);
                 _txtOutput.SelectionStart = _txtOutput.Text.Length;
                 _txtOutput.ScrollToCaret();
@@ -232,7 +218,7 @@ namespace DisplayAudioOrchestrator.GUI
             int active = 0;
             foreach (var d in displays) if (d.Active) active++;
             _lblStatus.Text = $"{active} display(s) active. {_state.Profiles.Count} profile(s) saved. " +
-                              $"Double-click a profile to apply.";
+                              "Double-click a profile to apply.";
         }
 
         // ── Apply ─────────────────────────────────────────────────────────────
@@ -280,15 +266,15 @@ namespace DisplayAudioOrchestrator.GUI
             string name;
             using (var dlg = new Form())
             {
-                dlg.Text = "Save Profile";
-                dlg.ClientSize = new Size(380, 110);
+                dlg.Text            = "Save Profile";
+                dlg.ClientSize      = new Size(380, 110);
                 dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
-                dlg.StartPosition = FormStartPosition.CenterParent;
-                dlg.MaximizeBox = false;
+                dlg.StartPosition   = FormStartPosition.CenterParent;
+                dlg.MaximizeBox     = false;
 
-                var lbl = new Label { Text = "Profile name:", Left = 10, Top = 14, Width = 100, Height = 22 };
+                var lbl = new Label  { Text = "Profile name:", Left = 10, Top = 14, Width = 100, Height = 22 };
                 var txt = new TextBox { Left = 120, Top = 12, Width = 240 };
-                var ok  = new Button { Text = "Save", Left = 200, Top = 70, Width = 80, Height = 28, DialogResult = DialogResult.OK };
+                var ok  = new Button { Text = "Save",   Left = 200, Top = 70, Width = 80, Height = 28, DialogResult = DialogResult.OK };
                 var can = new Button { Text = "Cancel", Left = 288, Top = 70, Width = 80, Height = 28, DialogResult = DialogResult.Cancel };
                 dlg.Controls.AddRange(new Control[] { lbl, txt, ok, can });
                 dlg.AcceptButton = ok;
@@ -310,24 +296,14 @@ namespace DisplayAudioOrchestrator.GUI
                 var audio    = AudioManager.GetAllDevices();
 
                 var profile = new OrchestratorProfile();
+
                 foreach (var d in displays)
                 {
                     if (!d.Active) continue;
-                    string nick = null;
-                    foreach (var kv in _state.Displays)
-                    {
-                        var reg = kv.Value;
-                        if (d.GdiShortName.Equals(reg.GdiName, StringComparison.OrdinalIgnoreCase)) { nick = kv.Key; break; }
-                        if (!string.IsNullOrEmpty(reg.FriendlyName) && d.FriendlyName != null &&
-                            d.FriendlyName.IndexOf(reg.FriendlyName, StringComparison.OrdinalIgnoreCase) >= 0)
-                        { nick = kv.Key; break; }
-                    }
-                    if (nick == null) continue;
-
                     profile.Displays.Add(new ProfileDisplay
                     {
-                        Nickname   = nick,
-                        Active     = d.Active,
+                        GdiName    = d.GdiShortName,
+                        Active     = true,
                         Primary    = d.Primary,
                         Width      = d.Width,
                         Height     = d.Height,
@@ -337,16 +313,15 @@ namespace DisplayAudioOrchestrator.GUI
                     });
                 }
 
-                foreach (var kv in _state.Audio)
+                foreach (var a in audio)
                 {
-                    var reg  = kv.Value;
-                    var live = AudioManager.FindByPattern(reg.Pattern, reg.Type);
-                    if (live == null) continue;
+                    if (a.State != AudioGuids.DEVICE_STATE_ACTIVE) continue;
                     profile.Audio.Add(new ProfileAudio
                     {
-                        Nickname   = kv.Key,
-                        SetDefault = live.IsDefault,
-                        Volume     = live.VolumePercent >= 0 ? (int?)live.VolumePercent : null
+                        Pattern    = a.FriendlyName,
+                        Type       = a.Type,
+                        SetDefault = a.IsDefault,
+                        Volume     = a.VolumePercent >= 0 ? (int?)a.VolumePercent : null
                     });
                 }
 
@@ -354,7 +329,8 @@ namespace DisplayAudioOrchestrator.GUI
                 StateStore.Save(_state);
                 RefreshProfiles();
                 OrchestratorLogger.Log($"Profile '{profileName}' saved.", LogLevel.Info);
-                MessageBox.Show($"Profile '{profileName}' saved.", "Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Profile '{profileName}' saved.", "Saved",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -375,14 +351,12 @@ namespace DisplayAudioOrchestrator.GUI
             RefreshProfiles();
         }
 
-        // ── Device identification ─────────────────────────────────────────────
+        // ── Browse devices ────────────────────────────────────────────────────
 
-        private void BtnListDevices_Click(object sender, EventArgs e)
+        private void BtnBrowseDevices_Click(object sender, EventArgs e)
         {
-            using (var wiz = new DeviceIdentificationForm(_state))
-                wiz.ShowDialog(this);
-            _state = StateStore.Load();
-            RefreshProfiles();
+            using (var dlg = new DeviceIdentificationForm())
+                dlg.ShowDialog(this);
         }
     }
 }
