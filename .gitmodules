@@ -1,3 +1,6 @@
 [submodule "SetResolution"]
 	path = SetResolution
 	url = https://github.com/feuerswut/SetResolution
+[submodule "monarch"]
+	path = monarch
+	url = https://github.com/feuerswut/monarch
