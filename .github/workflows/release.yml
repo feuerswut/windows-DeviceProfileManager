@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name (e.g. v1.2)"
+        required: true
 
 jobs:
   release:
@@ -41,8 +46,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: kaiser-app
-          tagName: ${{ github.ref_name }}
-          releaseName: Kaiser ${{ github.ref_name }}
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: Kaiser ${{ github.event.inputs.tag || github.ref_name }}
           releaseBody: |
             See the [commit history](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for changes.
           releaseDraft: true
