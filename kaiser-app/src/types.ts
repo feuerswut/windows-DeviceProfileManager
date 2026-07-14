@@ -61,6 +61,8 @@ export interface ProfileDto {
   name: string;
   layout: Layout;
   audio: AudioSetting[];
+  /** Per-monitor DPI percentages, keyed by "adapter_luid:target_id" */
+  dpi_scales?: Record<string, number>;
 }
 
 export interface SnapshotDto {

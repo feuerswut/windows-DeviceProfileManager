@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use monarch::{AppConfig, AppSettings, ConfigStore, Layout, ManagerError, Profile};
@@ -23,6 +24,9 @@ pub struct KaiserProfile {
     pub layout: Layout,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio: Vec<AudioSetting>,
+    /// Per-monitor DPI scaling percentages. Key = "adapter_luid:target_id", value = percent (100, 125, 150, …)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub dpi_scales: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,15 +143,16 @@ impl ConfigStore for KaiserConfigStore {
         let mut names = Vec::new();
         let mut profiles = Vec::new();
         for profile in &config.profiles {
-            let audio = existing
+            let existing_kp = existing
                 .profile_names
                 .iter()
                 .zip(existing.profiles.iter())
                 .find(|(n, _)| *n == &profile.name)
-                .map(|(_, kp)| kp.audio.clone())
-                .unwrap_or_default();
+                .map(|(_, kp)| kp);
+            let audio = existing_kp.map(|kp| kp.audio.clone()).unwrap_or_default();
+            let dpi_scales = existing_kp.map(|kp| kp.dpi_scales.clone()).unwrap_or_default();
             names.push(profile.name.clone());
-            profiles.push(KaiserProfile { layout: profile.layout.clone(), audio });
+            profiles.push(KaiserProfile { layout: profile.layout.clone(), audio, dpi_scales });
         }
         let kaiser = KaiserConfig {
             profiles,

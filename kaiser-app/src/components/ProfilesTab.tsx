@@ -10,7 +10,7 @@ interface Props {
   onRefresh: () => Promise<void>;
 }
 
-export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
+export function ProfilesTab({ snapshot, audioDevices: _audioDevices, onRefresh }: Props) {
   const [newName, setNewName] = useState("");
   const [saveBusy, setSaveBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
@@ -108,15 +108,19 @@ export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
           >
             <div className="min-w-0">
               <div className="font-medium text-sm truncate">{profile.name}</div>
-              <div className="text-xs text-zinc-500 mt-0.5">
-                {profile.layout.outputs.filter((o) => o.enabled).length} display
-                {profile.layout.outputs.filter((o) => o.enabled).length !== 1
-                  ? "s"
-                  : ""}
+              <div className="text-xs text-zinc-500 mt-0.5 flex items-center flex-wrap gap-x-2 gap-y-0.5">
+                <span>
+                  {profile.layout.outputs.filter((o) => o.enabled).length} display
+                  {profile.layout.outputs.filter((o) => o.enabled).length !== 1 ? "s" : ""}
+                </span>
+                {profile.dpi_scales && Object.keys(profile.dpi_scales).length > 0 && (
+                  <span className="text-cyan-400">
+                    {Object.values(profile.dpi_scales).join("/") + "% DPI"}
+                  </span>
+                )}
                 {profile.audio.length > 0 && (
-                  <span className="ml-2 text-purple-400">
-                    + {profile.audio.length} audio rule
-                    {profile.audio.length !== 1 ? "s" : ""}
+                  <span className="text-purple-400">
+                    {profile.audio.map((a) => a.pattern).join(", ")}
                   </span>
                 )}
               </div>

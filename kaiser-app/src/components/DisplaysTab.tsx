@@ -1,8 +1,8 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { toast } from "sonner";
-import { RefreshCw, Power, Monitor, ChevronDown, Star } from "lucide-react";
+import { RefreshCw, Power, Monitor, ChevronDown } from "lucide-react";
 import { api } from "../api";
-import type { DisplayInfo, DisplayMode, Layout, OutputConfig, SnapshotDto } from "../types";
+import type { DisplayId, DisplayInfo, DisplayMode, Layout, OutputConfig, SnapshotDto } from "../types";
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -17,21 +17,29 @@ function gdiDisplayNumber(gdiName: string | undefined): string | null {
   return m ? m[1] : null;
 }
 
-// ---- Layout Canvas ----------------------------------------------------------
+const DPI_OPTIONS = [
+  { label: "100%", value: 100 },
+  { label: "125%", value: 125 },
+  { label: "150%", value: 150 },
+  { label: "175%", value: 175 },
+  { label: "200%", value: 200 },
+  { label: "225%", value: 225 },
+  { label: "250%", value: 250 },
+  { label: "300%", value: 300 },
+];
+
+// ---- Layout Canvas (Monarch-style) ------------------------------------------
+
+function getLayoutBounds(outputs: OutputConfig[]) {
+  if (outputs.length === 0) return { left: 0, top: 0, right: 1920, bottom: 1080 };
+  const left = Math.min(...outputs.map((o) => o.position.x));
+  const top = Math.min(...outputs.map((o) => o.position.y));
+  const right = Math.max(...outputs.map((o) => o.position.x + o.resolution.width));
+  const bottom = Math.max(...outputs.map((o) => o.position.y + o.resolution.height));
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
 
 const SNAP_PX = 50;
-
-function getCanvasBounds(outputs: OutputConfig[]) {
-  // Include origin and minimum 1920×1080 to keep the coordinate system stable.
-  let minX = 0, minY = 0, maxX = 1920, maxY = 1080;
-  for (const o of outputs) {
-    minX = Math.min(minX, o.position.x);
-    minY = Math.min(minY, o.position.y);
-    maxX = Math.max(maxX, o.position.x + o.resolution.width);
-    maxY = Math.max(maxY, o.position.y + o.resolution.height);
-  }
-  return { minX, minY, maxX, maxY };
-}
 
 interface LayoutCanvasProps {
   draft: Layout;
@@ -48,12 +56,19 @@ function LayoutCanvas({ draft, displays, onDraftChange }: LayoutCanvasProps) {
     origX: number;
     origY: number;
     frozenLayout: Layout;
-    frozenBounds: ReturnType<typeof getCanvasBounds>;
+    frozenBounds: ReturnType<typeof getLayoutBounds>;
+    scale: number;
   } | null>(null);
 
-  const bounds = getCanvasBounds(draft.outputs);
-  const totalW = bounds.maxX - bounds.minX;
-  const totalH = bounds.maxY - bounds.minY;
+  const activeOutputs = draft.outputs.filter((o) => o.enabled);
+  const bounds = getLayoutBounds(activeOutputs.length > 0 ? activeOutputs : draft.outputs);
+  const totalW = bounds.right - bounds.left;
+  const totalH = bounds.bottom - bounds.top;
+  const scale = Math.min(700 / Math.max(totalW, 1), 280 / Math.max(totalH, 1));
+  const canvasW = Math.max(340, totalW * scale + 24);
+  const canvasH = Math.max(160, totalH * scale + 24);
+
+  const monitorNumbers = new Map(displays.map((d, i) => [displayKey(d.id), i + 1]));
 
   function onPointerDown(e: React.PointerEvent<HTMLDivElement>, key: string) {
     e.preventDefault();
@@ -67,17 +82,16 @@ function LayoutCanvas({ draft, displays, onDraftChange }: LayoutCanvasProps) {
       origY: output.position.y,
       frozenLayout: draft,
       frozenBounds: bounds,
+      scale,
     };
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
   }
 
   function onPointerMove(e: React.PointerEvent) {
-    if (!dragState.current || !containerRef.current) return;
+    if (!dragState.current) return;
     const d = dragState.current;
-    const rect = containerRef.current.getBoundingClientRect();
-    const scaleX = (d.frozenBounds.maxX - d.frozenBounds.minX) / rect.width;
-    const scaleY = (d.frozenBounds.maxY - d.frozenBounds.minY) / rect.height;
-    const vx = (e.clientX - d.startClientX) * scaleX;
-    const vy = (e.clientY - d.startClientY) * scaleY;
+    const vx = (e.clientX - d.startClientX) / d.scale;
+    const vy = (e.clientY - d.startClientY) / d.scale;
     const newX = Math.round((d.origX + vx) / SNAP_PX) * SNAP_PX;
     const newY = Math.round((d.origY + vy) / SNAP_PX) * SNAP_PX;
 
@@ -96,44 +110,62 @@ function LayoutCanvas({ draft, displays, onDraftChange }: LayoutCanvasProps) {
   }
 
   return (
-    <div
-      ref={containerRef}
-      className="relative w-full overflow-hidden rounded-lg border border-zinc-700 bg-zinc-950 select-none"
-      style={{ aspectRatio: `${totalW}/${totalH}`, maxHeight: "200px" }}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerLeave={onPointerUp}
-    >
-      {draft.outputs.map((output) => {
-        const key = displayKey(output.display_id);
-        const display = displays.find((d) => displayKey(d.id) === key);
-        const leftPct = ((output.position.x - bounds.minX) / totalW) * 100;
-        const topPct = ((output.position.y - bounds.minY) / totalH) * 100;
-        const widthPct = (output.resolution.width / totalW) * 100;
-        const heightPct = (output.resolution.height / totalH) * 100;
+    <div className="overflow-auto rounded-lg border border-zinc-700 p-3">
+      <div
+        ref={containerRef}
+        className="relative rounded-md border border-zinc-800 bg-zinc-900/40 select-none"
+        style={{ width: `${canvasW}px`, height: `${canvasH}px`, minHeight: "140px" }}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerUp}
+      >
+        {draft.outputs.map((output) => {
+          const key = displayKey(output.display_id);
+          const display = displays.find((d) => displayKey(d.id) === key);
+          const monNum = monitorNumbers.get(key);
+          const active = output.enabled;
+          const left = (output.position.x - bounds.left) * scale + 12;
+          const top = (output.position.y - bounds.top) * scale + 12;
+          const w = Math.max(42, output.resolution.width * scale);
+          const h = Math.max(28, output.resolution.height * scale);
 
-        return (
-          <div
-            key={key}
-            onPointerDown={(e) => onPointerDown(e, key)}
-            className={`absolute rounded border cursor-grab active:cursor-grabbing flex flex-col items-center justify-center overflow-hidden transition-colors ${
-              output.enabled
-                ? output.primary
-                  ? "border-yellow-500 bg-yellow-900/30 text-yellow-200"
-                  : "border-blue-600 bg-blue-900/30 text-blue-300"
-                : "border-zinc-600 bg-zinc-800/20 text-zinc-500 opacity-40"
-            }`}
-            style={{ left: `${leftPct}%`, top: `${topPct}%`, width: `${widthPct}%`, height: `${heightPct}%` }}
-          >
-            <span className="text-[10px] leading-tight px-1 pointer-events-none truncate w-full text-center">
-              {display?.friendly_name ?? key}
-            </span>
-            {output.primary && (
-              <span className="text-[8px] text-yellow-400 pointer-events-none">PRIMARY</span>
-            )}
-          </div>
-        );
-      })}
+          return (
+            <div
+              key={key}
+              onPointerDown={(e) => active ? onPointerDown(e, key) : undefined}
+              className={`absolute flex min-w-0 flex-col justify-between rounded-md border p-1.5 text-[10px] ${
+                active
+                  ? output.primary
+                    ? "border-yellow-500/50 bg-yellow-900/20 text-yellow-200 cursor-grab active:cursor-grabbing"
+                    : "border-blue-500/30 bg-blue-900/15 text-blue-200 cursor-grab active:cursor-grabbing"
+                  : "border-zinc-600 bg-zinc-800/30 text-zinc-500"
+              }`}
+              style={{ left: `${left}px`, top: `${top}px`, width: `${w}px`, height: `${h}px` }}
+            >
+              <div className="flex min-w-0 items-start justify-between gap-1">
+                <div className="flex min-w-0 items-start gap-1">
+                  {monNum != null && (
+                    <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded border border-current/40 bg-zinc-900/60 px-1 text-[9px] font-bold leading-none">
+                      {monNum}
+                    </span>
+                  )}
+                  <span className="truncate font-medium leading-tight pointer-events-none">
+                    {display?.friendly_name ?? key}
+                  </span>
+                </div>
+                {output.primary && (
+                  <span className="shrink-0 rounded-full border border-yellow-500/50 px-1 py-px text-[7px] font-semibold uppercase tracking-wide text-yellow-400 pointer-events-none">
+                    Primary
+                  </span>
+                )}
+              </div>
+              <span className="text-[9px] leading-none text-zinc-500 pointer-events-none">
+                {active ? `${output.resolution.width}×${output.resolution.height}` : "Detached"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -173,6 +205,7 @@ function ResolutionPicker({ display, gdiName, onRefresh }: ResolutionPickerProps
   async function selectMode(mode: DisplayMode) {
     setApplying(true);
     setOpen(false);
+    setModes(null);
     try {
       await api.setDisplayMode(gdiName, mode);
       await onRefresh();
@@ -221,6 +254,69 @@ function ResolutionPicker({ display, gdiName, onRefresh }: ResolutionPickerProps
   );
 }
 
+// ---- DPI Picker (per-monitor) -----------------------------------------------
+
+interface DpiPickerProps {
+  displayId: DisplayId;
+}
+
+function DpiPicker({ displayId }: DpiPickerProps) {
+  const [open, setOpen] = useState(false);
+  const [currentDpi, setCurrentDpi] = useState<number | null>(null);
+  const [applying, setApplying] = useState(false);
+
+  useEffect(() => {
+    api.getDisplayDpi(displayId.adapter_luid, displayId.target_id)
+      .then(setCurrentDpi)
+      .catch(() => {});
+  }, [displayId.adapter_luid, displayId.target_id]);
+
+  async function selectDpi(percent: number) {
+    if (percent === currentDpi) { setOpen(false); return; }
+    setApplying(true);
+    setOpen(false);
+    try {
+      await api.setDisplayDpi(displayId.adapter_luid, displayId.target_id, percent);
+      setCurrentDpi(percent);
+      toast.success(`DPI set to ${percent}%`);
+    } catch (err) {
+      toast.error(`Set DPI failed: ${err}`);
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  const label = currentDpi != null ? `${currentDpi}% DPI` : "DPI…";
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        disabled={applying || currentDpi == null}
+        className="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-1 transition-colors disabled:opacity-50 whitespace-nowrap"
+      >
+        {applying ? "…" : label}
+        <ChevronDown size={10} className={`transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-50 w-32 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-64">
+          {DPI_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              onClick={() => selectDpi(opt.value)}
+              className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 transition-colors ${
+                opt.value === currentDpi ? "text-blue-400 font-medium" : "text-zinc-300"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---- Main component ---------------------------------------------------------
 
 interface Props {
@@ -238,25 +334,6 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
   const activeCount = displays.filter((d) => d.is_active).length;
   const currentLayout = draftLayout ?? layout;
   const isDirty = draftLayout !== null;
-
-  async function toggleDisplay(display: DisplayInfo) {
-    if (pending_confirmation) {
-      toast.error("Confirm or revert the current layout change first.");
-      return;
-    }
-    const key = displayKey(display.id);
-    setBusy(key);
-    try {
-      await api.toggleDisplay(display.id);
-      setDraftLayout(null);
-      await onRefresh();
-      toast.success(`${display.friendly_name} ${display.is_active ? "disabled" : "enabled"}`);
-    } catch (err) {
-      toast.error(`Toggle failed: ${err}`);
-    } finally {
-      setBusy(null);
-    }
-  }
 
   async function confirmLayout() {
     setConfirmBusy(true);
@@ -281,6 +358,25 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
       toast.error(`Revert failed: ${err}`);
     } finally {
       setConfirmBusy(false);
+    }
+  }
+
+  async function toggleDisplay(display: DisplayInfo) {
+    if (pending_confirmation) {
+      toast.error("Confirm or revert the current layout change first.");
+      return;
+    }
+    const key = displayKey(display.id);
+    setBusy(key);
+    try {
+      await api.toggleDisplay(display.id);
+      setDraftLayout(null);
+      await onRefresh();
+      toast.success(`${display.friendly_name} ${display.is_active ? "disabled" : "enabled"}`);
+    } catch (err) {
+      toast.error(`Toggle failed: ${err}`);
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -318,33 +414,34 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
   }
 
   return (
-    <div className="space-y-4">
-      {/* Pending confirmation banner */}
+    <div className="relative space-y-4">
+      {/* Pending confirmation — floating banner just below the tab bar */}
       {pending_confirmation && (
-        <div className="rounded-lg border border-yellow-600 bg-yellow-950/40 px-4 py-3 text-sm">
-          <div className="flex items-center justify-between mb-2">
+        <div className="sticky top-0 z-40 rounded-lg border border-yellow-500 bg-yellow-950/90 backdrop-blur px-4 py-3 text-sm shadow-lg">
+          <div className="flex items-center justify-between gap-4">
             <span className="text-yellow-300 font-medium">
-              Layout change — confirm to keep or revert within{" "}
+              Confirm layout change within{" "}
               {pending_confirmation_remaining_secs != null
                 ? `${Math.ceil(pending_confirmation_remaining_secs)}s`
-                : "…"}
+                : "…"}{" "}
+              or it will revert automatically
             </span>
-          </div>
-          <div className="flex gap-2">
-            <button
-              onClick={confirmLayout}
-              disabled={confirmBusy}
-              className="px-3 py-1.5 rounded text-xs font-medium bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
-            >
-              {confirmBusy ? "…" : "Confirm"}
-            </button>
-            <button
-              onClick={revertLayout}
-              disabled={confirmBusy}
-              className="px-3 py-1.5 rounded text-xs font-medium bg-red-800 hover:bg-red-700 text-white transition-colors disabled:opacity-50"
-            >
-              {confirmBusy ? "…" : "Revert"}
-            </button>
+            <div className="flex gap-2 shrink-0">
+              <button
+                onClick={confirmLayout}
+                disabled={confirmBusy}
+                className="px-3 py-1.5 rounded text-xs font-medium bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
+              >
+                {confirmBusy ? "…" : "Confirm"}
+              </button>
+              <button
+                onClick={revertLayout}
+                disabled={confirmBusy}
+                className="px-3 py-1.5 rounded text-xs font-medium bg-red-800 hover:bg-red-700 text-white transition-colors disabled:opacity-50"
+              >
+                {confirmBusy ? "…" : "Revert"}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -394,7 +491,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
       </div>
 
       <div className="grid gap-3">
-        {displays.map((display) => {
+        {displays.map((display, index) => {
           const key = displayKey(display.id);
           const output = layout.outputs.find(
             (o) =>
@@ -402,7 +499,8 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
               o.display_id.target_id === display.id.target_id
           );
           const gdiName = gdi_names?.[key];
-          const dispNum = gdiDisplayNumber(gdiName);
+          const dispNum = gdiDisplayNumber(gdiName) ?? String(index + 1);
+          const isBusy = busy === key;
 
           return (
             <div
@@ -421,15 +519,8 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                   />
                   <div>
                     <div className="font-medium text-sm flex items-center gap-2">
-                      {dispNum && (
-                        <span className="text-xs text-zinc-500 font-mono">#{dispNum}</span>
-                      )}
+                      <span className="text-xs text-zinc-500 font-mono">#{dispNum}</span>
                       {display.friendly_name}
-                      {display.is_primary && (
-                        <span className="text-xs text-yellow-400 flex items-center gap-0.5">
-                          <Star size={10} fill="currentColor" /> Primary
-                        </span>
-                      )}
                     </div>
                     <div className="text-xs text-zinc-500 mt-0.5">
                       {display.resolution.width}×{display.resolution.height} @{" "}
@@ -443,7 +534,13 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2 flex-shrink-0">
+                <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
+                  {/* DPI picker — per-monitor, fetches current DPI on mount */}
+                  {display.is_active && (
+                    <DpiPicker displayId={display.id} />
+                  )}
+
+                  {/* Resolution picker */}
                   {display.is_active && gdiName && (
                     <ResolutionPicker
                       display={display}
@@ -451,20 +548,33 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                       onRefresh={onRefresh}
                     />
                   )}
-                  {display.is_active && !display.is_primary && (
-                    <button
-                      onClick={() => makePrimary(display)}
-                      disabled={busy === key || pending_confirmation}
-                      title="Set as primary display"
-                      className="flex items-center gap-1 px-2 py-1.5 rounded text-xs text-zinc-400 hover:text-yellow-300 border border-zinc-700 hover:border-yellow-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <Star size={11} />
-                      Primary
-                    </button>
+
+                  {/* Primary button — all active monitors, toggle style */}
+                  {display.is_active && (
+                    display.is_primary ? (
+                      <button
+                        disabled
+                        className="flex items-center gap-1 px-2 py-1.5 rounded text-xs font-medium bg-yellow-900/40 text-yellow-300 border border-yellow-700 cursor-default opacity-90"
+                        title="This is the primary display"
+                      >
+                        ★ Primary
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => makePrimary(display)}
+                        disabled={isBusy || pending_confirmation}
+                        title="Set as primary display"
+                        className="flex items-center gap-1 px-2 py-1.5 rounded text-xs text-zinc-400 hover:text-yellow-300 border border-zinc-700 hover:border-yellow-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        ☆ Primary
+                      </button>
+                    )
                   )}
+
+                  {/* Enable/Disable button */}
                   <button
                     onClick={() => toggleDisplay(display)}
-                    disabled={busy === key || (display.is_active && activeCount <= 1)}
+                    disabled={isBusy || (display.is_active && activeCount <= 1)}
                     title={
                       display.is_active && activeCount <= 1
                         ? "Cannot disable the last active display"
@@ -477,7 +587,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
                     <Power size={12} />
-                    {busy === key ? "…" : display.is_active ? "Disable" : "Enable"}
+                    {isBusy ? "…" : display.is_active ? "Disable" : "Enable"}
                   </button>
                 </div>
               </div>

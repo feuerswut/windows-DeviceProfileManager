@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use kaiser_core::{
-    set_display_mode as core_set_display_mode, AudioDevice, AudioFlow, AudioSetting, DisplayMode,
-    KaiserConfigStore, KaiserProfile, SharedKaiserBackend,
+    get_display_dpi, set_display_dpi, set_display_mode as core_set_display_mode, AudioDevice,
+    AudioFlow, AudioSetting, DisplayMode, KaiserConfigStore, KaiserProfile, SharedKaiserBackend,
 };
 use monarch::{DisplayId, DisplayInfo, Layout, Profile};
 
@@ -69,14 +69,15 @@ pub struct ProfileDto {
     pub name: String,
     pub layout: Layout,
     pub audio: Vec<AudioSetting>,
+    /// Per-monitor DPI percentages keyed by "adapter_luid:target_id"
+    pub dpi_scales: HashMap<String, u32>,
 }
 
 fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
-    let audio = store
-        .load_kaiser_profile(&profile.name)
-        .map(|kp| kp.audio)
-        .unwrap_or_default();
-    ProfileDto { name: profile.name.clone(), layout: profile.layout.clone(), audio }
+    let kp = store.load_kaiser_profile(&profile.name);
+    let audio = kp.as_ref().map(|k| k.audio.clone()).unwrap_or_default();
+    let dpi_scales = kp.map(|k| k.dpi_scales.clone()).unwrap_or_default();
+    ProfileDto { name: profile.name.clone(), layout: profile.layout.clone(), audio, dpi_scales }
 }
 
 // ---- Display commands ---------------------------------------------------
@@ -157,20 +158,54 @@ pub fn apply_layout(layout: Layout, state: State<AppState>) -> Result<(), String
 }
 
 #[tauri::command]
-pub fn save_profile(
-    name: String,
-    audio: Option<Vec<AudioSetting>>,
-    state: State<AppState>,
-) -> Result<(), String> {
+pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> {
     let manager = state.manager.lock().unwrap();
     let layout = manager.get_layout().map_err(|e| e.to_string())?;
     drop(manager);
 
+    // Auto-capture current default audio devices (render + capture)
+    let audio: Vec<AudioSetting> = {
+        let audio_mgr = state.audio.lock().unwrap();
+        match audio_mgr.list_devices() {
+            Ok(devices) => devices
+                .into_iter()
+                .filter(|d| d.is_default_console)
+                .map(|d| AudioSetting {
+                    pattern: d.name.clone(),
+                    flow: d.flow,
+                    set_default: Some(true),
+                    volume: Some(d.volume),
+                    muted: Some(d.muted),
+                })
+                .collect(),
+            Err(e) => {
+                log::warn!("save_profile: could not list audio devices: {e}");
+                Vec::new()
+            }
+        }
+    };
+
+    // Auto-capture per-monitor DPI for all active outputs
+    let dpi_scales: HashMap<String, u32> = layout
+        .outputs
+        .iter()
+        .filter(|o| o.enabled)
+        .filter_map(|o| {
+            let key = format!("{}:{}", o.display_id.adapter_luid, o.display_id.target_id);
+            match get_display_dpi(o.display_id.adapter_luid, o.display_id.target_id) {
+                Ok(pct) => Some((key, pct)),
+                Err(e) => {
+                    log::warn!("save_profile: get_display_dpi for {key} failed: {e}");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    log::info!("save_profile: '{name}' dpi_scales={dpi_scales:?} audio={}", audio.len());
     let store = state.new_store();
-    let audio = audio.unwrap_or_default();
-    log::info!("save_profile: '{name}' ({} audio settings)", audio.len());
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales })
         .map_err(|e| e.to_string())?;
 
     let mut manager = state.manager.lock().unwrap();
@@ -189,6 +224,20 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
         if !kaiser_profile.audio.is_empty() {
             let audio = state.audio.lock().unwrap();
             apply_audio_settings(&audio, &kaiser_profile.audio);
+        }
+        for (key, percent) in &kaiser_profile.dpi_scales {
+            // key format: "adapter_luid:target_id"
+            if let Some((luid_str, tid_str)) = key.split_once(':') {
+                if let (Ok(luid), Ok(tid)) =
+                    (luid_str.parse::<u64>(), tid_str.parse::<u32>())
+                {
+                    if let Err(e) = set_display_dpi(luid, tid, *percent) {
+                        log::warn!("apply_profile: set_display_dpi {key}={percent}% failed: {e}");
+                    } else {
+                        log::info!("apply_profile: {key} DPI → {percent}%");
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -298,8 +347,10 @@ pub fn list_display_modes(gdi_device_name: String) -> Result<Vec<DisplayMode>, S
 }
 
 #[tauri::command]
-pub fn set_display_mode(gdi_device_name: String, mode: DisplayMode) -> Result<(), String> {
-    core_set_display_mode(&gdi_device_name, &mode).map_err(|e| e.to_string())
+pub fn set_display_mode(gdi_device_name: String, mode: DisplayMode, state: State<AppState>) -> Result<(), String> {
+    core_set_display_mode(&gdi_device_name, &mode).map_err(|e| e.to_string())?;
+    state.backend.invalidate_snapshot();
+    Ok(())
 }
 
 /// List display modes for a display identified by DisplayId (frontend-friendly;
@@ -344,7 +395,22 @@ pub fn set_display_mode_for_id(
         mode.height,
         mode.refresh_rate_hz
     );
-    core_set_display_mode(&gdi_name, &mode).map_err(|e| e.to_string())
+    core_set_display_mode(&gdi_name, &mode).map_err(|e| e.to_string())?;
+    state.backend.invalidate_snapshot();
+    Ok(())
+}
+
+// ---- DPI commands -------------------------------------------------------
+
+#[tauri::command]
+pub fn get_display_dpi_cmd(adapter_luid: u64, target_id: u32) -> Result<u32, String> {
+    get_display_dpi(adapter_luid, target_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_display_dpi_cmd(adapter_luid: u64, target_id: u32, percent: u32) -> Result<(), String> {
+    log::info!("set_display_dpi: {adapter_luid}:{target_id} → {percent}%");
+    set_display_dpi(adapter_luid, target_id, percent).map_err(|e| e.to_string())
 }
 
 // ---- Confirmation commands -----------------------------------------------

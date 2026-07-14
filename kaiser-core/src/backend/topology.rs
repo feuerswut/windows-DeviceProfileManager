@@ -105,6 +105,11 @@ impl KaiserBackend {
             .as_ref()
             .and_then(|s| s.gdi_names.get(&(adapter_luid, target_id)).cloned())
     }
+
+    pub fn invalidate_snapshot(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.last_snapshot = None;
+    }
 }
 
 impl DisplayBackend for KaiserBackend {

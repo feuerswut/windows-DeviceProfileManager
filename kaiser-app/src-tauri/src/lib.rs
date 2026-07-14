@@ -34,6 +34,8 @@ pub fn run() {
             commands::confirm_layout,
             commands::revert_layout,
             commands::make_primary,
+            commands::get_display_dpi_cmd,
+            commands::set_display_dpi_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kaiser");

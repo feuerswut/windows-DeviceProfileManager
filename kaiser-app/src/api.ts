@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AudioDevice,
-  AudioSetting,
   DisplayId,
   DisplayInfo,
   DisplayMode,
@@ -27,8 +26,8 @@ export const api = {
     return invoke("apply_layout", { layout });
   },
 
-  saveProfile(name: string, audio?: AudioSetting[]): Promise<void> {
-    return invoke("save_profile", { name, audio: audio ?? [] });
+  saveProfile(name: string): Promise<void> {
+    return invoke("save_profile", { name });
   },
 
   applyProfile(name: string): Promise<void> {
@@ -85,5 +84,13 @@ export const api = {
 
   makePrimary(displayId: DisplayId): Promise<void> {
     return invoke("make_primary", { displayId });
+  },
+
+  getDisplayDpi(adapterLuid: number, targetId: number): Promise<number> {
+    return invoke("get_display_dpi_cmd", { adapterLuid, targetId });
+  },
+
+  setDisplayDpi(adapterLuid: number, targetId: number, percent: number): Promise<void> {
+    return invoke("set_display_dpi_cmd", { adapterLuid, targetId, percent });
   },
 };

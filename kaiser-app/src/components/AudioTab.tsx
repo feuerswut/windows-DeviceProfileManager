@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { toast } from "sonner";
-import { RefreshCw, Volume2, VolumeX, Star } from "lucide-react";
+import { RefreshCw, Volume2, VolumeX, Mic } from "lucide-react";
 import { api } from "../api";
 import type { AudioDevice } from "../types";
 
@@ -73,15 +73,47 @@ export function AudioTab({ devices, onRefresh }: Props) {
         </button>
       </div>
 
-      <DeviceGroup title="Playback" devices={renderDevices} pending={pending}
+      <DeviceGroup title="Playback" devices={renderDevices} pending={pending} isCapture={false}
         onVolumeChange={handleVolumeChange}
         onMuteToggle={handleMuteToggle}
         onSetDefault={handleSetDefault}
       />
-      <DeviceGroup title="Recording" devices={captureDevices} pending={pending}
+      <DeviceGroup title="Recording" devices={captureDevices} pending={pending} isCapture={true}
         onVolumeChange={handleVolumeChange}
         onMuteToggle={handleMuteToggle}
         onSetDefault={handleSetDefault}
+      />
+    </div>
+  );
+}
+
+function VolumeSlider({
+  deviceId,
+  initialVolume,
+  enabled,
+  onVolumeChange,
+}: {
+  deviceId: string;
+  initialVolume: number;
+  enabled: boolean;
+  onVolumeChange: (id: string, vol: number) => Promise<void>;
+}) {
+  const [value, setValue] = useState(Math.round(initialVolume * 100));
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-zinc-500 w-8 text-right">{value}%</span>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        value={value}
+        disabled={!enabled}
+        onChange={(e) => setValue(Number(e.target.value))}
+        onMouseUp={(e) =>
+          onVolumeChange(deviceId, Number((e.target as HTMLInputElement).value))
+        }
+        className="flex-1 accent-blue-500"
       />
     </div>
   );
@@ -91,6 +123,7 @@ function DeviceGroup({
   title,
   devices,
   pending,
+  isCapture,
   onVolumeChange,
   onMuteToggle,
   onSetDefault,
@@ -98,10 +131,13 @@ function DeviceGroup({
   title: string;
   devices: AudioDevice[];
   pending: Set<string>;
+  isCapture: boolean;
   onVolumeChange: (id: string, vol: number) => Promise<void>;
   onMuteToggle: (d: AudioDevice) => Promise<void>;
   onSetDefault: (d: AudioDevice) => Promise<void>;
 }) {
+  const DeviceIcon = isCapture ? Mic : Volume2;
+
   return (
     <div>
       <h3 className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
@@ -117,22 +153,18 @@ function DeviceGroup({
             className={`rounded-lg border p-3 ${
               device.is_default_console
                 ? "border-blue-700 bg-blue-950/30"
-                : "border-zinc-800 bg-zinc-900"
+                : "border-zinc-700 bg-zinc-900"
             } ${!device.enabled ? "opacity-50" : ""}`}
           >
             <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-2">
-                <Volume2 size={14} className="text-zinc-400 shrink-0" />
+              <div className="flex items-center gap-2 min-w-0">
+                <DeviceIcon size={14} className="text-zinc-400 shrink-0" />
                 <span className="text-sm font-medium truncate max-w-[200px]">
                   {device.name}
                 </span>
-                {device.is_default_console && (
-                  <span className="text-xs text-blue-400 border border-blue-700 px-1.5 py-0.5 rounded">
-                    Default
-                  </span>
-                )}
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1.5 shrink-0">
+                {/* Mute toggle */}
                 <button
                   onClick={() => onMuteToggle(device)}
                   disabled={pending.has(device.id) || !device.enabled}
@@ -145,35 +177,36 @@ function DeviceGroup({
                 >
                   {device.muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
                 </button>
-                {!device.is_default_console && (
+
+                {/* Default toggle */}
+                {device.is_default_console ? (
+                  <button
+                    disabled
+                    className="px-2.5 py-1 rounded text-xs font-semibold bg-blue-700/60 text-blue-200 border border-blue-600 cursor-default"
+                    title="Current default device"
+                  >
+                    Active
+                  </button>
+                ) : (
                   <button
                     onClick={() => onSetDefault(device)}
                     disabled={pending.has(device.id) || !device.enabled}
-                    title="Set as default"
-                    className="p-1.5 rounded text-zinc-500 hover:text-yellow-400 transition-colors disabled:opacity-40"
+                    title="Set as default device"
+                    className="px-2.5 py-1 rounded text-xs font-semibold text-zinc-100 bg-zinc-700 hover:bg-blue-700 border border-zinc-600 hover:border-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   >
-                    <Star size={14} />
+                    {pending.has(device.id) ? "…" : "Enable"}
                   </button>
                 )}
               </div>
             </div>
 
             {device.enabled && (
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-zinc-500 w-8 text-right">
-                  {Math.round(device.volume * 100)}%
-                </span>
-                <input
-                  type="range"
-                  min={0}
-                  max={100}
-                  defaultValue={Math.round(device.volume * 100)}
-                  onMouseUp={(e) =>
-                    onVolumeChange(device.id, Number((e.target as HTMLInputElement).value))
-                  }
-                  className="flex-1 accent-blue-500"
-                />
-              </div>
+              <VolumeSlider
+                deviceId={device.id}
+                initialVolume={device.volume}
+                enabled={device.enabled}
+                onVolumeChange={onVolumeChange}
+              />
             )}
           </div>
         ))}

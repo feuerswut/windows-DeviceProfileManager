@@ -16,8 +16,9 @@ impl AppState {
         let backend = Arc::new(KaiserBackend::new());
         let shared = SharedKaiserBackend(Arc::clone(&backend));
         let store = KaiserConfigStore::new(store_path.clone());
-        let manager = MonarchDisplayManager::new(shared, store)
+        let mut manager = MonarchDisplayManager::new(shared, store)
             .expect("failed to initialize display manager");
+        manager.set_confirmation_timeout(std::time::Duration::from_secs(15));
         Self {
             manager: Mutex::new(manager),
             backend,
