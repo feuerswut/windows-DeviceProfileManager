@@ -22,7 +22,7 @@ const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
 const QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ONLY_ACTIVE_PATHS;
 
 pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
-    let (paths, modes) = query_raw_active()?;
+    let (paths, modes) = query_raw(QUERY_FLAGS)?;
     let raw = RawTopologySnapshot {
         paths: paths.clone(),
         modes: modes.clone(),
@@ -121,14 +121,15 @@ fn effective_resolution_for_rotation(
     source_resolution
 }
 
-fn query_raw_active(
+fn query_raw(
+    flags: QUERY_DISPLAY_CONFIG_FLAGS,
 ) -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), ManagerError> {
     unsafe {
         let mut path_count = 0u32;
         let mut mode_count = 0u32;
 
         let mut status =
-            GetDisplayConfigBufferSizes(QUERY_FLAGS, &mut path_count, &mut mode_count);
+            GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count);
         if status.0 != 0 {
             return Err(ManagerError::Backend(format!(
                 "GetDisplayConfigBufferSizes failed: {}",
@@ -145,7 +146,7 @@ fn query_raw_active(
             let mut out_modes = mode_count;
 
             status = QueryDisplayConfig(
-                QUERY_FLAGS,
+                flags,
                 &mut out_paths,
                 paths.as_mut_ptr(),
                 &mut out_modes,
@@ -155,7 +156,7 @@ fn query_raw_active(
 
             if status == ERROR_INSUFFICIENT_BUFFER {
                 let retry = GetDisplayConfigBufferSizes(
-                    QUERY_FLAGS,
+                    flags,
                     &mut path_count,
                     &mut mode_count,
                 );

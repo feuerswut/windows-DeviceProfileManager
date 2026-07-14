@@ -13,7 +13,7 @@ use super::apply::{
     GammaRampKey, GammaRampWords,
 };
 use super::enumerate::query_active_topology;
-use super::win32_types::TopologySnapshot;
+use super::win32_types::{luid_to_u64, RawTopologySnapshot, TopologySnapshot};
 
 struct BackendCache {
     last_snapshot: Option<TopologySnapshot>,
@@ -70,24 +70,25 @@ impl KaiserBackend {
         Ok(())
     }
 
-    fn refresh_snapshot(&self, snapshot: TopologySnapshot) {
+    fn refresh_snapshot(&self, next_snapshot: TopologySnapshot) {
         let mut cache = self.cache.lock().unwrap();
-        let new_sig = active_color_state_signature(&snapshot);
+        let new_sig = active_color_state_signature(&next_snapshot);
         let old_sig = cache.last_color_state_signature.as_deref().unwrap_or("");
 
         if new_sig != old_sig {
-            let fresh_sdr = capture_sdr_gamma_ramps(&snapshot);
-            let merged: HashMap<GammaRampKey, GammaRampWords> = cache
+            let fresh_sdr = capture_sdr_gamma_ramps(&next_snapshot);
+            let merged_sdr: HashMap<GammaRampKey, GammaRampWords> = cache
                 .sdr_gamma_cache
                 .iter()
                 .filter(|(k, ramp)| !gamma_ramp_looks_identity(ramp) && !fresh_sdr.contains_key(k))
                 .map(|(k, v)| (*k, *v))
                 .chain(fresh_sdr.iter().filter(|(_, v)| !gamma_ramp_looks_identity(v)).map(|(k, v)| (*k, *v)))
                 .collect();
-            cache.sdr_gamma_cache = merged;
+            cache.sdr_gamma_cache = merged_sdr;
             cache.last_color_state_signature = Some(new_sig);
         }
-        cache.last_snapshot = Some(snapshot);
+        let merged = merge_snapshot_for_cache(cache.last_snapshot.as_ref(), next_snapshot);
+        cache.last_snapshot = Some(merged);
     }
 }
 
@@ -195,64 +196,32 @@ impl DisplayBackend for KaiserBackend {
             ));
         }
 
-        let currently_active: std::collections::HashSet<(u64, u32)> = snapshot
-            .raw
-            .paths
-            .iter()
-            .filter(|p| p.flags & 0x1 != 0)
-            .map(|p| {
-                (
-                    super::win32_types::luid_to_u64(
-                        p.targetInfo.adapterId.HighPart,
-                        p.targetInfo.adapterId.LowPart,
-                    ),
-                    p.targetInfo.id,
-                )
-            })
-            .collect();
-
-        let needs_to_enable_inactive = layout.outputs.iter().any(|o| {
-            o.enabled && !currently_active.contains(&(o.display_id.adapter_luid, o.display_id.target_id))
-        });
-
-        if needs_to_enable_inactive {
-            log::info!("KaiserBackend: layout enables inactive display(s); running topology extend");
-        }
-
-        let working_snapshot = if needs_to_enable_inactive {
-            let restored_paths_snapshot = self.load_persisted_snapshot_raw();
-            if let Some(persisted) = restored_paths_snapshot {
-                TopologySnapshot {
-                    raw: persisted,
-                    layout: snapshot.layout.clone(),
-                    displays: snapshot.displays.clone(),
-                    gdi_names: snapshot.gdi_names.clone(),
-                }
-            } else {
-                let _ = force_topology_extend();
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                query_active_topology().unwrap_or(snapshot)
-            }
-        } else {
-            snapshot
-        };
-
         log::info!(
-            "KaiserBackend: applying layout ({} outputs, {} enabled)",
+            "KaiserBackend: applying layout ({} outputs, {} enabled, {} raw paths cached)",
             layout.outputs.len(),
-            layout.outputs.iter().filter(|o| o.enabled).count()
+            layout.outputs.iter().filter(|o| o.enabled).count(),
+            snapshot.raw.paths.len(),
         );
-        let next_snapshot =
-            super::apply::apply_layout_against_snapshot(&layout, &working_snapshot)?;
-
-        self.persist_snapshot(&next_snapshot);
 
         let sdr_cache = {
             let cache = self.cache.lock().unwrap();
             cache.sdr_gamma_cache.clone()
         };
-        let _ = reapply_color_calibration_for_active_with_cached_sdr(&sdr_cache);
 
+        let next_snapshot = match super::apply::apply_layout_against_snapshot(&layout, &snapshot) {
+            Ok(s) => s,
+            Err(ref e) if is_set_display_invalid_parameter(e) => {
+                log::warn!("KaiserBackend: SetDisplayConfig error 87; falling back to topology extend");
+                force_topology_extend()?;
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                let recovered = query_active_topology()?;
+                super::apply::apply_layout_against_snapshot(&layout, &recovered)?
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.persist_snapshot(&next_snapshot);
+        let _ = reapply_color_calibration_for_active_with_cached_sdr(&sdr_cache);
         self.refresh_snapshot(next_snapshot);
         Ok(())
     }
@@ -330,11 +299,36 @@ impl KaiserBackend {
         }
     }
 
-    fn load_persisted_snapshot_raw(&self) -> Option<super::win32_types::RawTopologySnapshot> {
-        // We can't serialize the raw Win32 paths/modes, but we can trigger a full rediscover.
-        // This returns None to signal the caller to fall back to topology extend.
-        None
+}
+
+fn merge_snapshot_for_cache(previous: Option<&TopologySnapshot>, fresh: TopologySnapshot) -> TopologySnapshot {
+    if let Some(prev) = previous {
+        if prev.raw.paths.len() > fresh.raw.paths.len()
+            && raw_covers_active_outputs(&prev.raw, &fresh.layout)
+        {
+            let mut merged = fresh;
+            merged.raw = prev.raw.clone();
+            return merged;
+        }
     }
+    fresh
+}
+
+fn raw_covers_active_outputs(raw: &RawTopologySnapshot, layout: &Layout) -> bool {
+    layout.outputs.iter().filter(|o| o.enabled).all(|output| {
+        raw.paths.iter().any(|path| {
+            let adapter_luid = luid_to_u64(
+                path.targetInfo.adapterId.HighPart,
+                path.targetInfo.adapterId.LowPart,
+            );
+            adapter_luid == output.display_id.adapter_luid
+                && path.targetInfo.id == output.display_id.target_id
+        })
+    })
+}
+
+fn is_set_display_invalid_parameter(error: &ManagerError) -> bool {
+    matches!(error, ManagerError::Backend(msg) if msg.contains("SetDisplayConfig failed: 87"))
 }
 
 pub fn kaiser_data_dir() -> PathBuf {
