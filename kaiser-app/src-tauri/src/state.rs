@@ -1,10 +1,11 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use kaiser_core::{AudioManager, KaiserBackend, KaiserConfigStore};
+use kaiser_core::{AudioManager, KaiserBackend, KaiserConfigStore, SharedKaiserBackend};
 use monarch::MonarchDisplayManager;
 
 pub struct AppState {
-    pub manager: Mutex<MonarchDisplayManager<KaiserBackend, KaiserConfigStore>>,
+    pub manager: Mutex<MonarchDisplayManager<SharedKaiserBackend, KaiserConfigStore>>,
+    pub backend: Arc<KaiserBackend>,
     pub audio: Mutex<AudioManager>,
     pub store_path: std::path::PathBuf,
 }
@@ -12,12 +13,14 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let store_path = KaiserConfigStore::default_path();
-        let backend = KaiserBackend::new();
+        let backend = Arc::new(KaiserBackend::new());
+        let shared = SharedKaiserBackend(Arc::clone(&backend));
         let store = KaiserConfigStore::new(store_path.clone());
-        let manager = MonarchDisplayManager::new(backend, store)
+        let manager = MonarchDisplayManager::new(shared, store)
             .expect("failed to initialize display manager");
         Self {
             manager: Mutex::new(manager),
+            backend,
             audio: Mutex::new(AudioManager::new()),
             store_path,
         }

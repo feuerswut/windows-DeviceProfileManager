@@ -6,6 +6,8 @@ use state::AppState;
 use tauri::Manager;
 
 pub fn run() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     tauri::Builder::default()
         .setup(|app| {
             let state = AppState::new();
@@ -27,6 +29,8 @@ pub fn run() {
             commands::set_default_audio_device,
             commands::list_display_modes,
             commands::set_display_mode,
+            commands::list_display_modes_for_id,
+            commands::set_display_mode_for_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kaiser");

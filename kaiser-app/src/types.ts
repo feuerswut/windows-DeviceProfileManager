@@ -69,6 +69,8 @@ export interface SnapshotDto {
   profiles: ProfileDto[];
   pending_confirmation: boolean;
   pending_confirmation_remaining_secs: number | null;
+  /** GDI device names keyed as "adapter_luid:target_id" strings. */
+  gdi_names: Record<string, string>;
 }
 
 export interface DisplayMode {

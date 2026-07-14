@@ -66,4 +66,12 @@ export const api = {
   setDisplayMode(gdiDeviceName: string, mode: DisplayMode): Promise<void> {
     return invoke("set_display_mode", { gdiDeviceName, mode });
   },
+
+  listDisplayModesForId(displayId: DisplayId): Promise<DisplayMode[]> {
+    return invoke("list_display_modes_for_id", { displayId });
+  },
+
+  setDisplayModeForId(displayId: DisplayId, mode: DisplayMode): Promise<void> {
+    return invoke("set_display_mode_for_id", { displayId, mode });
+  },
 };
