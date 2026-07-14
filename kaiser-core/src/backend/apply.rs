@@ -125,6 +125,95 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
     Ok(())
 }
 
+pub(super) fn try_attach_inactive_for_layout(
+    desired: &Layout,
+    active_snapshot: &TopologySnapshot,
+) -> Result<TopologySnapshot, ManagerError> {
+    let active_keys: std::collections::HashSet<(u64, u32)> = active_snapshot
+        .raw
+        .paths
+        .iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .map(|p| (
+            luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart),
+            p.targetInfo.id,
+        ))
+        .collect();
+
+    let needs_attach: Vec<(u64, u32)> = desired
+        .outputs
+        .iter()
+        .filter(|o| {
+            o.enabled && !active_keys.contains(&(o.display_id.adapter_luid, o.display_id.target_id))
+        })
+        .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
+        .collect();
+
+    if needs_attach.is_empty() {
+        return Err(ManagerError::Backend(
+            "try_attach_inactive: no inactive outputs to attach".to_string(),
+        ));
+    }
+
+    let all_paths = super::enumerate::query_inactive_paths()?;
+
+    let desired_outputs = desired_output_index(desired);
+    let mut next_paths = active_snapshot.raw.paths.clone();
+    let mut next_modes = active_snapshot.raw.modes.clone();
+
+    for path in &mut next_paths {
+        let key = path_target_key(path);
+        let desired_output = desired_outputs.get(&key);
+        let enabled = desired_output.map(|o| o.enabled).unwrap_or(false);
+        if !enabled {
+            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+        } else {
+            apply_desired_source_mode(path, &mut next_modes, desired_output);
+            apply_desired_target_refresh(path, desired_output);
+        }
+    }
+
+    for (adapter_luid, target_id) in &needs_attach {
+        let Some(mut inactive_path) = all_paths
+            .iter()
+            .find(|p| {
+                luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart)
+                    == *adapter_luid
+                    && p.targetInfo.id == *target_id
+            })
+            .cloned()
+        else {
+            log::warn!(
+                "try_attach_inactive: no path found for adapter={adapter_luid:#018x} target={target_id}"
+            );
+            continue;
+        };
+        inactive_path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+        inactive_path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+        inactive_path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+        apply_desired_target_refresh(&mut inactive_path, desired_outputs.get(&(*adapter_luid, *target_id)));
+        next_paths.push(inactive_path);
+    }
+
+    reorder_paths_for_desired_priority(&mut next_paths, &desired_outputs);
+
+    unsafe {
+        let status = SetDisplayConfig(
+            Some(next_paths.as_slice()),
+            Some(next_modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        );
+        if status != 0 {
+            return Err(ManagerError::Backend(format!(
+                "SetDisplayConfig (inactive-attach fallback) failed: {}",
+                status
+            )));
+        }
+    }
+
+    super::enumerate::query_active_topology()
+}
+
 pub(super) fn reapply_color_calibration_for_active_with_cached_sdr(
     cached_sdr_ramps: &HashMap<GammaRampKey, GammaRampWords>,
 ) -> Result<(), ManagerError> {
