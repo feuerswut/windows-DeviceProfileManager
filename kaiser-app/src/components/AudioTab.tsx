@@ -192,7 +192,7 @@ function DeviceGroup({
                 ) : (
                   <button
                     onClick={() => onSetDefault(device)}
-                    disabled={pending.has(device.id) || !device.enabled}
+                    disabled={pending.has(device.id)}
                     title="Set as default device"
                     className="px-2.5 py-1 rounded text-xs font-semibold text-zinc-100 bg-zinc-700 hover:bg-blue-700 border border-zinc-600 hover:border-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   >
