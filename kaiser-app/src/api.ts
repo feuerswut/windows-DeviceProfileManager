@@ -9,89 +9,100 @@ import type {
   SnapshotDto,
 } from "./types";
 
+async function inv<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (err) {
+    const msg = `${cmd}: ${err}`;
+    console.error("[kaiser]", msg);
+    invoke("frontend_log", { level: "error", message: msg }).catch(() => {});
+    throw err;
+  }
+}
+
 export const api = {
   getSnapshot(): Promise<SnapshotDto> {
-    return invoke("get_snapshot");
+    return inv("get_snapshot");
   },
 
   listDisplays(): Promise<DisplayInfo[]> {
-    return invoke("list_displays");
+    return inv("list_displays");
   },
 
   toggleDisplay(displayId: DisplayId): Promise<void> {
-    return invoke("toggle_display", { displayId });
+    return inv("toggle_display", { displayId });
   },
 
   applyLayout(layout: Layout): Promise<void> {
-    return invoke("apply_layout", { layout });
+    return inv("apply_layout", { layout });
   },
 
   saveProfile(name: string): Promise<void> {
-    return invoke("save_profile", { name });
+    return inv("save_profile", { name });
   },
 
   applyProfile(name: string): Promise<void> {
-    return invoke("apply_profile", { name });
+    return inv("apply_profile", { name });
   },
 
   deleteProfile(name: string): Promise<void> {
-    return invoke("delete_profile", { name });
+    return inv("delete_profile", { name });
   },
 
   listProfiles(): Promise<ProfileDto[]> {
-    return invoke("list_profiles");
+    return inv("list_profiles");
   },
 
   listAudioDevices(): Promise<AudioDevice[]> {
-    return invoke("list_audio_devices");
+    return inv("list_audio_devices");
   },
 
   setAudioVolume(deviceId: string, volume: number): Promise<void> {
-    return invoke("set_audio_volume", { deviceId, volume });
+    return inv("set_audio_volume", { deviceId, volume });
   },
 
   setAudioMute(deviceId: string, muted: boolean): Promise<void> {
-    return invoke("set_audio_mute", { deviceId, muted });
+    return inv("set_audio_mute", { deviceId, muted });
   },
 
   setDefaultAudioDevice(deviceId: string): Promise<void> {
-    return invoke("set_default_audio_device", { deviceId });
+    return inv("set_default_audio_device", { deviceId });
   },
 
   listDisplayModes(gdiDeviceName: string): Promise<DisplayMode[]> {
-    return invoke("list_display_modes", { gdiDeviceName });
+    return inv("list_display_modes", { gdiDeviceName });
   },
 
   setDisplayMode(gdiDeviceName: string, mode: DisplayMode): Promise<void> {
-    return invoke("set_display_mode", { gdiDeviceName, mode });
+    return inv("set_display_mode", { gdiDeviceName, mode });
   },
 
   listDisplayModesForId(displayId: DisplayId): Promise<DisplayMode[]> {
-    return invoke("list_display_modes_for_id", { displayId });
+    return inv("list_display_modes_for_id", { displayId });
   },
 
   setDisplayModeForId(displayId: DisplayId, mode: DisplayMode): Promise<void> {
-    return invoke("set_display_mode_for_id", { displayId, mode });
+    return inv("set_display_mode_for_id", { displayId, mode });
   },
 
   confirmLayout(): Promise<void> {
-    return invoke("confirm_layout");
+    return inv("confirm_layout");
   },
 
   revertLayout(): Promise<void> {
-    return invoke("revert_layout");
+    return inv("revert_layout");
   },
 
   makePrimary(displayId: DisplayId): Promise<void> {
-    return invoke("make_primary", { displayId });
+    return inv("make_primary", { displayId });
   },
 
   getDisplayDpi(adapterLuid: number, targetId: number): Promise<number> {
-    return invoke("get_display_dpi_cmd", { adapterLuid, targetId });
+    return inv("get_display_dpi_cmd", { adapterLuid, targetId });
   },
 
   setDisplayDpi(adapterLuid: number, targetId: number, percent: number): Promise<void> {
-    return invoke("set_display_dpi_cmd", { adapterLuid, targetId, percent });
+    return inv("set_display_dpi_cmd", { adapterLuid, targetId, percent });
   },
 
   updateProfile(
@@ -100,6 +111,6 @@ export const api = {
     dpiScales: Record<string, number>,
     audio: import("./types").AudioSetting[],
   ): Promise<void> {
-    return invoke("update_profile", { name, layout, dpiScales, audio });
+    return inv("update_profile", { name, layout, dpiScales, audio });
   },
 };
