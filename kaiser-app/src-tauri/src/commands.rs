@@ -76,8 +76,10 @@ pub struct ProfileDto {
 fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
     let kp = store.load_kaiser_profile(&profile.name);
     let audio = kp.as_ref().map(|k| k.audio.clone()).unwrap_or_default();
-    let dpi_scales = kp.map(|k| k.dpi_scales.clone()).unwrap_or_default();
-    ProfileDto { name: profile.name.clone(), layout: profile.layout.clone(), audio, dpi_scales }
+    let dpi_scales = kp.as_ref().map(|k| k.dpi_scales.clone()).unwrap_or_default();
+    // Kaiser config layout is authoritative (may be user-edited); fall back to Monarch's
+    let layout = kp.map(|k| k.layout).unwrap_or_else(|| profile.layout.clone());
+    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales }
 }
 
 // ---- Display commands ---------------------------------------------------
@@ -215,18 +217,26 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
 #[tauri::command]
 pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String> {
     log::info!("apply_profile: '{name}'");
-    let mut manager = state.manager.lock().unwrap();
-    manager.apply_profile(&name).map_err(|e| e.to_string())?;
-    drop(manager);
-
     let store = state.new_store();
-    if let Some(kaiser_profile) = store.load_kaiser_profile(&name) {
+    let kaiser_profile = store.load_kaiser_profile(&name);
+
+    {
+        let mut manager = state.manager.lock().unwrap();
+        if let Some(ref kp) = kaiser_profile {
+            // Kaiser config layout is authoritative (may have been user-edited)
+            let layout = fix_layout_display_ids(kp.layout.clone(), &manager);
+            manager.apply_layout(layout).map_err(|e| e.to_string())?;
+        } else {
+            manager.apply_profile(&name).map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(kaiser_profile) = kaiser_profile {
         if !kaiser_profile.audio.is_empty() {
             let audio = state.audio.lock().unwrap();
             apply_audio_settings(&audio, &kaiser_profile.audio);
         }
         for (key, percent) in &kaiser_profile.dpi_scales {
-            // key format: "adapter_luid:target_id"
             if let Some((luid_str, tid_str)) = key.split_once(':') {
                 if let (Ok(luid), Ok(tid)) =
                     (luid_str.parse::<u64>(), tid_str.parse::<u32>())
@@ -241,6 +251,22 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// Save edited profile settings (layout, DPI, audio) without applying to the system.
+#[tauri::command]
+pub fn update_profile(
+    name: String,
+    layout: Layout,
+    dpi_scales: HashMap<String, u32>,
+    audio: Vec<AudioSetting>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    log::info!("update_profile: '{name}'");
+    let store = state.new_store();
+    store
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales })
+        .map_err(|e| e.to_string())
 }
 
 fn apply_audio_settings(audio: &kaiser_core::AudioManager, settings: &[AudioSetting]) {

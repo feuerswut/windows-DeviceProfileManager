@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { toast } from "sonner";
 import { RefreshCw, Power, Monitor, ChevronDown } from "lucide-react";
 import { api } from "../api";
@@ -6,18 +6,17 @@ import type { DisplayId, DisplayInfo, DisplayMode, Layout, OutputConfig, Snapsho
 
 // ---- Helpers ----------------------------------------------------------------
 
-function displayKey(id: { adapter_luid: number; target_id: number }) {
+export function displayKey(id: { adapter_luid: number; target_id: number }) {
   return `${id.adapter_luid}:${id.target_id}`;
 }
 
-/** Extract Windows display number from GDI name like "\\.\DISPLAY1" → "1" */
 function gdiDisplayNumber(gdiName: string | undefined): string | null {
   if (!gdiName) return null;
   const m = gdiName.match(/DISPLAY(\d+)/i);
   return m ? m[1] : null;
 }
 
-const DPI_OPTIONS = [
+export const DPI_OPTIONS = [
   { label: "100%", value: 100 },
   { label: "125%", value: 125 },
   { label: "150%", value: 150 },
@@ -28,10 +27,13 @@ const DPI_OPTIONS = [
   { label: "300%", value: 300 },
 ];
 
-// ---- Layout Canvas (Monarch-style) ------------------------------------------
+const SNAP_PX = 50;
+const CANVAS_SIZE = 6000; // large enough to never clip monitors during drag
 
-function getLayoutBounds(outputs: OutputConfig[]) {
-  if (outputs.length === 0) return { left: 0, top: 0, right: 1920, bottom: 1080 };
+// ---- Layout Canvas (Google Maps style) ------------------------------------
+
+function getBounds(outputs: OutputConfig[]) {
+  if (outputs.length === 0) return { left: 0, top: 0, right: 1920, bottom: 1080, width: 1920, height: 1080 };
   const left = Math.min(...outputs.map((o) => o.position.x));
   const top = Math.min(...outputs.map((o) => o.position.y));
   const right = Math.max(...outputs.map((o) => o.position.x + o.resolution.width));
@@ -39,122 +41,194 @@ function getLayoutBounds(outputs: OutputConfig[]) {
   return { left, top, right, bottom, width: right - left, height: bottom - top };
 }
 
-const SNAP_PX = 50;
-
-interface LayoutCanvasProps {
+interface CanvasProps {
   draft: Layout;
   displays: DisplayInfo[];
   onDraftChange: (l: Layout) => void;
+  height?: number;
 }
 
-function LayoutCanvas({ draft, displays, onDraftChange }: LayoutCanvasProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const dragState = useRef<{
-    key: string;
-    startClientX: number;
-    startClientY: number;
-    origX: number;
-    origY: number;
-    frozenLayout: Layout;
-    frozenBounds: ReturnType<typeof getLayoutBounds>;
-    scale: number;
-  } | null>(null);
+export function LayoutCanvas({ draft, displays, onDraftChange, height = 320 }: CanvasProps) {
+  const outerRef = useRef<HTMLDivElement>(null);
+  const [outerSize, setOuterSize] = useState({ w: 700, h: height });
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const dragRef = useRef<
+    | { type: "canvas"; sx: number; sy: number; ox: number; oy: number }
+    | { type: "monitor"; key: string; sx: number; sy: number; ovx: number; ovy: number; frozenLayout: Layout; scale: number }
+    | null
+  >(null);
 
-  const activeOutputs = draft.outputs.filter((o) => o.enabled);
-  const bounds = getLayoutBounds(activeOutputs.length > 0 ? activeOutputs : draft.outputs);
-  const totalW = bounds.right - bounds.left;
-  const totalH = bounds.bottom - bounds.top;
-  const scale = Math.min(700 / Math.max(totalW, 1), 280 / Math.max(totalH, 1));
-  const canvasW = Math.max(340, totalW * scale + 24);
-  const canvasH = Math.max(160, totalH * scale + 24);
+  // Measure outer container
+  useEffect(() => {
+    const el = outerRef.current;
+    if (!el) return;
+    const obs = new ResizeObserver((entries) => {
+      for (const e of entries) {
+        setOuterSize({ w: e.contentRect.width, h: e.contentRect.height });
+      }
+    });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
 
-  const monitorNumbers = new Map(displays.map((d, i) => [displayKey(d.id), i + 1]));
+  const allOutputs = draft.outputs;
+  const activeOutputs = allOutputs.filter((o) => o.enabled);
+  const bounds = getBounds(activeOutputs.length > 0 ? activeOutputs : allOutputs);
 
-  function onPointerDown(e: React.PointerEvent<HTMLDivElement>, key: string) {
-    e.preventDefault();
+  // Scale: fit bounding box with 20% margin (10% each side)
+  const scale = Math.min(
+    (outerSize.w * 0.8) / Math.max(bounds.width, 1),
+    (outerSize.h * 0.8) / Math.max(bounds.height, 1),
+    1.0 // don't zoom in beyond 1px:1px
+  );
+
+  const computeCenter = useCallback(() => {
+    const bboxCx = (bounds.left + bounds.right) / 2;
+    const bboxCy = (bounds.top + bounds.bottom) / 2;
+    return {
+      x: outerSize.w / 2 - bboxCx * scale,
+      y: outerSize.h / 2 - bboxCy * scale,
+    };
+  }, [bounds.left, bounds.right, bounds.top, bounds.bottom, outerSize.w, outerSize.h, scale]);
+
+  // Auto-center when layout changes externally
+  const layoutSigRef = useRef("");
+  useEffect(() => {
+    const sig = draft.outputs.map((o) => `${o.display_id.adapter_luid}:${o.display_id.target_id}:${o.enabled}:${o.position.x}:${o.position.y}:${o.resolution.width}:${o.resolution.height}`).join("|");
+    if (sig !== layoutSigRef.current) {
+      layoutSigRef.current = sig;
+      setOffset(computeCenter());
+    }
+  }, [draft, computeCenter]);
+
+  // Re-center if bounding box is 80%+ offscreen
+  function checkRecenter(newOffset: { x: number; y: number }) {
+    const bbl = newOffset.x + bounds.left * scale;
+    const bbt = newOffset.y + bounds.top * scale;
+    const bbr = newOffset.x + bounds.right * scale;
+    const bbb = newOffset.y + bounds.bottom * scale;
+    const visW = Math.max(0, Math.min(bbr, outerSize.w) - Math.max(bbl, 0));
+    const visH = Math.max(0, Math.min(bbb, outerSize.h) - Math.max(bbt, 0));
+    const visArea = visW * visH;
+    const totalArea = bounds.width * scale * bounds.height * scale;
+    if (totalArea > 0 && visArea / totalArea < 0.2) {
+      setOffset(computeCenter());
+    }
+  }
+
+  // Canvas pan (background)
+  function onCanvasPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0) return;
+    dragRef.current = { type: "canvas", sx: e.clientX, sy: e.clientY, ox: offset.x, oy: offset.y };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+
+  // Monitor drag
+  function onMonitorPointerDown(e: React.PointerEvent<HTMLDivElement>, key: string) {
+    e.stopPropagation();
+    if (e.button !== 0) return;
     const output = draft.outputs.find((o) => displayKey(o.display_id) === key);
     if (!output) return;
-    dragState.current = {
+    dragRef.current = {
+      type: "monitor",
       key,
-      startClientX: e.clientX,
-      startClientY: e.clientY,
-      origX: output.position.x,
-      origY: output.position.y,
+      sx: e.clientX,
+      sy: e.clientY,
+      ovx: output.position.x,
+      ovy: output.position.y,
       frozenLayout: draft,
-      frozenBounds: bounds,
       scale,
     };
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
 
   function onPointerMove(e: React.PointerEvent) {
-    if (!dragState.current) return;
-    const d = dragState.current;
-    const vx = (e.clientX - d.startClientX) / d.scale;
-    const vy = (e.clientY - d.startClientY) / d.scale;
-    const newX = Math.round((d.origX + vx) / SNAP_PX) * SNAP_PX;
-    const newY = Math.round((d.origY + vy) / SNAP_PX) * SNAP_PX;
-
-    onDraftChange({
-      ...d.frozenLayout,
-      outputs: d.frozenLayout.outputs.map((o) =>
-        displayKey(o.display_id) === d.key
-          ? { ...o, position: { x: Math.max(0, newX), y: Math.max(0, newY) } }
-          : o
-      ),
-    });
+    const d = dragRef.current;
+    if (!d) return;
+    if (d.type === "canvas") {
+      const newOffset = { x: d.ox + e.clientX - d.sx, y: d.oy + e.clientY - d.sy };
+      setOffset(newOffset);
+    } else {
+      const dvx = (e.clientX - d.sx) / d.scale;
+      const dvy = (e.clientY - d.sy) / d.scale;
+      const newX = Math.round((d.ovx + dvx) / SNAP_PX) * SNAP_PX;
+      const newY = Math.round((d.ovy + dvy) / SNAP_PX) * SNAP_PX;
+      onDraftChange({
+        ...d.frozenLayout,
+        outputs: d.frozenLayout.outputs.map((o) =>
+          displayKey(o.display_id) === d.key
+            ? { ...o, position: { x: Math.max(0, newX), y: Math.max(0, newY) } }
+            : o
+        ),
+      });
+    }
   }
 
-  function onPointerUp() {
-    dragState.current = null;
+  function onPointerUp(e: React.PointerEvent) {
+    const d = dragRef.current;
+    dragRef.current = null;
+    if (d?.type === "canvas") {
+      const newOffset = { x: d.ox + e.clientX - d.sx, y: d.oy + e.clientY - d.sy };
+      checkRecenter(newOffset);
+    }
   }
+
+  const monitorNumbers = new Map(displays.map((d, i) => [displayKey(d.id), i + 1]));
 
   return (
-    <div className="overflow-auto rounded-lg border border-zinc-700 p-3">
+    <div
+      ref={outerRef}
+      className="relative rounded-lg border border-zinc-700 bg-zinc-900/20 overflow-hidden cursor-grab active:cursor-grabbing"
+      style={{ height: `${height}px` }}
+      onPointerDown={onCanvasPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerLeave={onPointerUp}
+    >
+      {/* Infinite canvas */}
       <div
-        ref={containerRef}
-        className="relative rounded-md border border-zinc-800 bg-zinc-900/40 select-none"
-        style={{ width: `${canvasW}px`, height: `${canvasH}px`, minHeight: "140px" }}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerLeave={onPointerUp}
+        style={{
+          position: "absolute",
+          width: `${CANVAS_SIZE}px`,
+          height: `${CANVAS_SIZE}px`,
+          transform: `translate(${offset.x}px, ${offset.y}px)`,
+          touchAction: "none",
+        }}
       >
-        {draft.outputs.map((output) => {
+        {allOutputs.map((output) => {
           const key = displayKey(output.display_id);
           const display = displays.find((d) => displayKey(d.id) === key);
           const monNum = monitorNumbers.get(key);
           const active = output.enabled;
-          const left = (output.position.x - bounds.left) * scale + 12;
-          const top = (output.position.y - bounds.top) * scale + 12;
+          const x = output.position.x * scale;
+          const y = output.position.y * scale;
           const w = Math.max(42, output.resolution.width * scale);
           const h = Math.max(28, output.resolution.height * scale);
 
           return (
             <div
               key={key}
-              onPointerDown={(e) => active ? onPointerDown(e, key) : undefined}
-              className={`absolute flex min-w-0 flex-col justify-between rounded-md border p-1.5 text-[10px] ${
+              onPointerDown={(e) => onMonitorPointerDown(e, key)}
+              style={{ position: "absolute", left: `${x}px`, top: `${y}px`, width: `${w}px`, height: `${h}px` }}
+              className={`flex flex-col justify-between rounded-md border p-1.5 text-[10px] select-none cursor-grab active:cursor-grabbing ${
                 active
                   ? output.primary
-                    ? "border-yellow-500/50 bg-yellow-900/20 text-yellow-200 cursor-grab active:cursor-grabbing"
-                    : "border-blue-500/30 bg-blue-900/15 text-blue-200 cursor-grab active:cursor-grabbing"
-                  : "border-zinc-600 bg-zinc-800/30 text-zinc-500"
+                    ? "border-yellow-500/60 bg-yellow-900/25 text-yellow-200"
+                    : "border-blue-500/40 bg-blue-900/20 text-blue-100"
+                  : "border-zinc-600/60 bg-zinc-800/40 text-zinc-500"
               }`}
-              style={{ left: `${left}px`, top: `${top}px`, width: `${w}px`, height: `${h}px` }}
             >
-              <div className="flex min-w-0 items-start justify-between gap-1">
+              <div className="flex min-w-0 items-start justify-between gap-1 pointer-events-none">
                 <div className="flex min-w-0 items-start gap-1">
                   {monNum != null && (
-                    <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded border border-current/40 bg-zinc-900/60 px-1 text-[9px] font-bold leading-none">
+                    <span className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded border border-current/40 bg-zinc-900/70 px-1 text-[9px] font-bold leading-none">
                       {monNum}
                     </span>
                   )}
-                  <span className="truncate font-medium leading-tight pointer-events-none">
-                    {display?.friendly_name ?? key}
-                  </span>
+                  <span className="truncate font-medium leading-tight">{display?.friendly_name ?? key}</span>
                 </div>
                 {output.primary && (
-                  <span className="shrink-0 rounded-full border border-yellow-500/50 px-1 py-px text-[7px] font-semibold uppercase tracking-wide text-yellow-400 pointer-events-none">
+                  <span className="shrink-0 rounded-full border border-yellow-500/50 px-1 py-px text-[7px] font-semibold uppercase tracking-wide text-yellow-400">
                     Primary
                   </span>
                 )}
@@ -165,6 +239,11 @@ function LayoutCanvas({ draft, displays, onDraftChange }: LayoutCanvasProps) {
             </div>
           );
         })}
+      </div>
+
+      {/* Hint */}
+      <div className="absolute bottom-2 right-3 text-[10px] text-zinc-600 pointer-events-none select-none">
+        Drag monitors · Scroll canvas
       </div>
     </div>
   );
@@ -286,8 +365,6 @@ function DpiPicker({ displayId }: DpiPickerProps) {
     }
   }
 
-  const label = currentDpi != null ? `${currentDpi}% DPI` : "DPI…";
-
   return (
     <div className="relative">
       <button
@@ -295,7 +372,7 @@ function DpiPicker({ displayId }: DpiPickerProps) {
         disabled={applying || currentDpi == null}
         className="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-1 transition-colors disabled:opacity-50 whitespace-nowrap"
       >
-        {applying ? "…" : label}
+        {applying ? "…" : currentDpi != null ? `${currentDpi}% DPI` : "DPI…"}
         <ChevronDown size={10} className={`transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
       {open && (
@@ -334,6 +411,16 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
   const activeCount = displays.filter((d) => d.is_active).length;
   const currentLayout = draftLayout ?? layout;
   const isDirty = draftLayout !== null;
+
+  // Reset draft when external layout changes (e.g. after confirmation revert)
+  const prevLayoutRef = useRef("");
+  useEffect(() => {
+    const sig = JSON.stringify(layout.outputs.map(o => o.position));
+    if (sig !== prevLayoutRef.current) {
+      prevLayoutRef.current = sig;
+      setDraftLayout(null);
+    }
+  }, [layout]);
 
   async function confirmLayout() {
     setConfirmBusy(true);
@@ -414,8 +501,8 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
   }
 
   return (
-    <div className="relative space-y-4">
-      {/* Pending confirmation — floating banner just below the tab bar */}
+    <div className="space-y-4">
+      {/* Floating confirmation banner */}
       {pending_confirmation && (
         <div className="sticky top-0 z-40 rounded-lg border border-yellow-500 bg-yellow-950/90 backdrop-blur px-4 py-3 text-sm shadow-lg">
           <div className="flex items-center justify-between gap-4">
@@ -424,21 +511,15 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
               {pending_confirmation_remaining_secs != null
                 ? `${Math.ceil(pending_confirmation_remaining_secs)}s`
                 : "…"}{" "}
-              or it will revert automatically
+              or it will revert
             </span>
             <div className="flex gap-2 shrink-0">
-              <button
-                onClick={confirmLayout}
-                disabled={confirmBusy}
-                className="px-3 py-1.5 rounded text-xs font-medium bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
-              >
+              <button onClick={confirmLayout} disabled={confirmBusy}
+                className="px-3 py-1.5 rounded text-xs font-medium bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50">
                 {confirmBusy ? "…" : "Confirm"}
               </button>
-              <button
-                onClick={revertLayout}
-                disabled={confirmBusy}
-                className="px-3 py-1.5 rounded text-xs font-medium bg-red-800 hover:bg-red-700 text-white transition-colors disabled:opacity-50"
-              >
+              <button onClick={revertLayout} disabled={confirmBusy}
+                className="px-3 py-1.5 rounded text-xs font-medium bg-red-800 hover:bg-red-700 text-white transition-colors disabled:opacity-50">
                 {confirmBusy ? "…" : "Revert"}
               </button>
             </div>
@@ -448,41 +529,27 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
 
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-medium text-zinc-400">Display Layout</h2>
-        <button
-          onClick={onRefresh}
-          className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
-        >
-          <RefreshCw size={12} />
-          Refresh
+        <button onClick={onRefresh} className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
+          <RefreshCw size={12} /> Refresh
         </button>
       </div>
 
-      <LayoutCanvas
-        draft={currentLayout}
-        displays={displays}
-        onDraftChange={setDraftLayout}
-      />
+      <LayoutCanvas draft={currentLayout} displays={displays} onDraftChange={setDraftLayout} />
 
       <div className="flex items-center gap-2 min-h-[28px]">
         {isDirty ? (
           <>
-            <button
-              onClick={applyDraft}
-              disabled={applyingLayout || pending_confirmation}
-              className="px-3 py-1.5 rounded text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors disabled:opacity-50"
-            >
+            <button onClick={applyDraft} disabled={applyingLayout || pending_confirmation}
+              className="px-3 py-1.5 rounded text-xs font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors disabled:opacity-50">
               {applyingLayout ? "Applying…" : "Apply Layout"}
             </button>
-            <button
-              onClick={() => setDraftLayout(null)}
-              className="px-3 py-1.5 rounded text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 transition-colors"
-            >
+            <button onClick={() => setDraftLayout(null)}
+              className="px-3 py-1.5 rounded text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 transition-colors">
               Reset
             </button>
-            <span className="text-xs text-zinc-500">Drag to reposition</span>
           </>
         ) : (
-          <p className="text-xs text-zinc-600">Drag monitors above to reposition, then click Apply Layout.</p>
+          <p className="text-xs text-zinc-600">Drag monitors to reposition, then click Apply Layout.</p>
         )}
       </div>
 
@@ -503,88 +570,56 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
           const isBusy = busy === key;
 
           return (
-            <div
-              key={key}
+            <div key={key}
               className={`rounded-lg border p-4 transition-colors ${
-                display.is_active
-                  ? "border-zinc-700 bg-zinc-900"
-                  : "border-zinc-800 bg-zinc-900/50 opacity-60"
+                display.is_active ? "border-zinc-700 bg-zinc-900" : "border-zinc-800 bg-zinc-900/50 opacity-60"
               }`}
             >
               <div className="flex items-start justify-between">
                 <div className="flex items-center gap-3">
-                  <Monitor
-                    size={20}
-                    className={display.is_active ? "text-blue-400" : "text-zinc-600"}
-                  />
+                  <Monitor size={20} className={display.is_active ? "text-blue-400" : "text-zinc-600"} />
                   <div>
                     <div className="font-medium text-sm flex items-center gap-2">
                       <span className="text-xs text-zinc-500 font-mono">#{dispNum}</span>
                       {display.friendly_name}
                     </div>
                     <div className="text-xs text-zinc-500 mt-0.5">
-                      {display.resolution.width}×{display.resolution.height} @{" "}
-                      {Math.round(display.refresh_rate_mhz / 1000)} Hz
+                      {display.resolution.width}×{display.resolution.height} @ {Math.round(display.refresh_rate_mhz / 1000)} Hz
                     </div>
                     {output && display.is_active && (
                       <div className="text-xs text-zinc-600 mt-0.5">
-                        Position: ({output.position.x}, {output.position.y})
+                        ({output.position.x}, {output.position.y})
                       </div>
                     )}
                   </div>
                 </div>
 
                 <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
-                  {/* DPI picker — per-monitor, fetches current DPI on mount */}
-                  {display.is_active && (
-                    <DpiPicker displayId={display.id} />
-                  )}
-
-                  {/* Resolution picker */}
+                  {display.is_active && <DpiPicker displayId={display.id} />}
                   {display.is_active && gdiName && (
-                    <ResolutionPicker
-                      display={display}
-                      gdiName={gdiName}
-                      onRefresh={onRefresh}
-                    />
+                    <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />
                   )}
-
-                  {/* Primary button — all active monitors, toggle style */}
                   {display.is_active && (
                     display.is_primary ? (
-                      <button
-                        disabled
-                        className="flex items-center gap-1 px-2 py-1.5 rounded text-xs font-medium bg-yellow-900/40 text-yellow-300 border border-yellow-700 cursor-default opacity-90"
-                        title="This is the primary display"
-                      >
+                      <button disabled
+                        className="flex items-center gap-1 px-2 py-1.5 rounded text-xs font-medium bg-yellow-900/40 text-yellow-300 border border-yellow-700 cursor-default opacity-90">
                         ★ Primary
                       </button>
                     ) : (
-                      <button
-                        onClick={() => makePrimary(display)}
+                      <button onClick={() => makePrimary(display)}
                         disabled={isBusy || pending_confirmation}
-                        title="Set as primary display"
-                        className="flex items-center gap-1 px-2 py-1.5 rounded text-xs text-zinc-400 hover:text-yellow-300 border border-zinc-700 hover:border-yellow-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
+                        className="flex items-center gap-1 px-2 py-1.5 rounded text-xs text-zinc-400 hover:text-yellow-300 border border-zinc-700 hover:border-yellow-600 transition-colors disabled:opacity-50">
                         ☆ Primary
                       </button>
                     )
                   )}
-
-                  {/* Enable/Disable button */}
-                  <button
-                    onClick={() => toggleDisplay(display)}
+                  <button onClick={() => toggleDisplay(display)}
                     disabled={isBusy || (display.is_active && activeCount <= 1)}
-                    title={
-                      display.is_active && activeCount <= 1
-                        ? "Cannot disable the last active display"
-                        : undefined
-                    }
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
                       display.is_active
                         ? "bg-red-900/40 text-red-400 hover:bg-red-900/60 border border-red-900"
                         : "bg-green-900/40 text-green-400 hover:bg-green-900/60 border border-green-900"
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                    } disabled:opacity-50`}
                   >
                     <Power size={12} />
                     {isBusy ? "…" : display.is_active ? "Disable" : "Enable"}
@@ -596,9 +631,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
         })}
 
         {displays.length === 0 && (
-          <div className="text-center text-zinc-500 py-12 text-sm">
-            No displays detected
-          </div>
+          <div className="text-center text-zinc-500 py-12 text-sm">No displays detected</div>
         )}
       </div>
     </div>

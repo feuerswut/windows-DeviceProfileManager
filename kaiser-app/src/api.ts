@@ -93,4 +93,13 @@ export const api = {
   setDisplayDpi(adapterLuid: number, targetId: number, percent: number): Promise<void> {
     return invoke("set_display_dpi_cmd", { adapterLuid, targetId, percent });
   },
+
+  updateProfile(
+    name: string,
+    layout: import("./types").Layout,
+    dpiScales: Record<string, number>,
+    audio: import("./types").AudioSetting[],
+  ): Promise<void> {
+    return invoke("update_profile", { name, layout, dpiScales, audio });
+  },
 };
