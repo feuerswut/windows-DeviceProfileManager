@@ -37,6 +37,7 @@ pub fn run() {
             commands::get_display_dpi_cmd,
             commands::set_display_dpi_cmd,
             commands::update_profile,
+            commands::frontend_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kaiser");

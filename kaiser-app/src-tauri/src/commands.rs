@@ -455,6 +455,18 @@ pub fn revert_layout(state: State<AppState>) -> Result<(), String> {
     manager.rollback_pending().map_err(|e| e.to_string())
 }
 
+// ---- Frontend logging ---------------------------------------------------
+
+#[tauri::command]
+pub fn frontend_log(level: String, message: String) {
+    match level.as_str() {
+        "error" => log::error!("[frontend] {}", message),
+        "warn"  => log::warn!("[frontend] {}", message),
+        "info"  => log::info!("[frontend] {}", message),
+        _       => log::debug!("[frontend] {}", message),
+    }
+}
+
 // ---- Primary display command --------------------------------------------
 
 #[tauri::command]
