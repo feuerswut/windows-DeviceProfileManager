@@ -141,15 +141,18 @@ pub struct ProfileDto {
     pub audio: Vec<AudioSetting>,
     /// Per-monitor DPI percentages keyed by "adapter_luid:target_id"
     pub dpi_scales: HashMap<String, u32>,
+    /// Friendly display names captured at save time, keyed by "adapter_luid:target_id"
+    pub display_names: HashMap<String, String>,
 }
 
 fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
     let kp = store.load_kaiser_profile(&profile.name);
     let audio = kp.as_ref().map(|k| k.audio.clone()).unwrap_or_default();
     let dpi_scales = kp.as_ref().map(|k| k.dpi_scales.clone()).unwrap_or_default();
+    let display_names = kp.as_ref().map(|k| k.display_names.clone()).unwrap_or_default();
     // Kaiser config layout is authoritative (may be user-edited); fall back to Monarch's
     let layout = kp.map(|k| k.layout).unwrap_or_else(|| profile.layout.clone());
-    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales }
+    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names }
 }
 
 // ---- Display commands ---------------------------------------------------
@@ -270,27 +273,32 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
         }
     };
 
-    // Auto-capture per-monitor DPI for all active outputs
-    let dpi_scales: HashMap<String, u32> = layout
-        .outputs
-        .iter()
-        .filter(|o| o.enabled)
-        .filter_map(|o| {
+    // Auto-capture per-monitor DPI and friendly names for all active outputs
+    let mut dpi_scales: HashMap<String, u32> = HashMap::new();
+    let mut display_names: HashMap<String, String> = HashMap::new();
+    {
+        let manager = state.manager.lock().unwrap();
+        let displays = manager.list_displays().unwrap_or_default();
+        drop(manager);
+        for o in layout.outputs.iter().filter(|o| o.enabled) {
             let key = format!("{}:{}", o.display_id.adapter_luid, o.display_id.target_id);
             match get_display_dpi(o.display_id.adapter_luid, o.display_id.target_id) {
-                Ok(pct) => Some((key, pct)),
-                Err(e) => {
-                    log::warn!("save_profile: get_display_dpi for {key} failed: {e}");
-                    None
-                }
+                Ok(pct) => { dpi_scales.insert(key.clone(), pct); }
+                Err(e) => log::warn!("save_profile: get_display_dpi for {key} failed: {e}"),
             }
-        })
-        .collect();
+            if let Some(d) = displays.iter().find(|d| {
+                d.id.adapter_luid == o.display_id.adapter_luid
+                    && d.id.target_id == o.display_id.target_id
+            }) {
+                display_names.insert(key, d.friendly_name.clone());
+            }
+        }
+    }
 
     log::info!("save_profile: '{name}' dpi_scales={dpi_scales:?} audio={}", audio.len());
     let store = state.new_store();
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names })
         .map_err(|e| e.to_string())?;
 
     let mut manager = state.manager.lock().unwrap();
@@ -377,8 +385,11 @@ pub fn update_profile(
 ) -> Result<(), String> {
     log::info!("update_profile: '{name}'");
     let store = state.new_store();
+    let display_names = store.load_kaiser_profile(&name)
+        .map(|kp| kp.display_names)
+        .unwrap_or_default();
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names })
         .map_err(|e| e.to_string())
 }
 

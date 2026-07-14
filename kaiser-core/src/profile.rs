@@ -27,6 +27,9 @@ pub struct KaiserProfile {
     /// Per-monitor DPI scaling percentages. Key = "adapter_luid:target_id", value = percent (100, 125, 150, …)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub dpi_scales: HashMap<String, u32>,
+    /// Friendly display names captured at save time. Key = "adapter_luid:target_id", value = Windows friendly name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub display_names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,8 +154,9 @@ impl ConfigStore for KaiserConfigStore {
                 .map(|(_, kp)| kp);
             let audio = existing_kp.map(|kp| kp.audio.clone()).unwrap_or_default();
             let dpi_scales = existing_kp.map(|kp| kp.dpi_scales.clone()).unwrap_or_default();
+            let display_names = existing_kp.map(|kp| kp.display_names.clone()).unwrap_or_default();
             names.push(profile.name.clone());
-            profiles.push(KaiserProfile { layout: profile.layout.clone(), audio, dpi_scales });
+            profiles.push(KaiserProfile { layout: profile.layout.clone(), audio, dpi_scales, display_names });
         }
         let kaiser = KaiserConfig {
             profiles,
