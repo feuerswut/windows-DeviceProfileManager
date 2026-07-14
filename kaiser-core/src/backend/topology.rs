@@ -138,11 +138,20 @@ impl DisplayBackend for KaiserBackend {
         // so the UI can show them as "off" and let the user re-enable them
         let active_ids: std::collections::HashSet<_> =
             all_displays.iter().map(|d| d.id.clone()).collect();
+        let active_edid_hashes: std::collections::HashSet<u64> =
+            all_displays.iter().filter_map(|d| d.id.edid_hash).collect();
 
         if let Ok(content) = std::fs::read_to_string(&self.snapshot_path) {
             if let Ok(persisted) = serde_json::from_str::<PersistedSnapshot>(&content) {
                 for display in persisted.displays {
-                    if !active_ids.contains(&display.id) {
+                    // Match by stable edid_hash first to avoid ghost entries after a
+                    // reboot where the adapter LUID changes for the same physical monitor.
+                    let matched_by_hash = display
+                        .id
+                        .edid_hash
+                        .map(|h| active_edid_hashes.contains(&h))
+                        .unwrap_or(false);
+                    if !active_ids.contains(&display.id) && !matched_by_hash {
                         let mut inactive = display;
                         inactive.is_active = false;
                         all_displays.push(inactive);
@@ -167,11 +176,18 @@ impl DisplayBackend for KaiserBackend {
             .iter()
             .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
             .collect();
+        let active_edid_hashes: std::collections::HashSet<u64> =
+            layout.outputs.iter().filter_map(|o| o.display_id.edid_hash).collect();
         if let Ok(content) = std::fs::read_to_string(&self.snapshot_path) {
             if let Ok(persisted) = serde_json::from_str::<PersistedSnapshot>(&content) {
                 for mut output in persisted.layout.outputs {
                     let key = (output.display_id.adapter_luid, output.display_id.target_id);
-                    if !active_keys.contains(&key) {
+                    let matched_by_hash = output
+                        .display_id
+                        .edid_hash
+                        .map(|h| active_edid_hashes.contains(&h))
+                        .unwrap_or(false);
+                    if !active_keys.contains(&key) && !matched_by_hash {
                         output.enabled = false;
                         layout.outputs.push(output);
                     }
@@ -280,24 +296,38 @@ impl KaiserBackend {
 
         let active_ids: std::collections::HashSet<_> =
             snapshot.displays.iter().map(|d| d.id.clone()).collect();
+        let active_edid_hashes: std::collections::HashSet<u64> =
+            snapshot.displays.iter().filter_map(|d| d.id.edid_hash).collect();
         let active_keys: std::collections::HashSet<(u64, u32)> = snapshot
             .layout
             .outputs
             .iter()
             .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
             .collect();
+        let active_output_edid_hashes: std::collections::HashSet<u64> =
+            snapshot.layout.outputs.iter().filter_map(|o| o.display_id.edid_hash).collect();
 
         if let Ok(content) = std::fs::read_to_string(&self.snapshot_path) {
             if let Ok(old) = serde_json::from_str::<PersistedSnapshot>(&content) {
                 for mut d in old.displays {
-                    if !active_ids.contains(&d.id) {
+                    let matched_by_hash = d
+                        .id
+                        .edid_hash
+                        .map(|h| active_edid_hashes.contains(&h))
+                        .unwrap_or(false);
+                    if !active_ids.contains(&d.id) && !matched_by_hash {
                         d.is_active = false;
                         displays.push(d);
                     }
                 }
                 for mut o in old.layout.outputs {
                     let key = (o.display_id.adapter_luid, o.display_id.target_id);
-                    if !active_keys.contains(&key) {
+                    let matched_by_hash = o
+                        .display_id
+                        .edid_hash
+                        .map(|h| active_output_edid_hashes.contains(&h))
+                        .unwrap_or(false);
+                    if !active_keys.contains(&key) && !matched_by_hash {
                         o.enabled = false;
                         outputs.push(o);
                     }

@@ -1,3 +1,4 @@
 @echo off
 cd /d "%~dp0kaiser-app"
-npx tauri dev
+if not exist node_modules npm install
+npm run tauri -- dev
