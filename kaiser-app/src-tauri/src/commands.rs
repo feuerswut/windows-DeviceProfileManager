@@ -11,42 +11,112 @@ use monarch::{DisplayId, DisplayInfo, Layout, Profile};
 
 use crate::state::AppState;
 
-// u64 values (edid_hash) lose precision in JavaScript's f64 Number type.
-// Re-resolves display IDs from the live layout using only adapter_luid + target_id.
+// Remaps desired layout display IDs to the live layout's IDs.
+// Three tiers (mirrors Monarch's remap_layout_display_ids):
+//   1. Exact DisplayId match → keep as-is
+//   2. edid_hash match (only when exactly one unused live candidate)
+//   3. target_id fallback (only when exactly one unused live candidate)
+// This survives adapter LUID changes across reboots.
 fn fix_layout_display_ids(
-    mut layout: Layout,
+    desired: Layout,
     manager: &monarch::MonarchDisplayManager<SharedKaiserBackend, KaiserConfigStore>,
 ) -> Layout {
-    if let Ok(live) = manager.get_layout() {
-        for output in &mut layout.outputs {
-            if let Some(live_out) = live.outputs.iter().find(|o| {
-                o.display_id.adapter_luid == output.display_id.adapter_luid
-                    && o.display_id.target_id == output.display_id.target_id
-            }) {
-                output.display_id = live_out.display_id.clone();
-            }
+    let Ok(live) = manager.get_layout() else { return desired };
+    remap_layout_display_ids(desired, &live)
+}
+
+fn remap_layout_display_ids(desired: Layout, current: &Layout) -> Layout {
+    use std::collections::{HashMap, HashSet};
+
+    let current_ids: HashSet<DisplayId> =
+        current.outputs.iter().map(|o| o.display_id.clone()).collect();
+
+    if desired.outputs.iter().all(|o| current_ids.contains(&o.display_id)) {
+        return desired;
+    }
+
+    let mut remapped = desired;
+    let mut used: HashSet<DisplayId> = remapped
+        .outputs
+        .iter()
+        .filter(|o| current_ids.contains(&o.display_id))
+        .map(|o| o.display_id.clone())
+        .collect();
+
+    let mut by_edid: HashMap<u64, Vec<&monarch::OutputConfig>> = HashMap::new();
+    for o in &current.outputs {
+        if let Some(h) = o.display_id.edid_hash {
+            by_edid.entry(h).or_default().push(o);
         }
     }
-    layout
+
+    for output in &mut remapped.outputs {
+        if current_ids.contains(&output.display_id) {
+            continue;
+        }
+        let mut replacement = None;
+
+        if let Some(h) = output.display_id.edid_hash {
+            let candidates: Vec<_> = by_edid
+                .get(&h)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| !used.contains(&c.display_id))
+                .collect();
+            if candidates.len() == 1 {
+                replacement = Some(candidates[0].display_id.clone());
+            }
+        }
+
+        if replacement.is_none() {
+            let candidates: Vec<_> = current
+                .outputs
+                .iter()
+                .filter(|c| {
+                    c.display_id.target_id == output.display_id.target_id
+                        && !used.contains(&c.display_id)
+                })
+                .collect();
+            if candidates.len() == 1 {
+                replacement = Some(candidates[0].display_id.clone());
+            }
+        }
+
+        if let Some(next_id) = replacement {
+            used.insert(next_id.clone());
+            output.display_id = next_id;
+        }
+    }
+
+    remapped
 }
 
 fn resolve_display_id(
     display_id: &DisplayId,
     manager: &monarch::MonarchDisplayManager<SharedKaiserBackend, KaiserConfigStore>,
 ) -> DisplayId {
-    manager
-        .get_layout()
-        .ok()
-        .and_then(|layout| {
-            layout
-                .outputs
-                .into_iter()
-                .find(|o| {
-                    o.display_id.adapter_luid == display_id.adapter_luid
-                        && o.display_id.target_id == display_id.target_id
-                })
-                .map(|o| o.display_id)
+    let Ok(live) = manager.get_layout() else { return display_id.clone() };
+    // Exact match first, then edid_hash, then target_id
+    live.outputs
+        .iter()
+        .find(|o| &o.display_id == display_id)
+        .or_else(|| {
+            display_id.edid_hash.and_then(|h| {
+                let candidates: Vec<_> =
+                    live.outputs.iter().filter(|o| o.display_id.edid_hash == Some(h)).collect();
+                if candidates.len() == 1 { Some(candidates[0]) } else { None }
+            })
         })
+        .or_else(|| {
+            let candidates: Vec<_> = live
+                .outputs
+                .iter()
+                .filter(|o| o.display_id.target_id == display_id.target_id)
+                .collect();
+            if candidates.len() == 1 { Some(candidates[0]) } else { None }
+        })
+        .map(|o| o.display_id.clone())
         .unwrap_or_else(|| display_id.clone())
 }
 
