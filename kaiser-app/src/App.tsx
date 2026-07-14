@@ -7,6 +7,46 @@ import { DisplaysTab } from "./components/DisplaysTab";
 import { AudioTab } from "./components/AudioTab";
 import { ProfilesTab } from "./components/ProfilesTab";
 
+function ConfirmBanner({
+  remainingSecs,
+  onConfirm,
+  onRevert,
+}: {
+  remainingSecs: number | null;
+  onConfirm: () => Promise<void>;
+  onRevert: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  async function act(fn: () => Promise<void>) {
+    setBusy(true);
+    try { await fn(); } finally { setBusy(false); }
+  }
+  return (
+    <div className="flex items-center justify-between gap-4 bg-yellow-950/95 border-b border-yellow-600/70 px-4 py-2.5 text-sm shadow-lg backdrop-blur z-50">
+      <span className="text-yellow-300 font-medium">
+        Confirm layout change
+        {remainingSecs != null ? ` — reverts in ${Math.ceil(remainingSecs)}s` : ""}
+      </span>
+      <div className="flex gap-2 shrink-0">
+        <button
+          onClick={() => act(onConfirm)}
+          disabled={busy}
+          className="px-3 py-1 rounded text-xs font-semibold bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
+        >
+          {busy ? "…" : "Confirm"}
+        </button>
+        <button
+          onClick={() => act(onRevert)}
+          disabled={busy}
+          className="px-3 py-1 rounded text-xs font-semibold bg-red-800 hover:bg-red-700 text-white transition-colors disabled:opacity-50"
+        >
+          {busy ? "…" : "Revert"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 type Tab = "displays" | "audio" | "profiles";
 
 export default function App() {
@@ -38,6 +78,26 @@ export default function App() {
       setLoading(false)
     );
   }, [refreshSnapshot, refreshAudio]);
+
+  async function handleConfirm() {
+    try {
+      await api.confirmLayout();
+      await refreshSnapshot();
+      toast.success("Layout confirmed");
+    } catch (err) {
+      toast.error(`Confirm failed: ${err}`);
+    }
+  }
+
+  async function handleRevert() {
+    try {
+      await api.revertLayout();
+      await refreshSnapshot();
+      toast.success("Layout reverted");
+    } catch (err) {
+      toast.error(`Revert failed: ${err}`);
+    }
+  }
 
   // Poll every 3s: snapshot drives auto-rollback + display state; audio detects external changes
   useEffect(() => {
@@ -85,8 +145,17 @@ export default function App() {
         ))}
       </nav>
 
+      {/* Global confirm banner — visible on all tabs */}
+      {!loading && snapshot?.pending_confirmation && (
+        <ConfirmBanner
+          remainingSecs={snapshot.pending_confirmation_remaining_secs}
+          onConfirm={handleConfirm}
+          onRevert={handleRevert}
+        />
+      )}
+
       {/* Content */}
-      <main className="flex-1 overflow-auto p-4">
+      <main className="flex-1 overflow-auto p-4 scrollbar-thin">
         {loading ? (
           <div className="flex items-center justify-center h-full text-zinc-500">
             Loading…

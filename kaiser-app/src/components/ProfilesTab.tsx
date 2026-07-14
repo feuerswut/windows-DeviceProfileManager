@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import { toast } from "sonner";
 import { Play, Save, Trash2, RefreshCw, Monitor, Mic, Volume2, ChevronDown, Edit2, X, Check } from "lucide-react";
 import { api } from "../api";
@@ -41,13 +41,11 @@ function MonitorCard({
     <div
       className={`flex items-center gap-2 rounded border px-2 py-1 text-xs ${
         output.enabled
-          ? output.primary
-            ? "border-yellow-600/40 bg-yellow-950/30 text-yellow-200"
-            : "border-zinc-700 bg-zinc-800/60 text-zinc-300"
+          ? "border-zinc-700 bg-zinc-800/60 text-zinc-300"
           : "border-zinc-800 bg-zinc-900/40 text-zinc-600"
       }`}
     >
-      <Monitor size={11} className={output.enabled ? (output.primary ? "text-yellow-400" : "text-blue-400") : "text-zinc-600"} />
+      <Monitor size={11} className={output.enabled ? "text-blue-400" : "text-zinc-600"} />
       <span className="font-mono text-[10px] text-zinc-500">#{index}</span>
       {output.enabled ? (
         <>
@@ -86,7 +84,12 @@ interface EditPanelProps {
   onSaved: () => void;
 }
 
-function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }: EditPanelProps) {
+export interface EditPanelHandle {
+  save: () => void;
+}
+
+const EditPanel = forwardRef<EditPanelHandle, EditPanelProps>(
+function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
   const [layout, setLayout] = useState<Layout>(() => JSON.parse(JSON.stringify(profile.layout)));
   const [dpiScales, setDpiScales] = useState<Record<string, number>>(
     () => profile.dpi_scales ? { ...profile.dpi_scales } : {}
@@ -163,6 +166,8 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }: EditPa
       setSaving(false);
     }
   }
+
+  useImperativeHandle(ref, () => ({ save }));
 
   const renderDevices = audioDevices.filter((d) => d.flow === "render");
   const captureDevices = audioDevices.filter((d) => d.flow === "capture");
@@ -256,7 +261,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }: EditPa
                         <ChevronDown size={9} className={`transition-transform ${modesOpen === key ? "rotate-180" : ""}`} />
                       </button>
                       {modesOpen === key && (
-                        <div className="absolute left-0 top-full mt-1 z-50 w-52 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-56">
+                        <div className="absolute right-0 top-full mt-1 z-50 w-44 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-56">
                           {modes == null ? (
                             <div className="px-3 py-2 text-xs text-zinc-500">Loading…</div>
                           ) : modes.length === 0 ? (
@@ -358,7 +363,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }: EditPa
       </div>
     </div>
   );
-}
+});
 
 // ---- Profile card -----------------------------------------------------------
 
@@ -374,6 +379,7 @@ interface ProfileCardProps {
 
 function ProfileCard({ profile, snapshot, audioDevices, busy, onApply, onDelete, onRefresh }: ProfileCardProps) {
   const [editing, setEditing] = useState(false);
+  const editRef = useRef<EditPanelHandle>(null);
 
   const renderSettings = profile.audio.filter((a) => a.flow === "render");
   const captureSettings = profile.audio.filter((a) => a.flow === "capture");
@@ -407,6 +413,15 @@ function ProfileCard({ profile, snapshot, audioDevices, busy, onApply, onDelete,
 
         {/* Actions */}
         <div className="flex items-center gap-1 shrink-0">
+          {editing && (
+            <button
+              onClick={() => editRef.current?.save()}
+              title="Save profile"
+              className="p-1.5 rounded border border-green-700 text-green-400 bg-green-900/30 hover:bg-green-900/50 transition-colors"
+            >
+              <Save size={13} />
+            </button>
+          )}
           <button onClick={() => setEditing((e) => !e)}
             title="Edit profile"
             className={`p-1.5 rounded border transition-colors ${
@@ -431,6 +446,7 @@ function ProfileCard({ profile, snapshot, audioDevices, busy, onApply, onDelete,
 
       {editing && (
         <EditPanel
+          ref={editRef}
           profile={profile}
           snapshot={snapshot}
           audioDevices={audioDevices}
@@ -546,6 +562,8 @@ export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
           />
         ))}
       </div>
+
+      <div className="h-[50px]" />
     </div>
   );
 }

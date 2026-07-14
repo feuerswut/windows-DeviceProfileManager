@@ -309,7 +309,7 @@ function ResolutionPicker({ display, gdiName, onRefresh }: ResolutionPickerProps
         <ChevronDown size={10} className={`transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
       {open && modes && (
-        <div className="absolute right-0 top-full mt-1 z-50 w-52 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-64">
+        <div className="absolute right-0 top-full mt-1 z-50 w-44 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-64">
           {modes.map((mode, i) => {
             const isActive =
               mode.width === display.resolution.width &&
@@ -323,7 +323,7 @@ function ResolutionPicker({ display, gdiName, onRefresh }: ResolutionPickerProps
                   isActive ? "text-blue-400 font-medium" : "text-zinc-300"
                 }`}
               >
-                {mode.width}×{mode.height} @ {mode.refresh_rate_hz}Hz
+                {mode.width}×{mode.height} @{mode.refresh_rate_hz}Hz
               </button>
             );
           })}
@@ -405,9 +405,8 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   const [draftLayout, setDraftLayout] = useState<Layout | null>(null);
   const [applyingLayout, setApplyingLayout] = useState(false);
-  const [confirmBusy, setConfirmBusy] = useState(false);
 
-  const { displays, layout, pending_confirmation, pending_confirmation_remaining_secs, gdi_names } = snapshot;
+  const { displays, layout, pending_confirmation, gdi_names } = snapshot;
   const activeCount = displays.filter((d) => d.is_active).length;
   const currentLayout = draftLayout ?? layout;
   const isDirty = draftLayout !== null;
@@ -421,32 +420,6 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
       setDraftLayout(null);
     }
   }, [layout]);
-
-  async function confirmLayout() {
-    setConfirmBusy(true);
-    try {
-      await api.confirmLayout();
-      await onRefresh();
-      toast.success("Layout confirmed");
-    } catch (err) {
-      toast.error(`Confirm failed: ${err}`);
-    } finally {
-      setConfirmBusy(false);
-    }
-  }
-
-  async function revertLayout() {
-    setConfirmBusy(true);
-    try {
-      await api.revertLayout();
-      await onRefresh();
-      toast.success("Layout reverted");
-    } catch (err) {
-      toast.error(`Revert failed: ${err}`);
-    } finally {
-      setConfirmBusy(false);
-    }
-  }
 
   async function toggleDisplay(display: DisplayInfo) {
     if (pending_confirmation) {
@@ -502,31 +475,6 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
 
   return (
     <div className="space-y-4">
-      {/* Floating confirmation banner */}
-      {pending_confirmation && (
-        <div className="sticky top-0 z-40 rounded-lg border border-yellow-500 bg-yellow-950/90 backdrop-blur px-4 py-3 text-sm shadow-lg">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-yellow-300 font-medium">
-              Confirm layout change within{" "}
-              {pending_confirmation_remaining_secs != null
-                ? `${Math.ceil(pending_confirmation_remaining_secs)}s`
-                : "…"}{" "}
-              or it will revert
-            </span>
-            <div className="flex gap-2 shrink-0">
-              <button onClick={confirmLayout} disabled={confirmBusy}
-                className="px-3 py-1.5 rounded text-xs font-medium bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50">
-                {confirmBusy ? "…" : "Confirm"}
-              </button>
-              <button onClick={revertLayout} disabled={confirmBusy}
-                className="px-3 py-1.5 rounded text-xs font-medium bg-red-800 hover:bg-red-700 text-white transition-colors disabled:opacity-50">
-                {confirmBusy ? "…" : "Revert"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-medium text-zinc-400">Display Layout</h2>
         <button onClick={onRefresh} className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
@@ -634,6 +582,8 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
           <div className="text-center text-zinc-500 py-12 text-sm">No displays detected</div>
         )}
       </div>
+
+      <div className="h-[50px]" />
     </div>
   );
 }
