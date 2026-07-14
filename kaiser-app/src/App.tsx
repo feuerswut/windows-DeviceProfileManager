@@ -39,13 +39,15 @@ export default function App() {
     );
   }, [refreshSnapshot, refreshAudio]);
 
-  // Poll snapshot every 3s to drive auto-rollback of expired confirmations
-  // and keep the display state current.
+  // Poll every 3s: snapshot drives auto-rollback + display state; audio detects external changes
   useEffect(() => {
     if (loading) return;
-    const id = setInterval(() => { refreshSnapshot(); }, 3000);
+    const id = setInterval(() => {
+      refreshSnapshot();
+      refreshAudio();
+    }, 3000);
     return () => clearInterval(id);
-  }, [loading, refreshSnapshot]);
+  }, [loading, refreshSnapshot, refreshAudio]);
 
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "displays", label: "Displays", icon: <Monitor size={16} /> },
