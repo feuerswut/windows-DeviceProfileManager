@@ -74,6 +74,68 @@ function AudioChip({ setting, devices }: { setting: AudioSetting; devices: Audio
   );
 }
 
+// ---- Audio device section (with hidden disconnected devices) ----------------
+
+function AudioDeviceSection({
+  devices,
+  isCapture,
+  activePat,
+  onToggle,
+}: {
+  devices: AudioDevice[];
+  isCapture: boolean;
+  activePat: string | undefined;
+  onToggle: (d: AudioDevice, active: boolean) => void;
+}) {
+  const [showHidden, setShowHidden] = useState(false);
+  const Icon = isCapture ? Mic : Volume2;
+  const connected = devices.filter((d) => d.enabled);
+  const disconnected = devices.filter((d) => !d.enabled);
+
+  function renderButton(d: AudioDevice) {
+    const isActive = activePat != null && d.name.toLowerCase().includes(activePat.toLowerCase());
+    return (
+      <button key={d.id} onClick={() => onToggle(d, !isActive)}
+        className={`w-full text-left flex items-center gap-2 rounded px-2.5 py-1.5 text-xs border transition-colors ${
+          isActive
+            ? "border-blue-600 bg-blue-900/30 text-blue-200"
+            : "border-zinc-700 bg-zinc-800/40 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
+        }`}>
+        <Icon size={11} />
+        <span className="flex-1 truncate">{d.name}</span>
+        {isActive && <Check size={11} className="shrink-0 text-blue-400" />}
+      </button>
+    );
+  }
+
+  return (
+    <div>
+      <div className="text-[10px] text-zinc-600 mb-1 flex items-center gap-1">
+        <Icon size={9} /> {isCapture ? "Input" : "Output"}
+      </div>
+      <div className="space-y-1">
+        {connected.map(renderButton)}
+        {disconnected.length > 0 && (
+          <div>
+            <button
+              onClick={() => setShowHidden((s) => !s)}
+              className="flex items-center gap-1.5 text-xs text-zinc-600 hover:text-zinc-400 transition-colors py-1"
+            >
+              <ChevronDown size={12} className={`transition-transform ${showHidden ? "rotate-180" : ""}`} />
+              {showHidden ? "Hide" : "Show"} {disconnected.length} disconnected
+            </button>
+            {showHidden && (
+              <div className="space-y-1 mt-1 opacity-40">
+                {disconnected.map(renderButton)}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---- Inline edit panel ------------------------------------------------------
 
 interface EditPanelProps {
@@ -122,6 +184,17 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
       outputs: prev.outputs.map((o) =>
         displayKey(o.display_id) === key ? { ...o, enabled: !o.enabled } : o
       ),
+    }));
+  }
+
+  function setPrimary(key: string) {
+    setLayout((prev) => ({
+      ...prev,
+      outputs: prev.outputs.map((o) => ({
+        ...o,
+        primary: displayKey(o.display_id) === key,
+        enabled: displayKey(o.display_id) === key ? true : o.enabled,
+      })),
     }));
   }
 
@@ -202,25 +275,44 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
 
             return (
               <div key={key} className={`flex flex-wrap items-center gap-2 rounded border px-3 py-2 text-xs ${
-                output.enabled ? "border-zinc-700 bg-zinc-800/40" : "border-zinc-800 bg-zinc-900/30 opacity-60"
+                output.enabled || output.primary ? "border-zinc-700 bg-zinc-800/40" : "border-zinc-800 bg-zinc-900/30 opacity-60"
               }`}>
-                <Monitor size={12} className={output.enabled ? "text-blue-400" : "text-zinc-600"} />
+                <Monitor size={12} className={output.enabled || output.primary ? "text-blue-400" : "text-zinc-600"} />
                 <span className="font-mono text-zinc-500">#{num}</span>
                 <span className="font-medium text-zinc-300 flex-1 truncate">{name}</span>
 
-                {/* Active toggle */}
-                <button
-                  onClick={() => toggleEnabled(key)}
-                  className={`px-2 py-1 rounded text-[10px] font-medium border transition-colors ${
-                    output.enabled
-                      ? "bg-blue-700/50 border-blue-600 text-blue-200 hover:bg-red-900/50 hover:border-red-700 hover:text-red-300"
-                      : "bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-green-900/40 hover:border-green-700 hover:text-green-300"
-                  }`}
-                >
-                  {output.enabled ? "Enabled" : "Disabled"}
-                </button>
+                {/* Primary star */}
+                {output.primary ? (
+                  <button
+                    disabled
+                    className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium border border-yellow-600/60 bg-yellow-900/30 text-yellow-300 cursor-default"
+                  >
+                    ★ Primary
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => setPrimary(key)}
+                    className="px-2 py-1 rounded text-[10px] font-medium border border-zinc-700 text-zinc-500 hover:border-yellow-600/60 hover:text-yellow-400 transition-colors"
+                  >
+                    ☆
+                  </button>
+                )}
 
-                {output.enabled && (
+                {/* Active toggle — hidden for primary (always enabled) */}
+                {!output.primary && (
+                  <button
+                    onClick={() => toggleEnabled(key)}
+                    className={`px-2 py-1 rounded text-[10px] font-medium border transition-colors ${
+                      output.enabled
+                        ? "bg-blue-700/50 border-blue-600 text-blue-200 hover:bg-red-900/50 hover:border-red-700 hover:text-red-300"
+                        : "bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-green-900/40 hover:border-green-700 hover:text-green-300"
+                    }`}
+                  >
+                    {output.enabled ? "Enabled" : "Disabled"}
+                  </button>
+                )}
+
+                {(output.enabled || output.primary) && (
                   <>
                     {/* DPI */}
                     <div className="relative">
@@ -297,53 +389,20 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
           <div className="text-xs text-zinc-500 mb-2 font-medium">Audio Devices</div>
           <div className="space-y-3">
             {renderDevices.length > 0 && (
-              <div>
-                <div className="text-[10px] text-zinc-600 mb-1 flex items-center gap-1">
-                  <Volume2 size={9} /> Output
-                </div>
-                <div className="space-y-1">
-                  {renderDevices.map((d) => {
-                    const isActive = activeRenderPat != null && d.name.toLowerCase().includes(activeRenderPat.toLowerCase());
-                    return (
-                      <button key={d.id} onClick={() => setActiveAudio(d, !isActive)}
-                        className={`w-full text-left flex items-center gap-2 rounded px-2.5 py-1.5 text-xs border transition-colors ${
-                          isActive
-                            ? "border-blue-600 bg-blue-900/30 text-blue-200"
-                            : "border-zinc-700 bg-zinc-800/40 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
-                        }`}>
-                        <Volume2 size={11} />
-                        <span className="flex-1 truncate">{d.name}</span>
-                        {isActive && <Check size={11} className="shrink-0 text-blue-400" />}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+              <AudioDeviceSection
+                devices={renderDevices}
+                isCapture={false}
+                activePat={activeRenderPat}
+                onToggle={setActiveAudio}
+              />
             )}
-
             {captureDevices.length > 0 && (
-              <div>
-                <div className="text-[10px] text-zinc-600 mb-1 flex items-center gap-1">
-                  <Mic size={9} /> Input
-                </div>
-                <div className="space-y-1">
-                  {captureDevices.map((d) => {
-                    const isActive = activeCapturePat != null && d.name.toLowerCase().includes(activeCapturePat.toLowerCase());
-                    return (
-                      <button key={d.id} onClick={() => setActiveAudio(d, !isActive)}
-                        className={`w-full text-left flex items-center gap-2 rounded px-2.5 py-1.5 text-xs border transition-colors ${
-                          isActive
-                            ? "border-blue-600 bg-blue-900/30 text-blue-200"
-                            : "border-zinc-700 bg-zinc-800/40 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200"
-                        }`}>
-                        <Mic size={11} />
-                        <span className="flex-1 truncate">{d.name}</span>
-                        {isActive && <Check size={11} className="shrink-0 text-blue-400" />}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+              <AudioDeviceSection
+                devices={captureDevices}
+                isCapture={true}
+                activePat={activeCapturePat}
+                onToggle={setActiveAudio}
+              />
             )}
           </div>
         </div>
@@ -357,7 +416,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
           {saving ? "Saving…" : "Save Profile"}
         </button>
         <button onClick={onClose}
-          className="px-3 py-1.5 border border-zinc-700 hover:border-zinc-500 rounded text-xs text-zinc-400 hover:text-zinc-200 transition-colors">
+          className="px-3 py-1.5 border border-red-900 hover:border-red-700 rounded text-xs text-red-400 hover:text-red-300 transition-colors">
           Cancel
         </button>
       </div>
@@ -417,7 +476,7 @@ function ProfileCard({ profile, snapshot, audioDevices, busy, onApply, onDelete,
             <button
               onClick={() => editRef.current?.save()}
               title="Save profile"
-              className="p-1.5 rounded border border-green-700 text-green-400 bg-green-900/30 hover:bg-green-900/50 transition-colors"
+              className="p-1.5 rounded border border-zinc-600 text-zinc-400 bg-zinc-800 hover:bg-zinc-700 hover:text-zinc-200 transition-colors"
             >
               <Save size={13} />
             </button>
@@ -426,7 +485,7 @@ function ProfileCard({ profile, snapshot, audioDevices, busy, onApply, onDelete,
             title="Edit profile"
             className={`p-1.5 rounded border transition-colors ${
               editing
-                ? "border-blue-600 text-blue-400 bg-blue-900/30"
+                ? "border-red-800 text-red-400 bg-red-900/20 hover:bg-red-900/40"
                 : "border-zinc-700 text-zinc-500 hover:text-zinc-200 hover:border-zinc-500"
             }`}>
             {editing ? <X size={13} /> : <Edit2 size={13} />}
@@ -470,8 +529,9 @@ export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
   const [newName, setNewName] = useState("");
   const [saveBusy, setSaveBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ProfileDto | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
-  // Keep profiles fresh in the background (snapshot already polled every 3s in App.tsx)
   useEffect(() => {}, [snapshot]);
 
   async function handleSave() {
@@ -503,22 +563,25 @@ export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
     }
   }
 
-  async function handleDelete(profile: ProfileDto) {
-    if (!confirm(`Delete profile "${profile.name}"?`)) return;
-    setActionBusy(profile.name);
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    setDeleteBusy(true);
+    setActionBusy(pendingDelete.name);
     try {
-      await api.deleteProfile(profile.name);
+      await api.deleteProfile(pendingDelete.name);
       await onRefresh();
-      toast.success(`Deleted "${profile.name}"`);
+      toast.success(`Deleted "${pendingDelete.name}"`);
+      setPendingDelete(null);
     } catch (err) {
       toast.error(`Delete failed: ${err}`);
     } finally {
+      setDeleteBusy(false);
       setActionBusy(null);
     }
   }
 
   return (
-    <div className="space-y-5">
+    <div className="relative space-y-5">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-medium text-zinc-400">Saved Profiles</h2>
         <button onClick={onRefresh}
@@ -557,13 +620,46 @@ export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
             audioDevices={audioDevices}
             busy={actionBusy === profile.name}
             onApply={() => handleApply(profile)}
-            onDelete={() => handleDelete(profile)}
+            onDelete={() => setPendingDelete(profile)}
             onRefresh={onRefresh}
           />
         ))}
       </div>
 
       <div className="h-[50px]" />
+
+      {/* Delete confirmation overlay */}
+      {pendingDelete && (
+        <div className="absolute inset-0 z-50 pointer-events-none">
+          <div className="absolute inset-0 bg-gradient-to-b from-zinc-950/80 via-zinc-950/40 to-transparent backdrop-blur-[2px] [mask-image:linear-gradient(to_bottom,black_0%,black_40%,transparent_100%)]" />
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 w-4/5 pointer-events-auto">
+            <div className="rounded-lg border border-red-700/50 bg-red-950/40 px-5 py-3.5 flex items-center justify-between gap-5 shadow-xl backdrop-blur-sm">
+              <div className="flex items-center gap-3.5 min-w-0">
+                <Trash2 size={24} className="text-red-400 shrink-0" />
+                <div className="font-semibold text-base text-red-200 truncate">
+                  Delete profile <span className="text-red-400">{pendingDelete.name}</span>?
+                </div>
+              </div>
+              <div className="flex gap-2.5 shrink-0">
+                <button
+                  onClick={confirmDelete}
+                  disabled={deleteBusy}
+                  className="px-4 py-1.5 rounded text-sm font-semibold bg-red-700 hover:bg-red-600 text-white transition-colors disabled:opacity-50"
+                >
+                  {deleteBusy ? "…" : "Delete"}
+                </button>
+                <button
+                  onClick={() => setPendingDelete(null)}
+                  disabled={deleteBusy}
+                  className="px-4 py-1.5 rounded text-sm font-semibold bg-zinc-700 hover:bg-zinc-600 text-white transition-colors disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
