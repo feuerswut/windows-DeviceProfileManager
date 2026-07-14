@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { Toaster, toast } from "sonner";
 import { Monitor, Volume2, Layers } from "lucide-react";
 import { api } from "./api";
@@ -17,15 +17,40 @@ function ConfirmBanner({
   onRevert: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
+  // Local countdown — initialized from backend, ticks every 100ms, re-syncs on each backend poll
+  const [display, setDisplay] = useState<number | null>(remainingSecs);
+  const localRef = useRef<number | null>(remainingSecs);
+
+  // Re-sync whenever the backend gives us a fresh value (every ~3s)
+  useEffect(() => {
+    if (remainingSecs != null) {
+      localRef.current = remainingSecs;
+      setDisplay(remainingSecs);
+    }
+  }, [remainingSecs]);
+
+  // Tick every 100ms for a smooth countdown
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (localRef.current == null) return;
+      localRef.current = Math.max(0, localRef.current - 0.1);
+      setDisplay(localRef.current);
+    }, 100);
+    return () => clearInterval(id);
+  }, []);
+
   async function act(fn: () => Promise<void>) {
     setBusy(true);
     try { await fn(); } finally { setBusy(false); }
   }
+
+  const secs = display != null ? Math.ceil(display) : null;
+
   return (
     <div className="flex items-center justify-between gap-4 bg-yellow-950/95 border-b border-yellow-600/70 px-4 py-2.5 text-sm shadow-lg backdrop-blur z-50">
       <span className="text-yellow-300 font-medium">
         Confirm layout change
-        {remainingSecs != null ? ` — reverts in ${Math.ceil(remainingSecs)}s` : ""}
+        {secs != null ? ` — reverts in ${secs}s` : ""}
       </span>
       <div className="flex gap-2 shrink-0">
         <button

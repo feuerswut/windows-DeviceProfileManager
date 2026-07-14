@@ -3,7 +3,7 @@ import { toast } from "sonner";
 import { Play, Save, Trash2, RefreshCw, Monitor, Mic, Volume2, ChevronDown, Edit2, X, Check } from "lucide-react";
 import { api } from "../api";
 import type { AudioDevice, AudioSetting, DisplayMode, Layout, OutputConfig, ProfileDto, SnapshotDto } from "../types";
-import { LayoutCanvas, DPI_OPTIONS, displayKey } from "./DisplaysTab";
+import { LayoutCanvas, DPI_OPTIONS, displayKey, normalizeLayout } from "./DisplaysTab";
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -157,7 +157,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
   async function save() {
     setSaving(true);
     try {
-      await api.updateProfile(profile.name, layout, dpiScales, audio);
+      await api.updateProfile(profile.name, normalizeLayout(layout), dpiScales, audio);
       toast.success(`Profile "${profile.name}" updated`);
       onSaved();
     } catch (err) {

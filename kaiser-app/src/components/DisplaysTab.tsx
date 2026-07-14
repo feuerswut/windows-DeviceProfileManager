@@ -27,10 +27,10 @@ export const DPI_OPTIONS = [
   { label: "300%", value: 300 },
 ];
 
-const SNAP_PX = 50;
-const CANVAS_SIZE = 6000; // large enough to never clip monitors during drag
+const SNAP_THRESHOLD = 60; // virtual pixels — how close before an edge snaps
+const CANVAS_SIZE = 6000;
 
-// ---- Layout Canvas (Google Maps style) ------------------------------------
+// ---- Helpers ----------------------------------------------------------------
 
 function getBounds(outputs: OutputConfig[]) {
   if (outputs.length === 0) return { left: 0, top: 0, right: 1920, bottom: 1080, width: 1920, height: 1080 };
@@ -41,6 +41,76 @@ function getBounds(outputs: OutputConfig[]) {
   return { left, top, right, bottom, width: right - left, height: bottom - top };
 }
 
+/**
+ * Snap `(rawX, rawY)` of the dragged monitor (with size w×h) to the nearest
+ * edge of any other enabled monitor. Axes are independent — we pick the
+ * closest snap candidate per axis.
+ */
+function edgeSnap(
+  rawX: number, rawY: number, w: number, h: number,
+  others: OutputConfig[]
+): { x: number; y: number } {
+  let bestX = rawX, bestY = rawY;
+  let dxBest = SNAP_THRESHOLD + 1, dyBest = SNAP_THRESHOLD + 1;
+
+  for (const o of others) {
+    if (!o.enabled) continue;
+    const ol = o.position.x, ot = o.position.y;
+    const or_ = ol + o.resolution.width, ob = ot + o.resolution.height;
+
+    // --- X candidates ---
+    // our left → their right (place us to the right of them)
+    const dx1 = Math.abs(rawX - or_);
+    if (dx1 < dxBest) { dxBest = dx1; bestX = or_; }
+    // our right → their left (place us to the left of them)
+    const dx2 = Math.abs(rawX + w - ol);
+    if (dx2 < dxBest) { dxBest = dx2; bestX = ol - w; }
+    // align left edges
+    const dx3 = Math.abs(rawX - ol);
+    if (dx3 < dxBest) { dxBest = dx3; bestX = ol; }
+    // align right edges
+    const dx4 = Math.abs(rawX + w - or_);
+    if (dx4 < dxBest) { dxBest = dx4; bestX = or_ - w; }
+
+    // --- Y candidates ---
+    // our top → their bottom (place us below them)
+    const dy1 = Math.abs(rawY - ob);
+    if (dy1 < dyBest) { dyBest = dy1; bestY = ob; }
+    // our bottom → their top (place us above them)
+    const dy2 = Math.abs(rawY + h - ot);
+    if (dy2 < dyBest) { dyBest = dy2; bestY = ot - h; }
+    // align top edges
+    const dy3 = Math.abs(rawY - ot);
+    if (dy3 < dyBest) { dyBest = dy3; bestY = ot; }
+    // align bottom edges
+    const dy4 = Math.abs(rawY + h - ob);
+    if (dy4 < dyBest) { dyBest = dy4; bestY = ob - h; }
+  }
+
+  return { x: Math.round(bestX), y: Math.round(bestY) };
+}
+
+/**
+ * Normalize layout so the primary monitor sits at (0,0).
+ * This is what Windows requires. Other monitors stay relative to primary.
+ * If no primary, normalize to the bounding box origin instead.
+ */
+export function normalizeLayout(layout: Layout): Layout {
+  const primary = layout.outputs.find((o) => o.primary && o.enabled);
+  const ref = primary ?? layout.outputs.filter((o) => o.enabled)[0];
+  if (!ref) return layout;
+  const dx = ref.position.x;
+  const dy = ref.position.y;
+  if (dx === 0 && dy === 0) return layout;
+  return {
+    ...layout,
+    outputs: layout.outputs.map((o) => ({
+      ...o,
+      position: { x: o.position.x - dx, y: o.position.y - dy },
+    })),
+  };
+}
+
 interface CanvasProps {
   draft: Layout;
   displays: DisplayInfo[];
@@ -48,7 +118,7 @@ interface CanvasProps {
   height?: number;
 }
 
-export function LayoutCanvas({ draft, displays, onDraftChange, height = 320 }: CanvasProps) {
+export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: CanvasProps) {
   const outerRef = useRef<HTMLDivElement>(null);
   const [outerSize, setOuterSize] = useState({ w: 700, h: height });
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -151,14 +221,21 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 320 }: C
     } else {
       const dvx = (e.clientX - d.sx) / d.scale;
       const dvy = (e.clientY - d.sy) / d.scale;
-      const newX = Math.round((d.ovx + dvx) / SNAP_PX) * SNAP_PX;
-      const newY = Math.round((d.ovy + dvy) / SNAP_PX) * SNAP_PX;
+      const rawX = d.ovx + dvx;
+      const rawY = d.ovy + dvy;
+
+      const dragged = d.frozenLayout.outputs.find((o) => displayKey(o.display_id) === d.key);
+      const w = dragged?.resolution.width ?? 1920;
+      const h = dragged?.resolution.height ?? 1080;
+      const others = d.frozenLayout.outputs.filter(
+        (o) => displayKey(o.display_id) !== d.key
+      );
+
+      const { x, y } = edgeSnap(rawX, rawY, w, h, others);
       onDraftChange({
         ...d.frozenLayout,
         outputs: d.frozenLayout.outputs.map((o) =>
-          displayKey(o.display_id) === d.key
-            ? { ...o, position: { x: Math.max(0, newX), y: Math.max(0, newY) } }
-            : o
+          displayKey(o.display_id) === d.key ? { ...o, position: { x, y } } : o
         ),
       });
     }
@@ -444,7 +521,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
     if (!draftLayout) return;
     setApplyingLayout(true);
     try {
-      await api.applyLayout(draftLayout);
+      await api.applyLayout(normalizeLayout(draftLayout));
       setDraftLayout(null);
       await onRefresh();
       toast.success("Layout applied");
