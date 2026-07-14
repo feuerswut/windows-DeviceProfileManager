@@ -31,12 +31,17 @@ function MonitorCard({
   output,
   index,
   dpi,
+  name,
 }: {
   output: OutputConfig;
   index: number;
   dpi: number | undefined;
+  name: string | undefined;
 }) {
   const hz = Math.round(output.refresh_rate_mhz / 1000);
+  const displayName = name
+    ? name.replace(` ${output.display_id.target_id}`, '').trim() || 'Display'
+    : undefined;
   return (
     <div
       className={`flex items-center gap-2 rounded border px-2 py-1 text-xs ${
@@ -47,6 +52,8 @@ function MonitorCard({
     >
       <Monitor size={11} className={output.enabled ? "text-blue-400" : "text-zinc-600"} />
       <span className="font-mono text-[10px] text-zinc-500">#{index}</span>
+      {displayName && <span className="text-zinc-400">{displayName}</span>}
+      <span className="font-mono text-[10px] text-zinc-500">{output.display_id.target_id}</span>
       {output.enabled ? (
         <>
           <span>{output.resolution.width}×{output.resolution.height}</span>
@@ -456,7 +463,8 @@ function ProfileCard({ profile, snapshot, audioDevices, busy, onApply, onDelete,
               const num = displayIndex(output, snapshot) ?? idx + 1;
               const key = displayKey(output.display_id);
               const dpi = profile.dpi_scales?.[key];
-              return <MonitorCard key={key} output={output} index={num} dpi={dpi} />;
+              const name = profile.display_names?.[key];
+              return <MonitorCard key={key} output={output} index={num} dpi={dpi} name={name} />;
             })}
           </div>
 

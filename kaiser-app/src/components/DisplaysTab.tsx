@@ -620,7 +620,8 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                   <div>
                     <div className="font-medium text-sm flex items-center gap-2">
                       <span className="text-xs text-zinc-500 font-mono">#{dispNum}</span>
-                      {display.friendly_name}
+                      {display.friendly_name.replace(` ${display.id.target_id}`, '').trim() || 'Display'}
+                      <span className="text-xs text-zinc-500 font-mono">{display.id.target_id}</span>
                     </div>
                     <div className="text-xs text-zinc-500 mt-0.5">
                       {display.resolution.width}×{display.resolution.height} @ {Math.round(display.refresh_rate_mhz / 1000)} Hz
