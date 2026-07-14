@@ -160,6 +160,19 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
     // Auto-rollback if the confirmation window expired (acts as the daemon heartbeat).
     if let Ok(true) = manager.rollback_if_confirmation_expired() {
         log::info!("get_snapshot: confirmation expired — auto-rolled back");
+        drop(manager);
+        if let Some(dpi_snapshot) = state.pending_dpi_rollback.lock().unwrap().take() {
+            for (key, percent) in &dpi_snapshot {
+                if let Some((ls, ts)) = key.split_once(':') {
+                    if let (Ok(luid), Ok(tid)) = (ls.parse::<u64>(), ts.parse::<u32>()) {
+                        if let Err(e) = set_display_dpi(luid, tid, *percent) {
+                            log::warn!("get_snapshot: restore DPI {key}={percent}% failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        manager = state.manager.lock().unwrap();
     }
     let store = state.new_store();
     let displays = manager.list_displays().map_err(|e| e.to_string())?;
@@ -290,12 +303,26 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
     let store = state.new_store();
     let kaiser_profile = store.load_kaiser_profile(&name);
 
+    // Maps stored "luid:tid" DPI keys to the live (luid, tid) after ID remapping.
+    let mut dpi_key_remap: HashMap<String, (u64, u32)> = HashMap::new();
+
     {
         let mut manager = state.manager.lock().unwrap();
         if let Some(ref kp) = kaiser_profile {
-            // Kaiser config layout is authoritative (may have been user-edited)
-            let layout = fix_layout_display_ids(kp.layout.clone(), &manager);
-            manager.apply_layout(layout).map_err(|e| e.to_string())?;
+            let original = kp.layout.clone();
+            let remapped = fix_layout_display_ids(kp.layout.clone(), &manager);
+            // Capture old→new luid:tid pairs so DPI can follow the same remap.
+            for (old_out, new_out) in original.outputs.iter().zip(remapped.outputs.iter()) {
+                let old_key = format!(
+                    "{}:{}",
+                    old_out.display_id.adapter_luid, old_out.display_id.target_id
+                );
+                dpi_key_remap.insert(
+                    old_key,
+                    (new_out.display_id.adapter_luid, new_out.display_id.target_id),
+                );
+            }
+            manager.apply_layout(remapped).map_err(|e| e.to_string())?;
         } else {
             manager.apply_profile(&name).map_err(|e| e.to_string())?;
         }
@@ -306,17 +333,33 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
             let audio = state.audio.lock().unwrap();
             apply_audio_settings(&audio, &kaiser_profile.audio);
         }
+
+        // Snapshot current DPI for all outputs we are about to change so revert can undo it.
+        let pre_apply_dpi: HashMap<String, u32> = dpi_key_remap
+            .values()
+            .filter_map(|&(luid, tid)| {
+                get_display_dpi(luid, tid)
+                    .ok()
+                    .map(|pct| (format!("{luid}:{tid}"), pct))
+            })
+            .collect();
+        *state.pending_dpi_rollback.lock().unwrap() = Some(pre_apply_dpi);
+
         for (key, percent) in &kaiser_profile.dpi_scales {
-            if let Some((luid_str, tid_str)) = key.split_once(':') {
-                if let (Ok(luid), Ok(tid)) =
-                    (luid_str.parse::<u64>(), tid_str.parse::<u32>())
-                {
-                    if let Err(e) = set_display_dpi(luid, tid, *percent) {
-                        log::warn!("apply_profile: set_display_dpi {key}={percent}% failed: {e}");
-                    } else {
-                        log::info!("apply_profile: {key} DPI → {percent}%");
-                    }
+            let (luid, tid) = if let Some(&(l, t)) = dpi_key_remap.get(key) {
+                (l, t)
+            } else if let Some((ls, ts)) = key.split_once(':') {
+                match (ls.parse::<u64>(), ts.parse::<u32>()) {
+                    (Ok(l), Ok(t)) => (l, t),
+                    _ => continue,
                 }
+            } else {
+                continue;
+            };
+            if let Err(e) = set_display_dpi(luid, tid, *percent) {
+                log::warn!("apply_profile: set_display_dpi {key}={percent}% failed: {e}");
+            } else {
+                log::info!("apply_profile: {key} DPI → {percent}%");
             }
         }
     }
@@ -514,6 +557,7 @@ pub fn set_display_dpi_cmd(adapter_luid: u64, target_id: u32, percent: u32) -> R
 #[tauri::command]
 pub fn confirm_layout(state: State<AppState>) -> Result<(), String> {
     log::info!("confirm_layout");
+    *state.pending_dpi_rollback.lock().unwrap() = None;
     let mut manager = state.manager.lock().unwrap();
     manager.confirm_current_layout().map_err(|e| e.to_string())
 }
@@ -522,7 +566,23 @@ pub fn confirm_layout(state: State<AppState>) -> Result<(), String> {
 pub fn revert_layout(state: State<AppState>) -> Result<(), String> {
     log::info!("revert_layout");
     let mut manager = state.manager.lock().unwrap();
-    manager.rollback_pending().map_err(|e| e.to_string())
+    manager.rollback_pending().map_err(|e| e.to_string())?;
+    drop(manager);
+    // Restore DPI to the state captured just before the profile was applied.
+    if let Some(dpi_snapshot) = state.pending_dpi_rollback.lock().unwrap().take() {
+        for (key, percent) in &dpi_snapshot {
+            if let Some((ls, ts)) = key.split_once(':') {
+                if let (Ok(luid), Ok(tid)) = (ls.parse::<u64>(), ts.parse::<u32>()) {
+                    if let Err(e) = set_display_dpi(luid, tid, *percent) {
+                        log::warn!("revert_layout: restore DPI {key}={percent}% failed: {e}");
+                    } else {
+                        log::info!("revert_layout: {key} DPI restored → {percent}%");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---- Frontend logging ---------------------------------------------------
