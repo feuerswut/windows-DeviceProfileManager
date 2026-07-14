@@ -78,4 +78,6 @@ npm run tauri dev
 
 ## License
 
-MIT
+The submodules mentioned above are all licensed under MIT and you can access their source by clicking on their appropriate folder link in GitHub, or by recursively cloning the repository.
+
+The project itself is licensed under the GNU AFFERO GENERAL PUBLIC LICENSE, which means if you provide this software, you must link this repository, even if you only supply it in binary/installed form on a server, and users access the server; changes must be contributed back or made public in that case as well, if your change is inside of a public program. For the whole legal details, refer to the LICENSE file.
