@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kaiser_core::{AudioManager, KaiserBackend, KaiserConfigStore, SharedKaiserBackend};
@@ -8,6 +9,9 @@ pub struct AppState {
     pub backend: Arc<KaiserBackend>,
     pub audio: Mutex<AudioManager>,
     pub store_path: std::path::PathBuf,
+    /// DPI state captured just before a profile apply, keyed by "luid:tid".
+    /// Restored on revert so DPI rolls back together with the layout.
+    pub pending_dpi_rollback: Mutex<Option<HashMap<String, u32>>>,
 }
 
 impl AppState {
@@ -24,6 +28,7 @@ impl AppState {
             backend,
             audio: Mutex::new(AudioManager::new()),
             store_path,
+            pending_dpi_rollback: Mutex::new(None),
         }
     }
 
