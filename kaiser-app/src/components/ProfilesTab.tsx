@@ -257,7 +257,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
           draft={layout}
           displays={snapshot.displays}
           onDraftChange={setLayout}
-          height={200}
+          height={320}
         />
       </div>
 

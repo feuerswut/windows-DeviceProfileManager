@@ -122,6 +122,7 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
   const outerRef = useRef<HTMLDivElement>(null);
   const [outerSize, setOuterSize] = useState({ w: 700, h: height });
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [snapAnimating, setSnapAnimating] = useState(false);
   const dragRef = useRef<
     | { type: "canvas"; sx: number; sy: number; ox: number; oy: number }
     | { type: "monitor"; key: string; sx: number; sy: number; ovx: number; ovy: number; frozenLayout: Layout; scale: number }
@@ -145,10 +146,10 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
   const activeOutputs = allOutputs.filter((o) => o.enabled);
   const bounds = getBounds(activeOutputs.length > 0 ? activeOutputs : allOutputs);
 
-  // Scale: fit bounding box with 20% margin (10% each side)
+  // Scale: fit bounding box with 30% margin (15% each side)
   const scale = Math.min(
-    (outerSize.w * 0.8) / Math.max(bounds.width, 1),
-    (outerSize.h * 0.8) / Math.max(bounds.height, 1),
+    (outerSize.w * 0.7) / Math.max(bounds.width, 1),
+    (outerSize.h * 0.7) / Math.max(bounds.height, 1),
     1.0 // don't zoom in beyond 1px:1px
   );
 
@@ -171,7 +172,12 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
     }
   }, [draft, computeCenter]);
 
-  // Re-center if bounding box is 80%+ offscreen
+  // Re-center when the container is first measured (ResizeObserver fires after initial render
+  // with the real size, but the layoutSig effect already ran with the default 700px width)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setOffset(computeCenter()); }, [outerSize.w, outerSize.h]);
+
+  // Snap back if bounding box is 70%+ offscreen — animates 50% toward center
   function checkRecenter(newOffset: { x: number; y: number }) {
     const bbl = newOffset.x + bounds.left * scale;
     const bbt = newOffset.y + bounds.top * scale;
@@ -181,14 +187,20 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
     const visH = Math.max(0, Math.min(bbb, outerSize.h) - Math.max(bbt, 0));
     const visArea = visW * visH;
     const totalArea = bounds.width * scale * bounds.height * scale;
-    if (totalArea > 0 && visArea / totalArea < 0.2) {
-      setOffset(computeCenter());
+    if (totalArea > 0 && visArea / totalArea < 0.75) {
+      const center = computeCenter();
+      setSnapAnimating(true);
+      setOffset({
+        x: newOffset.x + (center.x - newOffset.x) * 0.5,
+        y: newOffset.y + (center.y - newOffset.y) * 0.5,
+      });
     }
   }
 
   // Canvas pan (background)
   function onCanvasPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     if (e.button !== 0) return;
+    setSnapAnimating(false);
     dragRef.current = { type: "canvas", sx: e.clientX, sy: e.clientY, ox: offset.x, oy: offset.y };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
@@ -269,8 +281,10 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
           width: `${CANVAS_SIZE}px`,
           height: `${CANVAS_SIZE}px`,
           transform: `translate(${offset.x}px, ${offset.y}px)`,
+          transition: snapAnimating ? "transform 320ms cubic-bezier(0.22, 0.61, 0.36, 1)" : undefined,
           touchAction: "none",
         }}
+        onTransitionEnd={() => setSnapAnimating(false)}
       >
         {allOutputs.map((output) => {
           const key = displayKey(output.display_id);
