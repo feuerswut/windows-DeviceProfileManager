@@ -7,9 +7,10 @@ use std::mem::size_of;
 use monarch::{DisplayInfo, Layout, ManagerError, OutputConfig, Position, Resolution};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
-    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
-    DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
     DISPLAYCONFIG_ROTATION, DISPLAYCONFIG_ROTATION_ROTATE90, DISPLAYCONFIG_ROTATION_ROTATE270,
     QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS,
 };
@@ -29,6 +30,7 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
 
     let mut displays = Vec::<DisplayInfo>::new();
     let mut outputs = Vec::new();
+    let mut gdi_names = HashMap::new();
     let mode_map = modes_by_key(&modes);
 
     for path in &paths {
@@ -45,6 +47,10 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
                 (format!("Display {}:{}", adapter_luid, path.targetInfo.id), None)
             });
         let display_id = make_display_id(adapter_luid, path.targetInfo.id, stable_edid_hash);
+
+        if let Ok(gdi_name) = source_gdi_device_name(path) {
+            gdi_names.insert((adapter_luid, path.targetInfo.id), gdi_name);
+        }
 
         let source_key = (
             path.sourceInfo.adapterId.HighPart,
@@ -102,7 +108,7 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
         }
     }
 
-    Ok(TopologySnapshot { raw, layout: Layout { outputs }, displays })
+    Ok(TopologySnapshot { raw, layout: Layout { outputs }, displays, gdi_names })
 }
 
 fn effective_resolution_for_rotation(
@@ -289,5 +295,24 @@ fn target_mode_refresh_mhz(mode: &DISPLAYCONFIG_MODE_INFO) -> Result<u32, Manage
         let numerator = target.targetVideoSignalInfo.vSyncFreq.Numerator;
         let denominator = target.targetVideoSignalInfo.vSyncFreq.Denominator.max(1);
         Ok(((numerator as u64 * 1000) / denominator as u64) as u32)
+    }
+}
+
+fn source_gdi_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, ManagerError> {
+    unsafe {
+        let mut info = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        info.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+            adapterId: path.sourceInfo.adapterId,
+            id: path.sourceInfo.id,
+        };
+        let status = DisplayConfigGetDeviceInfo(&mut info.header);
+        if status != 0 {
+            return Err(ManagerError::Backend(format!(
+                "DisplayConfigGetDeviceInfo(GET_SOURCE_NAME) failed: {status}"
+            )));
+        }
+        Ok(wide_array_to_string(&info.viewGdiDeviceName))
     }
 }

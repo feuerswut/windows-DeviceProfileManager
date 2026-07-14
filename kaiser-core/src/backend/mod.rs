@@ -8,7 +8,7 @@ mod topology;
 mod win32_types;
 
 #[cfg(target_os = "windows")]
-pub use topology::KaiserBackend;
+pub use topology::{KaiserBackend, SharedKaiserBackend};
 
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, Default)]
