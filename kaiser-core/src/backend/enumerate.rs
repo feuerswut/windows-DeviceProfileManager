@@ -12,7 +12,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
     DISPLAYCONFIG_ROTATION, DISPLAYCONFIG_ROTATION_ROTATE90, DISPLAYCONFIG_ROTATION_ROTATE270,
-    QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS,
+    QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS,
 };
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 
@@ -20,6 +20,11 @@ use super::win32_types::{luid_to_u64, make_display_id, RawTopologySnapshot, Topo
 
 const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
 const QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ONLY_ACTIVE_PATHS;
+
+pub(super) fn query_inactive_paths() -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, ManagerError> {
+    let (paths, _) = query_raw(QDC_ALL_PATHS)?;
+    Ok(paths)
+}
 
 pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
     let (paths, modes) = query_raw(QUERY_FLAGS)?;

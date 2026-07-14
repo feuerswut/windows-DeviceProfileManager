@@ -211,11 +211,27 @@ impl DisplayBackend for KaiserBackend {
         let next_snapshot = match super::apply::apply_layout_against_snapshot(&layout, &snapshot) {
             Ok(s) => s,
             Err(ref e) if is_set_display_invalid_parameter(e) => {
-                log::warn!("KaiserBackend: SetDisplayConfig error 87; falling back to topology extend");
-                force_topology_extend()?;
-                std::thread::sleep(std::time::Duration::from_millis(700));
-                let recovered = query_active_topology()?;
-                super::apply::apply_layout_against_snapshot(&layout, &recovered)?
+                log::error!(
+                    "KaiserBackend: SetDisplayConfig error 87; \
+                     trying inactive-path attach fallback (PS-style)"
+                );
+                let active = query_active_topology()?;
+                match super::apply::try_attach_inactive_for_layout(&layout, &active) {
+                    Ok(s) => {
+                        log::info!("KaiserBackend: inactive-path attach succeeded");
+                        s
+                    }
+                    Err(attach_err) => {
+                        log::error!(
+                            "KaiserBackend: attach fallback failed ({attach_err}); \
+                             trying topology extend as last resort"
+                        );
+                        force_topology_extend()?;
+                        std::thread::sleep(std::time::Duration::from_millis(700));
+                        let recovered = query_active_topology()?;
+                        super::apply::apply_layout_against_snapshot(&layout, &recovered)?
+                    }
+                }
             }
             Err(e) => return Err(e),
         };
