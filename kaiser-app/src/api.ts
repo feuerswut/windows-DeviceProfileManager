@@ -74,4 +74,16 @@ export const api = {
   setDisplayModeForId(displayId: DisplayId, mode: DisplayMode): Promise<void> {
     return invoke("set_display_mode_for_id", { displayId, mode });
   },
+
+  confirmLayout(): Promise<void> {
+    return invoke("confirm_layout");
+  },
+
+  revertLayout(): Promise<void> {
+    return invoke("revert_layout");
+  },
+
+  makePrimary(displayId: DisplayId): Promise<void> {
+    return invoke("make_primary", { displayId });
+  },
 };

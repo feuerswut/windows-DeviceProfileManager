@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use monarch::{Layout, ManagerError};
 use windows::core::{w, PCWSTR};
@@ -108,6 +108,8 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
     let display_switch_status = Command::new("DisplaySwitch.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .arg("/extend")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(|err| {
             ManagerError::Backend(format!(
@@ -211,6 +213,8 @@ fn best_effort_reload_color_calibration() {
     let _ = Command::new("schtasks.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .args(["/Run", "/TN", r"\Microsoft\Windows\WindowsColorSystem\Calibration Loader"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 
