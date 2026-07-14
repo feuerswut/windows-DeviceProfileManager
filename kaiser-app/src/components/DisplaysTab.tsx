@@ -583,7 +583,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
         )}
       </div>
 
-      <div className="h-[50px]" />
+      <div className="h-[200px]" />
     </div>
   );
 }

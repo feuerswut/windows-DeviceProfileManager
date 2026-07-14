@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { toast } from "sonner";
-import { RefreshCw, Volume2, VolumeX, Mic } from "lucide-react";
+import { RefreshCw, Volume2, VolumeX, Mic, ChevronDown } from "lucide-react";
 import { api } from "../api";
 import type { AudioDevice } from "../types";
 
@@ -92,12 +92,10 @@ export function AudioTab({ devices, onRefresh }: Props) {
 function VolumeSlider({
   deviceId,
   initialVolume,
-  enabled,
   onVolumeChange,
 }: {
   deviceId: string;
   initialVolume: number;
-  enabled: boolean;
   onVolumeChange: (id: string, vol: number) => Promise<void>;
 }) {
   const [value, setValue] = useState(Math.round(initialVolume * 100));
@@ -110,13 +108,93 @@ function VolumeSlider({
         min={0}
         max={100}
         value={value}
-        disabled={!enabled}
         onChange={(e) => setValue(Number(e.target.value))}
         onMouseUp={(e) =>
           onVolumeChange(deviceId, Number((e.target as HTMLInputElement).value))
         }
         className="flex-1 accent-blue-500"
       />
+    </div>
+  );
+}
+
+function DeviceCard({
+  device,
+  pending,
+  isCapture,
+  dimmed,
+  onVolumeChange,
+  onMuteToggle,
+  onSetDefault,
+}: {
+  device: AudioDevice;
+  pending: Set<string>;
+  isCapture: boolean;
+  dimmed: boolean;
+  onVolumeChange: (id: string, vol: number) => Promise<void>;
+  onMuteToggle: (d: AudioDevice) => Promise<void>;
+  onSetDefault: (d: AudioDevice) => Promise<void>;
+}) {
+  const DeviceIcon = isCapture ? Mic : Volume2;
+
+  return (
+    <div
+      className={`rounded-lg border p-3 transition-opacity ${
+        device.is_default_console
+          ? "border-blue-700 bg-blue-950/30"
+          : "border-zinc-700 bg-zinc-900"
+      } ${dimmed ? "opacity-40" : ""}`}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <DeviceIcon size={14} className="text-zinc-400 shrink-0" />
+          <span className="text-sm font-medium truncate max-w-[200px]">
+            {device.name}
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {device.enabled && (
+            <button
+              onClick={() => onMuteToggle(device)}
+              disabled={pending.has(device.id)}
+              title={device.muted ? "Unmute" : "Mute"}
+              className={`p-1.5 rounded transition-colors ${
+                device.muted
+                  ? "text-red-400 bg-red-900/30"
+                  : "text-zinc-400 hover:text-zinc-200"
+              } disabled:opacity-40`}
+            >
+              {device.muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+            </button>
+          )}
+
+          {device.is_default_console ? (
+            <button
+              disabled
+              className="px-2.5 py-1 rounded text-xs font-semibold bg-blue-700/60 text-blue-200 border border-blue-600 cursor-default"
+            >
+              Active
+            </button>
+          ) : (
+            <button
+              onClick={() => onSetDefault(device)}
+              disabled={pending.has(device.id)}
+              title="Set as default device"
+              className="px-2.5 py-1 rounded text-xs font-semibold text-zinc-100 bg-zinc-700 hover:bg-blue-700 border border-zinc-600 hover:border-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {pending.has(device.id) ? "…" : "Switch"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {device.enabled && (
+        <VolumeSlider
+          deviceId={device.id}
+          initialVolume={device.volume}
+          onVolumeChange={onVolumeChange}
+        />
+      )}
     </div>
   );
 }
@@ -138,7 +216,10 @@ function DeviceGroup({
   onMuteToggle: (d: AudioDevice) => Promise<void>;
   onSetDefault: (d: AudioDevice) => Promise<void>;
 }) {
-  const DeviceIcon = isCapture ? Mic : Volume2;
+  const [showHidden, setShowHidden] = useState(false);
+
+  const active = devices.filter((d) => d.enabled);
+  const hidden = devices.filter((d) => !d.enabled);
 
   return (
     <div>
@@ -146,72 +227,54 @@ function DeviceGroup({
         {title}
       </h3>
       <div className="space-y-2">
-        {devices.length === 0 && (
+        {active.length === 0 && hidden.length === 0 && (
           <div className="text-sm text-zinc-600 py-4">No devices found</div>
         )}
-        {devices.map((device) => (
-          <div
+
+        {active.map((device) => (
+          <DeviceCard
             key={device.id}
-            className={`rounded-lg border p-3 ${
-              device.is_default_console
-                ? "border-blue-700 bg-blue-950/30"
-                : "border-zinc-700 bg-zinc-900"
-            } ${!device.enabled ? "opacity-50" : ""}`}
-          >
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-2 min-w-0">
-                <DeviceIcon size={14} className="text-zinc-400 shrink-0" />
-                <span className="text-sm font-medium truncate max-w-[200px]">
-                  {device.name}
-                </span>
-              </div>
-              <div className="flex items-center gap-1.5 shrink-0">
-                {/* Mute toggle */}
-                <button
-                  onClick={() => onMuteToggle(device)}
-                  disabled={pending.has(device.id) || !device.enabled}
-                  title={device.muted ? "Unmute" : "Mute"}
-                  className={`p-1.5 rounded transition-colors ${
-                    device.muted
-                      ? "text-red-400 bg-red-900/30"
-                      : "text-zinc-400 hover:text-zinc-200"
-                  } disabled:opacity-40`}
-                >
-                  {device.muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-                </button>
+            device={device}
+            pending={pending}
+            isCapture={isCapture}
+            dimmed={false}
+            onVolumeChange={onVolumeChange}
+            onMuteToggle={onMuteToggle}
+            onSetDefault={onSetDefault}
+          />
+        ))}
 
-                {/* Default toggle */}
-                {device.is_default_console ? (
-                  <button
-                    disabled
-                    className="px-2.5 py-1 rounded text-xs font-semibold bg-blue-700/60 text-blue-200 border border-blue-600 cursor-default"
-                    title="Current default device"
-                  >
-                    Active
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => onSetDefault(device)}
-                    disabled={pending.has(device.id)}
-                    title="Set as default device"
-                    className="px-2.5 py-1 rounded text-xs font-semibold text-zinc-100 bg-zinc-700 hover:bg-blue-700 border border-zinc-600 hover:border-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {pending.has(device.id) ? "…" : "Switch"}
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {device.enabled && (
-              <VolumeSlider
-                deviceId={device.id}
-                initialVolume={device.volume}
-                enabled={device.enabled}
-                onVolumeChange={onVolumeChange}
+        {hidden.length > 0 && (
+          <div>
+            <button
+              onClick={() => setShowHidden((s) => !s)}
+              className="flex items-center gap-1.5 text-xs text-zinc-600 hover:text-zinc-400 transition-colors py-1"
+            >
+              <ChevronDown
+                size={12}
+                className={`transition-transform ${showHidden ? "rotate-180" : ""}`}
               />
+              {showHidden ? "Hide" : "Show"} {hidden.length} disconnected device{hidden.length !== 1 ? "s" : ""}
+            </button>
+
+            {showHidden && (
+              <div className="space-y-2 mt-1">
+                {hidden.map((device) => (
+                  <DeviceCard
+                    key={device.id}
+                    device={device}
+                    pending={pending}
+                    isCapture={isCapture}
+                    dimmed={true}
+                    onVolumeChange={onVolumeChange}
+                    onMuteToggle={onMuteToggle}
+                    onSetDefault={onSetDefault}
+                  />
+                ))}
+              </div>
             )}
           </div>
-        ))}
+        )}
       </div>
     </div>
   );
