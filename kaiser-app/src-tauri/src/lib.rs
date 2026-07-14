@@ -31,6 +31,9 @@ pub fn run() {
             commands::set_display_mode,
             commands::list_display_modes_for_id,
             commands::set_display_mode_for_id,
+            commands::confirm_layout,
+            commands::revert_layout,
+            commands::make_primary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kaiser");

@@ -83,7 +83,11 @@ fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
 
 #[tauri::command]
 pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
-    let manager = state.manager.lock().unwrap();
+    let mut manager = state.manager.lock().unwrap();
+    // Auto-rollback if the confirmation window expired (acts as the daemon heartbeat).
+    if let Ok(true) = manager.rollback_if_confirmation_expired() {
+        log::info!("get_snapshot: confirmation expired — auto-rolled back");
+    }
     let store = state.new_store();
     let displays = manager.list_displays().map_err(|e| e.to_string())?;
     let layout = manager.get_layout().map_err(|e| e.to_string())?;
@@ -341,4 +345,36 @@ pub fn set_display_mode_for_id(
         mode.refresh_rate_hz
     );
     core_set_display_mode(&gdi_name, &mode).map_err(|e| e.to_string())
+}
+
+// ---- Confirmation commands -----------------------------------------------
+
+#[tauri::command]
+pub fn confirm_layout(state: State<AppState>) -> Result<(), String> {
+    log::info!("confirm_layout");
+    let mut manager = state.manager.lock().unwrap();
+    manager.confirm_current_layout().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn revert_layout(state: State<AppState>) -> Result<(), String> {
+    log::info!("revert_layout");
+    let mut manager = state.manager.lock().unwrap();
+    manager.rollback_pending().map_err(|e| e.to_string())
+}
+
+// ---- Primary display command --------------------------------------------
+
+#[tauri::command]
+pub fn make_primary(display_id: DisplayId, state: State<AppState>) -> Result<(), String> {
+    let mut manager = state.manager.lock().unwrap();
+    let resolved = resolve_display_id(&display_id, &manager);
+    let mut layout = manager.get_layout().map_err(|e| e.to_string())?;
+    for output in &mut layout.outputs {
+        output.primary = output.display_id.adapter_luid == resolved.adapter_luid
+            && output.display_id.target_id == resolved.target_id
+            && output.enabled;
+    }
+    log::info!("make_primary: {}:{}", resolved.adapter_luid, resolved.target_id);
+    manager.apply_layout(layout).map_err(|e| e.to_string())
 }

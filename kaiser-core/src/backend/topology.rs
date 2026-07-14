@@ -15,12 +15,6 @@ use super::apply::{
 use super::enumerate::query_active_topology;
 use super::win32_types::TopologySnapshot;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct SerializableRawSnapshot {
-    paths: Vec<serde_json::Value>,
-    modes: Vec<serde_json::Value>,
-}
-
 struct BackendCache {
     last_snapshot: Option<TopologySnapshot>,
     last_color_state_signature: Option<String>,
