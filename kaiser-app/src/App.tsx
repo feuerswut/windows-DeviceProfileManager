@@ -47,23 +47,28 @@ function ConfirmBanner({
   const secs = display != null ? Math.ceil(display) : null;
 
   return (
-    <div className="flex items-center justify-between gap-4 bg-yellow-950/95 border-b border-yellow-600/70 px-4 py-2.5 text-sm shadow-lg backdrop-blur z-50">
-      <span className="text-yellow-300 font-medium">
-        Confirm layout change
-        {secs != null ? ` — reverts in ${secs}s` : ""}
-      </span>
-      <div className="flex gap-2 shrink-0">
+    <div className="rounded-lg border border-yellow-600/50 bg-yellow-950/40 px-5 py-3.5 flex items-center justify-between gap-5 shadow-xl backdrop-blur-sm">
+      <div className="flex items-center gap-3.5 min-w-0">
+        <Monitor size={24} className="text-yellow-400 shrink-0" />
+        <div className="font-semibold text-base text-yellow-200">Layout change pending</div>
+        {secs != null && (
+          <span className="text-sm tabular-nums text-yellow-400">
+            reverts in {secs}s
+          </span>
+        )}
+      </div>
+      <div className="flex gap-2.5 shrink-0">
         <button
           onClick={() => act(onConfirm)}
           disabled={busy}
-          className="px-3 py-1 rounded text-xs font-semibold bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
+          className="px-4 py-1.5 rounded text-sm font-semibold bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
         >
           {busy ? "…" : "Confirm"}
         </button>
         <button
           onClick={() => act(onRevert)}
           disabled={busy}
-          className="px-3 py-1 rounded text-xs font-semibold bg-red-800 hover:bg-red-700 text-white transition-colors disabled:opacity-50"
+          className="px-4 py-1.5 rounded text-sm font-semibold bg-red-900 hover:bg-red-800 text-white transition-colors disabled:opacity-50"
         >
           {busy ? "…" : "Revert"}
         </button>
@@ -170,17 +175,23 @@ export default function App() {
         ))}
       </nav>
 
-      {/* Global confirm banner — visible on all tabs */}
-      {!loading && snapshot?.pending_confirmation && (
-        <ConfirmBanner
-          remainingSecs={snapshot.pending_confirmation_remaining_secs}
-          onConfirm={handleConfirm}
-          onRevert={handleRevert}
-        />
-      )}
-
       {/* Content */}
-      <main className="flex-1 overflow-auto p-4 scrollbar-thin">
+      <div className="relative flex-1 overflow-hidden">
+        {!loading && snapshot?.pending_confirmation && (
+          <div className="absolute inset-0 z-50 pointer-events-none">
+            {/* Blur gradient scrim — fades from top, leaves bottom readable */}
+            <div className="absolute inset-0 bg-gradient-to-b from-zinc-950/80 via-zinc-950/40 to-transparent backdrop-blur-[2px] [mask-image:linear-gradient(to_bottom,black_0%,black_40%,transparent_100%)]" />
+            {/* Card centred at 80% width, pinned near the top */}
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 w-4/5 pointer-events-auto">
+              <ConfirmBanner
+                remainingSecs={snapshot.pending_confirmation_remaining_secs}
+                onConfirm={handleConfirm}
+                onRevert={handleRevert}
+              />
+            </div>
+          </div>
+        )}
+      <main className="h-full overflow-auto p-4 scrollbar-thin">
         {loading ? (
           <div className="flex items-center justify-center h-full text-zinc-500">
             Loading…
@@ -209,6 +220,7 @@ export default function App() {
           </>
         )}
       </main>
+      </div>
     </div>
   );
 }
