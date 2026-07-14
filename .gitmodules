@@ -1,0 +1,9 @@
+[submodule "SetResolution"]
+	path = SetResolution
+	url = https://github.com/feuerswut/SetResolution
+[submodule "Monarch"]
+	path = Monarch
+	url = https://github.com/feuerswut/Monarch
+[submodule "SetDPI"]
+	path = SetDPI
+	url = https://github.com/feuerswut/SetDPI

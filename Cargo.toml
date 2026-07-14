@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "kaiser-core",
+    "kaiser-app/src-tauri",
+]
+resolver = "2"

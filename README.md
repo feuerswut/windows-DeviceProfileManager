@@ -1,80 +1,83 @@
-# windows-DeviceProfileManager
+# Kaiser
 
-A CLI and GUI Windows PowerShell 5 tool to quickly save and apply Monitor + Audio configurations as named profiles.
+A Windows desktop app for saving and applying named display + audio profiles. Drag monitors around, enable or disable displays, set resolution and DPI per monitor, and switch between full setups in one click.
 
-> **Requires Windows PowerShell 5.1 — incompatible with PowerShell 7.**
-> 
-> Requires C# (5.0 in v1)
+Built with [Tauri v2](https://tauri.app/) (Rust backend, React/TypeScript frontend).
 
 ---
 
-## What it does
+## Features
 
-- **Profiles** — save your current monitor layout, resolutions, refresh rates, DPI scaling, HDR state, and audio defaults/volumes as a named profile, then apply any profile with one click.
-- **Display control** — set resolution, Hz, DPI, HDR and primary monitor per display. Supports extended desktop and mirror/clone topologies.
-- **Audio control** — set the default playback/recording device and volume per profile.
-- **Device nicknames** — assign stable short names (e.g. `left`, `center`, `laptop`) to physical monitors and audio devices so profiles survive reboots and driver updates.
-- **GUI** — a simple WinForms window: pick a profile, apply it, edit it, or save the current state. No dependencies beyond what ships with Windows.
-- **CLI** — all features available non-interactively for scripts and shortcuts.
+- **Profiles** — save your current monitor layout, resolutions, refresh rates, DPI scaling, and audio setup as a named profile, then apply any profile with one click.
+- **Display layout** — drag-and-drop canvas to position monitors. Enable or disable individual displays. Edge-snapping for precise alignment.
+- **Resolution & DPI** — pick resolution and refresh rate per monitor. Set DPI scaling independently per display.
+- **Audio** — set default playback and recording device, volume, and mute state per profile.
+- **Safe apply** — a confirmation banner appears after applying a new layout. If you don't confirm within 20 seconds the previous layout is automatically restored.
+- **Persistent identity** — monitors are identified by adapter LUID + EDID hash, so profiles survive reboots and driver reinstalls even when Windows reassigns `DISPLAY1`/`DISPLAY2` numbers.
 
 ---
 
-## Quick start
+## Requirements
 
-```powershell
-# Open the GUI (default)
-.\DisplayAudioOrchestrator.ps1
+- Windows 10 (1803+) or Windows 11
+- No runtime dependencies — the MSI installer is self-contained
 
-# Apply a saved profile
-.\DisplayAudioOrchestrator.ps1 -HwProfile GAMING
+---
 
-# List saved profiles
-.\DisplayAudioOrchestrator.ps1 -ListProfiles
+## Install
 
-# List detected devices
-.\DisplayAudioOrchestrator.ps1 -ListDevices
+Download the latest `.msi` from the [Releases](../../releases) page and run it.
 
-# Identify and nickname your monitors/speakers
-.\DisplayAudioOrchestrator.ps1 -Identify
+---
 
-# Save current state as a new profile
-.\DisplayAudioOrchestrator.ps1 -SaveProfileAs WORK
+## Build from source
 
-# Enable debug logging
-.\DisplayAudioOrchestrator.ps1 -DebugMode
+**Prerequisites:** Rust stable, Node.js 22+, Windows
+
+```sh
+git clone --recurse-submodules https://github.com/feuerswut/Kaiser
+cd Kaiser/kaiser-app
+npm install
+npm run tauri build
+```
+
+The installer is written to `target/release/bundle/msi/`.
+
+---
+
+## Development
+
+```sh
+git clone --recurse-submodules https://github.com/feuerswut/Kaiser
+cd Kaiser/kaiser-app
+npm install
+npm run tauri dev
+# or just run dev.bat from the repo root
 ```
 
 ---
 
-## First run
+## CI / Releases
 
-1. Run the script — the GUI opens.
-2. Click **Identify Devices** and assign short nicknames to your monitors and audio devices.
-3. Arrange your displays and set your preferred resolution/audio, then click **Save Current as Profile**.
-4. Repeat for each layout you use (e.g. `GAMING`, `WORK`, `PRESENTATION`).
-5. Apply any profile with a double-click or the **Apply** button.
+| Workflow | Trigger | Action |
+|---|---|---|
+| **CI** | Every push / PR | Type-check frontend, `cargo check` |
+| **Release** | `git tag v*` | Full Tauri build, draft GitHub Release with MSI |
 
 ---
 
-## Files
+## Submodules
 
-| File | Purpose |
+| Submodule | Purpose |
 |---|---|
-| `DisplayAudioOrchestrator.ps1` | Main script — self-contained, no install needed |
-| `config/devices.json` | Saved nicknames and profiles (auto-created) |
-| `logs/orchestrator.log` | Run log |
-| `README.ai.md` | Developer/AI reference — section map and architecture notes |
+| [Monarch](https://github.com/feuerswut/Monarch) | Core display management library (CCD API abstractions) |
+| [SetResolution](https://github.com/feuerswut/SetResolution) | Resolution/refresh-rate helper |
+| [SetDPI](https://github.com/feuerswut/SetDPI) | DPI scaling helper |
 
 ---
 
-## Notes
+## License
 
-- Profiles store hardware identity (adapter LUID + target ID, EDID) so they work correctly even when Windows reassigns `DISPLAY1`/`DISPLAY2` numbers after a reboot or topology change.
-- Resolution matching is fuzzy: `60 Hz` in a profile matches `59.94 Hz` on the driver; `1080p` matches the closest aspect-ratio-correct mode the monitor reports.
-- The `(don't change)` option in the profile editor leaves a display's active state, resolution, or audio default untouched when applying the profile.
+The submodules mentioned above are all licensed under MIT and you can access their source by clicking on their appropriate folder link in GitHub, or by recursively cloning the repository.
 
----
-
-## Credits
-
-Inspired by and partially based on [DisplayConfig](https://github.com/MartinGC94/DisplayConfig) by MartinGC94, licensed under MIT.
+The project itself is licensed under the GNU AFFERO GENERAL PUBLIC LICENSE, which means if you provide this software, you must link this repository, even if you only supply it in binary/installed form on a server, and users access the server; changes must be contributed back or made public in that case as well, if your change is inside of a public program. For the whole legal details, refer to the LICENSE file.
