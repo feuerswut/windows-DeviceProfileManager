@@ -302,13 +302,17 @@ pub fn apply_layout_against_snapshot(
             match paths.iter().find(|p| path_target_key(p) == (sl, st) && p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0).cloned() {
                 Some(sp) => {
                     let src_id = sp.sourceInfo.id;
-                    let src_mode_idx = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
                     let cur_id = paths[i].sourceInfo.id;
-                    log::debug!("apply D: src source_id={} cur source_id={} src_mode_idx={}", src_id, cur_id, src_mode_idx);
-                    if cur_id != src_id || unsafe { paths[i].sourceInfo.Anonymous.modeInfoIdx } != src_mode_idx {
+                    log::debug!("apply D: src source_id={} cur source_id={}", src_id, cur_id);
+                    if cur_id != src_id {
                         log::info!("apply D: {:016x}:{} mirrors {:016x}:{} (source_id {} → {})", key.0, key.1, sl, st, cur_id, src_id);
+                        // Share the source slot — set both mode indices to INVALID so
+                        // Windows picks valid modes for the clone via SDC_ALLOW_CHANGES.
+                        // Copying the source's modeInfoIdx causes ERROR_NOT_SUPPORTED
+                        // because the source mode entry is already "owned" by source_id.
                         paths[i].sourceInfo.id = src_id;
-                        paths[i].sourceInfo.Anonymous.modeInfoIdx = src_mode_idx;
+                        paths[i].sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                        paths[i].targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
                         changed = true;
                     } else {
                         log::debug!("apply D: {:016x}:{} already clones {:016x}:{}", key.0, key.1, sl, st);
