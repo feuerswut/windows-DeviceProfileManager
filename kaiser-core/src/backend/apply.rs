@@ -109,6 +109,29 @@ pub fn apply_layout_against_snapshot(
         }
     }
 
+    // ── Phase A1.5: shift source modes so the desired primary lands at (0,0) ──
+    // Required before deactivation — if the current primary (e.g. VDD at 0,0)
+    // is being removed, Windows will reject the config unless a new display is
+    // already normalised to (0,0). Mirrors PS SetPrimaryByName.
+    {
+        let cur = super::enumerate::query_active_topology()?;
+        let mut paths = cur.raw.paths.clone();
+        let mut modes = cur.raw.modes.clone();
+        if shift_primary_to_origin(&paths, &mut modes, &desired_outputs) {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply A1.5: set_primary SetDisplayConfig → {}", status);
+            if status == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+
     // ── Phase A2: deactivate unwanted monitors (retry up to 3×) ──────────────
     for attempt in 0..3u32 {
         let cur = super::enumerate::query_active_topology()?;
