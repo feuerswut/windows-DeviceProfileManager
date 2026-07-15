@@ -204,14 +204,75 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
 
     log::debug!("get_snapshot: {} displays, {} gdi_names", displays.len(), gdi_names.len());
 
-    Ok(SnapshotDto {
+    let snapshot = SnapshotDto {
         displays,
         layout,
         profiles,
         pending_confirmation: pending,
         pending_confirmation_remaining_secs: remaining,
         gdi_names,
-    })
+    };
+
+    // Release manager lock before file I/O, then sync any newly connected displays.
+    drop(manager);
+    sync_new_displays_to_profiles(&state, &store, &snapshot.displays, &snapshot.layout);
+
+    Ok(snapshot)
+}
+
+/// Adds newly connected displays (not yet in any profile) as disabled outputs.
+/// Runs only when the active display set changes; no-ops otherwise.
+fn sync_new_displays_to_profiles(
+    state: &AppState,
+    store: &KaiserConfigStore,
+    displays: &[DisplayInfo],
+    live_layout: &Layout,
+) {
+    use std::collections::BTreeSet;
+
+    let current_keys: BTreeSet<u32> = displays
+        .iter()
+        .filter(|d| d.is_active)
+        .map(|d| d.id.target_id)
+        .collect();
+
+    {
+        let mut known = state.known_display_keys.lock().unwrap();
+        if known.as_ref() == Some(&current_keys) {
+            return;
+        }
+        *known = Some(current_keys);
+    }
+
+    let profile_names = store.list_profile_names();
+    for name in &profile_names {
+        let Some(mut kp) = store.load_kaiser_profile(name) else { continue };
+        let mut changed = false;
+
+        for live_out in live_layout.outputs.iter().filter(|o| o.enabled) {
+            let in_profile = kp.layout.outputs.iter().any(|o| {
+                match (o.display_id.edid_hash, live_out.display_id.edid_hash) {
+                    (Some(h1), Some(h2)) => h1 == h2,
+                    _ => o.display_id.target_id == live_out.display_id.target_id,
+                }
+            });
+            if !in_profile {
+                let mut new_out = live_out.clone();
+                new_out.enabled = false;
+                new_out.primary = false;
+                kp.layout.outputs.push(new_out);
+                changed = true;
+                log::info!(
+                    "sync_profiles: added display :{} to profile '{name}' as disabled",
+                    live_out.display_id.target_id
+                );
+            }
+        }
+
+        if changed {
+            let _ = store.save_kaiser_profile(name, kp);
+        }
+    }
 }
 
 #[tauri::command]

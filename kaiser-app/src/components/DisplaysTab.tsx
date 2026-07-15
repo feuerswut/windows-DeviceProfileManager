@@ -286,7 +286,7 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
         }}
         onTransitionEnd={() => setSnapAnimating(false)}
       >
-        {allOutputs.map((output) => {
+        {activeOutputs.map((output) => {
           const key = displayKey(output.display_id);
           const display = displays.find((d) => displayKey(d.id) === key);
           const monNum = monitorNumbers.get(key);

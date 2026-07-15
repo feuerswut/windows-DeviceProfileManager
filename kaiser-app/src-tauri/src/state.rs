@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use kaiser_core::{AudioManager, KaiserBackend, KaiserConfigStore, SharedKaiserBackend};
@@ -12,6 +12,9 @@ pub struct AppState {
     /// DPI state captured just before a profile apply, keyed by "luid:tid".
     /// Restored on revert so DPI rolls back together with the layout.
     pub pending_dpi_rollback: Mutex<Option<HashMap<String, u32>>>,
+    /// Target IDs of displays seen on the last snapshot poll.
+    /// None = first run; triggers profile sync whenever the set changes.
+    pub known_display_keys: Mutex<Option<BTreeSet<u32>>>,
 }
 
 impl AppState {
@@ -29,6 +32,7 @@ impl AppState {
             audio: Mutex::new(AudioManager::new()),
             store_path,
             pending_dpi_rollback: Mutex::new(None),
+            known_display_keys: Mutex::new(None),
         }
     }
 
