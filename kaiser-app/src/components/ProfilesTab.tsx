@@ -260,10 +260,25 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
     });
   }
 
+  /** Ensure cloned outputs share the same position/resolution as their source. */
+  function syncClonePositions(l: Layout): Layout {
+    return {
+      ...l,
+      outputs: l.outputs.map(o => {
+        const key = displayKey(o.display_id);
+        const srcKey = cloneSources[key];
+        if (!srcKey) return o;
+        const src = l.outputs.find(s => displayKey(s.display_id) === srcKey);
+        if (!src) return o;
+        return { ...o, position: src.position, resolution: src.resolution };
+      }),
+    };
+  }
+
   async function save() {
     setSaving(true);
     try {
-      await api.updateProfile(profile.name, normalizeLayout(layout), dpiScales, audio, displayRotations, cloneSources);
+      await api.updateProfile(profile.name, normalizeLayout(syncClonePositions(layout)), dpiScales, audio, displayRotations, cloneSources);
       toast.success(`Profile "${profile.name}" updated`);
       onSaved();
     } catch (err) {

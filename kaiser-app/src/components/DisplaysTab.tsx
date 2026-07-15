@@ -154,7 +154,17 @@ export function LayoutCanvas({ draft, displays, rotations, clonePairs, onDraftCh
 
   const allOutputs = draft.outputs;
   const activeOutputs = allOutputs.filter((o) => o.enabled);
-  const bounds = getBounds(activeOutputs.length > 0 ? activeOutputs : allOutputs, rotations);
+
+  // Clone relationships: which keys are clones, and which sources are mirrored by whom
+  const cloneKeySet = new Set(Object.keys(clonePairs));
+  const mirroredBy: Record<string, string[]> = {};
+  for (const [cloneKey, srcKey] of Object.entries(clonePairs)) {
+    (mirroredBy[srcKey] ??= []).push(cloneKey);
+  }
+  // Only render non-clone outputs — clones are shown as a badge on their source
+  const visibleOutputs = activeOutputs.filter((o) => !cloneKeySet.has(displayKey(o.display_id)));
+
+  const bounds = getBounds(visibleOutputs.length > 0 ? visibleOutputs : allOutputs, rotations);
 
   // Scale: fit bounding box with 30% margin (15% each side)
   const scale = Math.min(
@@ -175,7 +185,7 @@ export function LayoutCanvas({ draft, displays, rotations, clonePairs, onDraftCh
   // Auto-center when layout changes externally
   const layoutSigRef = useRef("");
   useEffect(() => {
-    const sig = draft.outputs.map((o) => `${o.display_id.adapter_luid}:${o.display_id.target_id}:${o.enabled}:${o.position.x}:${o.position.y}:${o.resolution.width}:${o.resolution.height}:${rotations[displayKey(o.display_id)] ?? 0}`).join("|");
+    const sig = visibleOutputs.map((o) => `${o.display_id.adapter_luid}:${o.display_id.target_id}:${o.position.x}:${o.position.y}:${o.resolution.width}:${o.resolution.height}:${rotations[displayKey(o.display_id)] ?? 0}`).join("|");
     if (sig !== layoutSigRef.current) {
       layoutSigRef.current = sig;
       setOffset(computeCenter());
@@ -296,13 +306,16 @@ export function LayoutCanvas({ draft, displays, rotations, clonePairs, onDraftCh
         }}
         onTransitionEnd={() => setSnapAnimating(false)}
       >
-        {activeOutputs.map((output) => {
+        {visibleOutputs.map((output) => {
           const key = displayKey(output.display_id);
           const display = displays.find((d) => displayKey(d.id) === key);
           const monNum = monitorNumbers.get(key);
           const active = output.enabled;
           const rot = rotations[key] ?? 0;
-          const isClone = key in clonePairs;
+          const mirroredByList = (mirroredBy[key] ?? []).map(ck => ({
+            num: monitorNumbers.get(ck),
+            name: displays.find(d => displayKey(d.id) === ck)?.friendly_name,
+          }));
           const { width: ew, height: eh } = effectiveSize(output, rot);
           const x = output.position.x * scale;
           const y = output.position.y * scale;
@@ -332,13 +345,17 @@ export function LayoutCanvas({ draft, displays, rotations, clonePairs, onDraftCh
                   <span className="truncate font-medium leading-tight">{display?.friendly_name ?? key}</span>
                 </div>
                 <div className="flex shrink-0 items-center gap-0.5">
-                  {isClone && <span className="rounded-full border border-purple-500/50 px-1 py-px text-[7px] font-semibold uppercase text-purple-400">Clone</span>}
                   {output.primary && <span className="rounded-full border border-yellow-500/50 px-1 py-px text-[7px] font-semibold uppercase text-yellow-400">Primary</span>}
                 </div>
               </div>
               <span className="text-[9px] leading-none text-zinc-500 pointer-events-none">
                 {active ? `${ew}×${eh}${rot ? ` ${rot}°` : ""}` : "Detached"}
               </span>
+              {mirroredByList.map((m, i) => (
+                <span key={i} className="text-[8px] leading-tight text-green-400 pointer-events-none flex items-center gap-0.5">
+                  <Monitor size={7} /> {m.num != null ? `#${m.num}` : ""} {m.name ?? ""}
+                </span>
+              ))}
             </div>
           );
         })}
