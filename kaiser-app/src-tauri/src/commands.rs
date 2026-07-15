@@ -150,6 +150,10 @@ pub struct ProfileDto {
     pub dpi_scales: HashMap<String, u32>,
     /// Friendly display names captured at save time, keyed by "adapter_luid:target_id"
     pub display_names: HashMap<String, String>,
+    /// Per-monitor rotation in degrees (0/90/180/270) keyed by "adapter_luid:target_id"
+    pub display_rotations: HashMap<String, u32>,
+    /// Clone relationships: "luid:tid" (clone) → "luid:tid" (source)
+    pub clone_sources: HashMap<String, String>,
 }
 
 /// Deduplicate outputs by target_id (prefer enabled over disabled) and strip
@@ -180,12 +184,12 @@ fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
     let audio = kp.as_ref().map(|k| k.audio.clone()).unwrap_or_default();
     let dpi_scales = kp.as_ref().map(|k| k.dpi_scales.clone()).unwrap_or_default();
     let display_names = kp.as_ref().map(|k| k.display_names.clone()).unwrap_or_default();
-    // Kaiser config layout is authoritative (may be user-edited); fall back to Monarch's.
-    // Sanitize on every read to fix any duplicates or stale primary flags.
+    let display_rotations = kp.as_ref().map(|k| k.display_rotations.clone()).unwrap_or_default();
+    let clone_sources = kp.as_ref().map(|k| k.clone_sources.clone()).unwrap_or_default();
     let layout = kp
         .map(|k| sanitize_layout(k.layout))
         .unwrap_or_else(|| profile.layout.clone());
-    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names }
+    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names, display_rotations, clone_sources }
 }
 
 // ---- Display commands ---------------------------------------------------
@@ -468,10 +472,41 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
                     (new_out.display_id.adapter_luid, new_out.display_id.target_id),
                 );
             }
-            manager.apply_layout(remapped).map_err(|e| e.to_string())?;
+
+            // Build (u64,u32)-keyed rotation/clone maps so they can be injected
+            // between deactivation (step 4) and resolution (step 5) in the apply pipeline.
+            #[cfg(target_os = "windows")]
+            {
+                let parse_key = |k: &str| -> Option<(u64, u32)> {
+                    let (ls, ts) = k.split_once(':')?;
+                    Some((ls.parse().ok()?, ts.parse().ok()?))
+                };
+                let rotations: HashMap<(u64, u32), u32> = kp.display_rotations.iter()
+                    .filter_map(|(k, &d)| {
+                        let live = dpi_key_remap.get(k).copied().or_else(|| parse_key(k))?;
+                        Some((live, d))
+                    })
+                    .collect();
+                let clones: HashMap<(u64, u32), (u64, u32)> = kp.clone_sources.iter()
+                    .filter_map(|(ck, sk)| {
+                        let cl = dpi_key_remap.get(ck).copied().or_else(|| parse_key(ck))?;
+                        let sl = dpi_key_remap.get(sk).copied().or_else(|| parse_key(sk))?;
+                        Some((cl, sl))
+                    })
+                    .collect();
+                state.backend.set_pending_display_ops(rotations, clones);
+            }
+
+            manager.apply_layout(remapped).map_err(|e| {
+                #[cfg(target_os = "windows")]
+                state.backend.clear_pending_display_ops();
+                e.to_string()
+            })?;
         } else {
             manager.apply_profile(&name).map_err(|e| e.to_string())?;
         }
+        #[cfg(target_os = "windows")]
+        state.backend.clear_pending_display_ops();
     }
 
     if let Some(kaiser_profile) = kaiser_profile {
@@ -503,25 +538,26 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
                 log::info!("apply_profile: {key} DPI → {percent}%");
             }
         }
+
     }
     Ok(())
 }
 
-/// Save edited profile settings (layout, DPI, audio) without applying to the system.
+/// Save edited profile settings (layout, DPI, audio, rotation, clone) without applying.
 #[tauri::command]
 pub fn update_profile(
     name: String,
     layout: Layout,
     dpi_scales: HashMap<String, u32>,
     audio: Vec<AudioSetting>,
+    display_rotations: HashMap<String, u32>,
+    clone_sources: HashMap<String, String>,
     state: State<AppState>,
 ) -> Result<(), String> {
-    log::info!("update_profile: '{name}'");
+    log::info!("update_profile: '{name}' rotations={display_rotations:?}");
     let store = state.new_store();
     let existing = store.load_kaiser_profile(&name);
     let display_names = existing.as_ref().map(|kp| kp.display_names.clone()).unwrap_or_default();
-    let display_rotations = existing.as_ref().map(|kp| kp.display_rotations.clone()).unwrap_or_default();
-    let clone_sources = existing.as_ref().map(|kp| kp.clone_sources.clone()).unwrap_or_default();
     store
         .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources })
         .map_err(|e| e.to_string())

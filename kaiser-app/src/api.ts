@@ -106,8 +106,10 @@ export const api = {
     layout: import("./types").Layout,
     dpiScales: Record<string, number>,
     audio: import("./types").AudioSetting[],
+    displayRotations: Record<string, number>,
+    cloneSources: Record<string, string>,
   ): Promise<void> {
-    return inv("update_profile", { name, layout, dpiScales, audio });
+    return inv("update_profile", { name, layout, dpiScales, audio, displayRotations, cloneSources });
   },
 
   /** Set rotation for a single active display (0, 90, 180, 270 degrees). */

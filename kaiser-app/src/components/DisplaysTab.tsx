@@ -500,7 +500,7 @@ interface RotationPickerProps {
   onRefresh: () => Promise<void>;
 }
 
-function RotationPicker({ displayId, current, onRefresh }: RotationPickerProps) {
+export function RotationPicker({ displayId, current, onRefresh }: RotationPickerProps) {
   const [applying, setApplying] = useState(false);
 
   async function selectRotation(deg: number) {
@@ -760,11 +760,12 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                 display.is_active ? "border-zinc-700 bg-zinc-900" : "border-zinc-800 bg-zinc-900/50 opacity-60"
               }`}
             >
-              <div className="flex items-start justify-between">
-                <div className="flex items-center gap-3">
+              {/* Row 1: info + main controls */}
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-3 min-w-0">
                   <Monitor size={20} className={display.is_active ? "text-blue-400" : "text-zinc-600"} />
-                  <div>
-                    <div className="font-medium text-sm flex items-center gap-2">
+                  <div className="min-w-0">
+                    <div className="font-medium text-sm flex items-center gap-2 flex-wrap">
                       <span className="text-xs text-zinc-500 font-mono">#{dispNum}</span>
                       {display.friendly_name.replace(` ${display.id.target_id}`, '').trim() || 'Display'}
                       <span className="text-xs text-zinc-500 font-mono">{display.id.target_id}</span>
@@ -781,22 +782,6 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                 </div>
 
                 <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
-                  {display.is_active && output && (
-                    <ClonePicker
-                      displayId={display.id}
-                      currentCloneSourceKey={clone_pairs?.[key] ?? null}
-                      otherOutputs={layout.outputs.filter((o) => displayKey(o.display_id) !== key)}
-                      displays={displays}
-                      onRefresh={onRefresh}
-                    />
-                  )}
-                  {display.is_active && (
-                    <RotationPicker
-                      displayId={display.id}
-                      current={rotation_values?.[key] ?? 0}
-                      onRefresh={onRefresh}
-                    />
-                  )}
                   {display.is_active && <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />}
                   {display.is_active && gdiName && (
                     <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />
@@ -828,6 +813,26 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                   </button>
                 </div>
               </div>
+
+              {/* Row 2: Extended + Rotation (only for active displays) */}
+              {display.is_active && (
+                <div className="flex items-center gap-2 mt-2 flex-wrap">
+                  {output && (
+                    <ClonePicker
+                      displayId={display.id}
+                      currentCloneSourceKey={clone_pairs?.[key] ?? null}
+                      otherOutputs={layout.outputs.filter((o) => displayKey(o.display_id) !== key)}
+                      displays={displays}
+                      onRefresh={onRefresh}
+                    />
+                  )}
+                  <RotationPicker
+                    displayId={display.id}
+                    current={rotation_values?.[key] ?? 0}
+                    onRefresh={onRefresh}
+                  />
+                </div>
+              )}
             </div>
           );
         })}

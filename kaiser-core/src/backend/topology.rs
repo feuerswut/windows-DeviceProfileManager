@@ -19,6 +19,10 @@ struct BackendCache {
     last_snapshot: Option<TopologySnapshot>,
     last_color_state_signature: Option<String>,
     sdr_gamma_cache: HashMap<GammaRampKey, GammaRampWords>,
+    /// Rotation/clone to apply between deactivation (step 4) and resolution (step 5).
+    /// Set from apply_profile before calling apply_layout; consumed in try_apply_once.
+    pending_rotations: HashMap<(u64, u32), u32>,
+    pending_clones: HashMap<(u64, u32), (u64, u32)>,
 }
 
 impl BackendCache {
@@ -27,6 +31,8 @@ impl BackendCache {
             last_snapshot: None,
             last_color_state_signature: None,
             sdr_gamma_cache: HashMap::new(),
+            pending_rotations: HashMap::new(),
+            pending_clones: HashMap::new(),
         }
     }
 }
@@ -110,6 +116,29 @@ impl KaiserBackend {
     pub fn invalidate_snapshot(&self) {
         let mut cache = self.cache.lock().unwrap();
         cache.last_snapshot = None;
+    }
+
+    /// Set rotation and clone data to be applied (in order) between step 4 and step 5
+    /// of the next apply_layout call. Cleared automatically after the apply completes.
+    pub fn set_pending_display_ops(
+        &self,
+        rotations: HashMap<(u64, u32), u32>,
+        clones: HashMap<(u64, u32), (u64, u32)>,
+    ) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.pending_rotations = rotations;
+        cache.pending_clones = clones;
+    }
+
+    pub fn clear_pending_display_ops(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.pending_rotations.clear();
+        cache.pending_clones.clear();
+    }
+
+    fn get_pending_display_ops(&self) -> (HashMap<(u64, u32), u32>, HashMap<(u64, u32), (u64, u32)>) {
+        let cache = self.cache.lock().unwrap();
+        (cache.pending_rotations.clone(), cache.pending_clones.clone())
     }
 
     pub fn get_rotation_values(&self) -> HashMap<(u64, u32), u32> {
@@ -295,7 +324,8 @@ impl KaiserBackend {
         layout: &Layout,
         snapshot: &TopologySnapshot,
     ) -> Result<TopologySnapshot, ManagerError> {
-        match super::apply::apply_layout_against_snapshot(layout, snapshot) {
+        let (pending_rotations, pending_clones) = self.get_pending_display_ops();
+        match super::apply::apply_layout_against_snapshot(layout, snapshot, &pending_rotations, &pending_clones) {
             Ok(s) => Ok(s),
             Err(e) => {
                 log::error!(
@@ -315,7 +345,7 @@ impl KaiserBackend {
                         force_topology_extend()?;
                         std::thread::sleep(std::time::Duration::from_millis(900));
                         let recovered = query_active_topology()?;
-                        super::apply::apply_layout_against_snapshot(layout, &recovered)
+                        super::apply::apply_layout_against_snapshot(layout, &recovered, &pending_rotations, &pending_clones)
                     }
                 }
             }

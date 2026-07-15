@@ -164,10 +164,17 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
     () => profile.dpi_scales ? { ...profile.dpi_scales } : {}
   );
   const [audio, setAudio] = useState<AudioSetting[]>(() => JSON.parse(JSON.stringify(profile.audio)));
+  const [displayRotations, setDisplayRotations] = useState<Record<string, number>>(
+    () => profile.display_rotations ? { ...profile.display_rotations } : {}
+  );
+  const [cloneSources, setCloneSources] = useState<Record<string, string>>(
+    () => profile.clone_sources ? { ...profile.clone_sources } : {}
+  );
   const [saving, setSaving] = useState(false);
   const [modesCache, setModesCache] = useState<Record<string, DisplayMode[] | null>>({});
   const [modesOpen, setModesOpen] = useState<string | null>(null);
   const [dpiOpen, setDpiOpen] = useState<string | null>(null);
+  const [cloneOpen, setCloneOpen] = useState<string | null>(null);
 
   async function loadModes(key: string, output: OutputConfig) {
     if (modesCache[key] !== undefined) return;
@@ -237,7 +244,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
   async function save() {
     setSaving(true);
     try {
-      await api.updateProfile(profile.name, normalizeLayout(layout), dpiScales, audio);
+      await api.updateProfile(profile.name, normalizeLayout(layout), dpiScales, audio, displayRotations, cloneSources);
       toast.success(`Profile "${profile.name}" updated`);
       onSaved();
     } catch (err) {
@@ -329,6 +336,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                         onClick={() => {
                           setDpiOpen(dpiOpen === key ? null : key);
                           setModesOpen(null);
+                          setCloneOpen(null);
                         }}
                         className="flex items-center gap-1 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-1 transition-colors text-zinc-400 hover:text-zinc-200 whitespace-nowrap"
                       >
@@ -354,6 +362,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                           const next = modesOpen === key ? null : key;
                           setModesOpen(next);
                           setDpiOpen(null);
+                          setCloneOpen(null);
                           if (next) await loadModes(key, output);
                         }}
                         className="flex items-center gap-1 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-1 transition-colors text-zinc-400 hover:text-zinc-200 whitespace-nowrap"
@@ -386,8 +395,64 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                     </div>
                   </>
                 )}
-              </div>
-            );
+              {/* Row 2: Extended + Rotation (only for enabled monitors) */}
+              {(output.enabled || output.primary) && (
+                <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                  {/* Clone / Extended dropdown */}
+                  <div className="relative">
+                    <button
+                      onClick={() => { setCloneOpen(cloneOpen === key ? null : key); setDpiOpen(null); setModesOpen(null); }}
+                      className={`flex items-center gap-1 text-xs border rounded px-2 py-1 transition-colors ${
+                        cloneSources[key]
+                          ? "border-purple-600 text-purple-300 bg-purple-900/20"
+                          : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+                      }`}
+                    >
+                      {cloneSources[key]
+                        ? `Mirrors: ${layout.outputs.find(o => displayKey(o.display_id) === cloneSources[key]) ? friendlyName(layout.outputs.find(o => displayKey(o.display_id) === cloneSources[key])!, snapshot) : cloneSources[key]}`
+                        : "Extended"}
+                      <ChevronDown size={9} className={`transition-transform ${cloneOpen === key ? "rotate-180" : ""}`} />
+                    </button>
+                    {cloneOpen === key && (
+                      <div className="absolute left-0 top-full mt-1 z-50 w-48 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl">
+                        <button
+                          onClick={() => { setCloneSources(p => { const n = {...p}; delete n[key]; return n; }); setCloneOpen(null); }}
+                          className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${!cloneSources[key] ? "text-blue-400 font-medium" : "text-zinc-300"}`}
+                        >Extended (no mirror)</button>
+                        {layout.outputs.filter(o => displayKey(o.display_id) !== key && (o.enabled || o.primary)).map(o => {
+                          const oKey = displayKey(o.display_id);
+                          return (
+                            <button key={oKey}
+                              onClick={() => { setCloneSources(p => ({...p, [key]: oKey})); setCloneOpen(null); }}
+                              className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${cloneSources[key] === oKey ? "text-purple-400 font-medium" : "text-zinc-300"}`}
+                            >Mirror: {friendlyName(o, snapshot)}</button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Rotation buttons (local state — saved with profile) */}
+                  <div className="flex items-center gap-0.5">
+                    {([0, 90, 180, 270] as const).map(deg => (
+                      <button
+                        key={deg}
+                        onClick={() => setDisplayRotations(p => deg === 0 ? (({ [key]: _, ...rest }) => rest)(p) : {...p, [key]: deg})}
+                        title={`Rotate ${deg}°`}
+                        className={`flex items-center justify-center w-7 h-6 rounded text-[10px] border transition-colors ${
+                          (displayRotations[key] ?? 0) === deg
+                            ? "bg-blue-700 border-blue-600 text-white"
+                            : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+                        }`}
+                      >
+                        {deg === 0 ? "0°" : `${deg}°`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
           })}
         </div>
       </div>
