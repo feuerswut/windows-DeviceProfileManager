@@ -189,6 +189,7 @@ pub fn apply_layout_against_snapshot(
     }
 
     // ── Phase B: rotation (before resolution) ────────────────────────────────
+    log::debug!("apply B: desired_rotations={:?}", desired_rotations);
     if !desired_rotations.is_empty() {
         let cur = super::enumerate::query_active_topology()?;
         let mut paths = cur.raw.paths.clone();
@@ -197,12 +198,19 @@ pub fn apply_layout_against_snapshot(
         for path in paths.iter_mut() {
             if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
             let key = path_target_key(path);
-            let Some(&deg) = desired_rotations.get(&key) else { continue };
+            let Some(&deg) = desired_rotations.get(&key) else {
+                log::debug!("apply B: {:016x}:{} — no rotation entry, skipping", key.0, key.1);
+                continue;
+            };
             let rot = degrees_to_displayconfig_rotation(deg);
-            if path.targetInfo.rotation.0 != rot.0 {
-                log::info!("apply B: {:016x}:{} rotation → {}°", key.0, key.1, deg);
+            let current_rot = path.targetInfo.rotation.0;
+            log::debug!("apply B: {:016x}:{} current_rot={} desired_rot={} deg={}°", key.0, key.1, current_rot, rot.0, deg);
+            if current_rot != rot.0 {
+                log::info!("apply B: {:016x}:{} rotation {} → {}°", key.0, key.1, current_rot, deg);
                 path.targetInfo.rotation = rot;
                 changed = true;
+            } else {
+                log::debug!("apply B: {:016x}:{} rotation already {}°, no change", key.0, key.1, deg);
             }
         }
         if changed {
@@ -214,7 +222,11 @@ pub fn apply_layout_against_snapshot(
                 )
             };
             log::info!("apply B: rotation SetDisplayConfig → {}", status);
+        } else {
+            log::debug!("apply B: no rotation changes needed");
         }
+    } else {
+        log::debug!("apply B: no rotations specified");
     }
 
     // ── Phase C: resolution & position ───────────────────────────────────────
@@ -276,6 +288,7 @@ pub fn apply_layout_against_snapshot(
     }
 
     // ── Phase D: clone / mirror (after topology + rotation + resolution) ──────
+    log::debug!("apply D: desired_clones={:?}", desired_clones);
     if !desired_clones.is_empty() {
         let cur = super::enumerate::query_active_topology()?;
         let mut paths = cur.raw.paths.clone();
@@ -285,13 +298,24 @@ pub fn apply_layout_against_snapshot(
             if paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
             let key = path_target_key(&paths[i]);
             let Some(&(sl, st)) = desired_clones.get(&key) else { continue };
-            if let Some(sp) = paths.iter().find(|p| path_target_key(p) == (sl, st)).cloned() {
-                let src_id = sp.sourceInfo.id;
-                if paths[i].sourceInfo.id != src_id {
-                    log::info!("apply D: {:016x}:{} mirrors {:016x}:{}", key.0, key.1, sl, st);
-                    paths[i].sourceInfo.id = src_id;
-                    paths[i].sourceInfo.Anonymous.modeInfoIdx = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
-                    changed = true;
+            log::debug!("apply D: {:016x}:{} should clone {:016x}:{}", key.0, key.1, sl, st);
+            match paths.iter().find(|p| path_target_key(p) == (sl, st) && p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0).cloned() {
+                Some(sp) => {
+                    let src_id = sp.sourceInfo.id;
+                    let src_mode_idx = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
+                    let cur_id = paths[i].sourceInfo.id;
+                    log::debug!("apply D: src source_id={} cur source_id={} src_mode_idx={}", src_id, cur_id, src_mode_idx);
+                    if cur_id != src_id || unsafe { paths[i].sourceInfo.Anonymous.modeInfoIdx } != src_mode_idx {
+                        log::info!("apply D: {:016x}:{} mirrors {:016x}:{} (source_id {} → {})", key.0, key.1, sl, st, cur_id, src_id);
+                        paths[i].sourceInfo.id = src_id;
+                        paths[i].sourceInfo.Anonymous.modeInfoIdx = src_mode_idx;
+                        changed = true;
+                    } else {
+                        log::debug!("apply D: {:016x}:{} already clones {:016x}:{}", key.0, key.1, sl, st);
+                    }
+                }
+                None => {
+                    log::warn!("apply D: clone source {:016x}:{} not found in active paths — clone skipped", sl, st);
                 }
             }
         }
@@ -303,8 +327,12 @@ pub fn apply_layout_against_snapshot(
                     SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
                 )
             };
-            log::info!("apply D: clone SetDisplayConfig → {}", status);
+            log::info!("apply D: clone SetDisplayConfig → {} ({})", status, if status == 0 { "OK" } else { "FAILED" });
+        } else {
+            log::debug!("apply D: no clone changes needed");
         }
+    } else {
+        log::debug!("apply D: no clones specified");
     }
 
     let next_snapshot = super::enumerate::query_active_topology()?;

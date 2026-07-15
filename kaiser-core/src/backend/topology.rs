@@ -125,6 +125,7 @@ impl KaiserBackend {
         rotations: HashMap<(u64, u32), u32>,
         clones: HashMap<(u64, u32), (u64, u32)>,
     ) {
+        log::debug!("set_pending_display_ops: rotations={:?} clones={:?}", rotations, clones);
         let mut cache = self.cache.lock().unwrap();
         cache.pending_rotations = rotations;
         cache.pending_clones = clones;
@@ -138,7 +139,10 @@ impl KaiserBackend {
 
     fn get_pending_display_ops(&self) -> (HashMap<(u64, u32), u32>, HashMap<(u64, u32), (u64, u32)>) {
         let cache = self.cache.lock().unwrap();
-        (cache.pending_rotations.clone(), cache.pending_clones.clone())
+        let r = cache.pending_rotations.clone();
+        let c = cache.pending_clones.clone();
+        log::debug!("get_pending_display_ops: rotations={:?} clones={:?}", r, c);
+        (r, c)
     }
 
     pub fn get_rotation_values(&self) -> HashMap<(u64, u32), u32> {
