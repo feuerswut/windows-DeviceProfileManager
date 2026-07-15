@@ -302,10 +302,8 @@ fn phase1_enable_targets(
             Some(p) => {
                 let mut p = p.clone();
                 p.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-                unsafe {
-                    p.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-                    p.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-                }
+                p.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                p.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
                 log::info!("phase1: appending inactive target {:016x}:{}", adapter_luid, target_id);
                 phase1_paths.push(p);
             }
@@ -400,10 +398,8 @@ pub(super) fn try_attach_inactive_for_layout(
             continue;
         };
         inactive_path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        unsafe {
-            inactive_path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-            inactive_path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-        }
+        inactive_path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+        inactive_path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
         apply_desired_target_refresh(
             &mut inactive_path,
             desired_outputs.get(&(*adapter_luid, *target_id)),

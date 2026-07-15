@@ -272,6 +272,9 @@ impl DisplayBackend for KaiserBackend {
         }))
     }
 
+}
+
+impl KaiserBackend {
     /// Single attempt: two-phase apply → inactive-attach fallback → extend+retry.
     fn try_apply_once(
         &self,
