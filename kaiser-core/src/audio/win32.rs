@@ -6,7 +6,7 @@ use windows::Win32::Devices::FunctionDiscovery::{
     PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName,
 };
 use windows::Win32::Media::Audio::{
-    eCapture, eCommunications, eConsole, eRender, EDataFlow, ERole,
+    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole,
     IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
     DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_UNPLUGGED,
 };
@@ -116,13 +116,13 @@ impl AudioManager {
             device_id.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             let policy: com_policy_config::IPolicyConfig =
-                CoCreateInstance(&com_policy_config::CLSID_PolicyConfigClient, None, CLSCTX_ALL)
+                CoCreateInstance(&com_policy_config::PolicyConfigClient, None, CLSCTX_ALL)
                     .map_err(|e| anyhow::anyhow!("CoCreateInstance IPolicyConfig: {e}"))?;
             let pcwstr = windows::core::PCWSTR(id_wide.as_ptr());
-            // Set all three roles: eConsole=0, eMultimedia=1, eCommunications=2
-            for role in 0u32..=2 {
+            // Set all three roles: eConsole, eMultimedia, eCommunications
+            for role in [eConsole, eMultimedia, eCommunications] {
                 if let Err(e) = policy.SetDefaultEndpoint(pcwstr, role) {
-                    log::warn!("SetDefaultEndpoint role={role}: {e}");
+                    log::warn!("SetDefaultEndpoint role={role:?}: {e}");
                 }
             }
         }
