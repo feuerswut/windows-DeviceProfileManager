@@ -200,11 +200,6 @@ impl DisplayBackend for KaiserBackend {
     fn apply_layout(&self, layout: Layout) -> Result<(), ManagerError> {
         self.ensure_snapshot()?;
 
-        let snapshot = {
-            let cache = self.cache.lock().unwrap();
-            cache.last_snapshot.as_ref().unwrap().clone()
-        };
-
         let any_enabled = layout.outputs.iter().any(|o| o.enabled);
         if !any_enabled {
             return Err(ManagerError::Backend(
@@ -223,18 +218,77 @@ impl DisplayBackend for KaiserBackend {
             cache.sdr_gamma_cache.clone()
         };
 
-        let next_snapshot = match super::apply::apply_layout_against_snapshot(&layout, &snapshot) {
-            Ok(s) => s,
+        // Retry loop: keep attempting until the active topology matches the desired
+        // layout or we exhaust all attempts. Windows topology changes are async and
+        // may require multiple passes to fully settle.
+        const MAX_ATTEMPTS: u32 = 6;
+        let mut last_err: Option<ManagerError> = None;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                log::info!("KaiserBackend: retry attempt {}/{}", attempt, MAX_ATTEMPTS - 1);
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+            }
+
+            // Always use the freshest cached snapshot for each attempt.
+            let snapshot = {
+                let cache = self.cache.lock().unwrap();
+                cache.last_snapshot.as_ref().unwrap().clone()
+            };
+
+            let result = self.try_apply_once(&layout, &snapshot);
+
+            match result {
+                Ok(next_snapshot) => {
+                    if super::apply::verify_layout_applied(&layout, &next_snapshot) {
+                        log::info!("KaiserBackend: layout verified on attempt {}", attempt + 1);
+                        self.persist_snapshot(&next_snapshot);
+                        let _ = reapply_color_calibration_for_active_with_cached_sdr(&sdr_cache);
+                        self.refresh_snapshot(next_snapshot);
+                        return Ok(());
+                    }
+                    log::warn!(
+                        "KaiserBackend: apply attempt {} returned Ok but verification failed — will retry",
+                        attempt + 1
+                    );
+                    self.refresh_snapshot(next_snapshot);
+                    last_err = Some(ManagerError::Backend(
+                        "topology verification failed after apply".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    log::error!("KaiserBackend: apply attempt {} failed: {e}", attempt + 1);
+                    // Refresh snapshot so the next attempt sees current state.
+                    if let Ok(fresh) = query_active_topology() {
+                        self.refresh_snapshot(fresh);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            ManagerError::Backend("apply failed after all attempts".to_string())
+        }))
+    }
+
+    /// Single attempt: two-phase apply → inactive-attach fallback → extend+retry.
+    fn try_apply_once(
+        &self,
+        layout: &Layout,
+        snapshot: &TopologySnapshot,
+    ) -> Result<TopologySnapshot, ManagerError> {
+        match super::apply::apply_layout_against_snapshot(layout, snapshot) {
+            Ok(s) => Ok(s),
             Err(e) => {
                 log::error!(
-                    "KaiserBackend: main apply failed ({e}); \
-                     trying inactive-path attach fallback"
+                    "KaiserBackend: main apply failed ({e}); trying inactive-path attach fallback"
                 );
                 let active = query_active_topology()?;
-                match super::apply::try_attach_inactive_for_layout(&layout, &active) {
+                match super::apply::try_attach_inactive_for_layout(layout, &active) {
                     Ok(s) => {
                         log::info!("KaiserBackend: inactive-path attach succeeded");
-                        s
+                        Ok(s)
                     }
                     Err(attach_err) => {
                         log::error!(
@@ -242,18 +296,13 @@ impl DisplayBackend for KaiserBackend {
                              trying topology extend as last resort"
                         );
                         force_topology_extend()?;
-                        std::thread::sleep(std::time::Duration::from_millis(700));
+                        std::thread::sleep(std::time::Duration::from_millis(900));
                         let recovered = query_active_topology()?;
-                        super::apply::apply_layout_against_snapshot(&layout, &recovered)?
+                        super::apply::apply_layout_against_snapshot(layout, &recovered)
                     }
                 }
             }
-        };
-
-        self.persist_snapshot(&next_snapshot);
-        let _ = reapply_color_calibration_for_active_with_cached_sdr(&sdr_cache);
-        self.refresh_snapshot(next_snapshot);
-        Ok(())
+        }
     }
 }
 

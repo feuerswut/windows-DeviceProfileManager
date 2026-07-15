@@ -6,7 +6,12 @@ use state::AppState;
 use tauri::Manager;
 
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // In debug builds default to DEBUG so log::debug! calls in the apply pipeline are visible.
+    #[cfg(debug_assertions)]
+    let default_level = "debug";
+    #[cfg(not(debug_assertions))]
+    let default_level = "info";
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 
     tauri::Builder::default()
         .setup(|app| {

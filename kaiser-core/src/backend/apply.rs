@@ -37,17 +37,16 @@ const GAMMA_RAMP_WORDS: usize = 3 * 256;
 pub(super) type GammaRampKey = (u64, u32);
 pub(super) type GammaRampWords = [u16; GAMMA_RAMP_WORDS];
 
-/// Two-phase apply mirroring the PowerShell kaiser.ps1 approach:
+/// Two-phase apply mirroring the PowerShell kaiser.ps1 approach.
 ///
-/// Phase 1 (EnableMonitorByName): if any desired-active targets are currently
-/// inactive, append them from QDC_ALL_PATHS to the **active** paths array
-/// (keeping the active modes array untouched) and call SetDisplayConfig.
-/// This brings the target online before we try to disable other monitors.
+/// Phase 1 (EnableMonitorByName): inactive desired targets are appended to the
+/// **active** paths array (active modes untouched) and SetDisplayConfig is called.
+/// We then poll until every target appears in QDC_ONLY_ACTIVE_PATHS.
 ///
-/// Phase 2 (DeactivateAllExcept): query fresh QDC_ONLY_ACTIVE_PATHS (which now
-/// includes anything enabled in phase 1), clear the active flag on unwanted
-/// paths (without touching mode indices — the PS script does the same), update
-/// position/resolution on paths we keep, then call SetDisplayConfig again.
+/// Phase 2 (DeactivateAllExcept + SetPrimaryByName): fresh QDC_ONLY_ACTIVE_PATHS
+/// is queried; unwanted paths get their active flag cleared (mode indices kept);
+/// all source-mode positions are shifted so the desired primary lands at (0,0);
+/// SetDisplayConfig is called.
 pub fn apply_layout_against_snapshot(
     desired: &Layout,
     snapshot: &TopologySnapshot,
@@ -59,62 +58,94 @@ pub fn apply_layout_against_snapshot(
 
     let desired_outputs = desired_output_index(desired);
 
-    // Targets in the desired layout that should be active but aren't currently.
     let currently_active_keys: std::collections::HashSet<(u64, u32)> = snapshot
-        .raw
-        .paths
-        .iter()
+        .raw.paths.iter()
         .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
         .map(|p| path_target_key(p))
         .collect();
 
-    let needs_enable: Vec<(u64, u32)> = desired
-        .outputs
-        .iter()
+    let needs_enable: Vec<(u64, u32)> = desired.outputs.iter()
         .filter(|o| o.enabled)
         .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
         .filter(|key| !currently_active_keys.contains(key))
         .collect();
 
-    // Phase 1: bring inactive targets online first.
+    // --- Phase 1: bring inactive targets online (mirrors EnableMonitorByName) ---
     if !needs_enable.is_empty() {
-        log::info!("apply: phase 1 — enabling {} inactive target(s): {:?}", needs_enable.len(), needs_enable);
+        log::info!(
+            "apply phase1: enabling {} inactive target(s): {:?}",
+            needs_enable.len(),
+            needs_enable
+        );
         match phase1_enable_targets(&needs_enable, &snapshot.raw.paths, &snapshot.raw.modes) {
             Ok(()) => {
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                log::info!("apply: phase 1 succeeded");
+                log::info!("apply phase1: SetDisplayConfig OK — polling for topology settle (up to 12s)");
+                if !wait_for_targets_active(&needs_enable, 12_000) {
+                    log::warn!("apply phase1: target(s) did not appear in active topology within 12s, proceeding anyway");
+                } else {
+                    log::info!("apply phase1: all targets confirmed active");
+                }
             }
             Err(e) => {
-                log::warn!("apply: phase 1 failed ({e}); proceeding to phase 2 anyway");
+                log::warn!("apply phase1: failed ({e}); proceeding to phase 2 with current topology");
             }
         }
     }
 
-    // Phase 2: query fresh active topology (includes targets enabled in phase 1),
-    // disable unwanted paths, update modes on kept paths.
+    // --- Phase 2: query fresh active set, disable unwanted, normalise positions ---
     let phase2_snap = super::enumerate::query_active_topology()?;
     let mut next_paths = phase2_snap.raw.paths.clone();
     let mut next_modes = phase2_snap.raw.modes.clone();
+
+    log::info!(
+        "apply phase2: fresh active has {} paths; desired enabled: {}",
+        next_paths.len(),
+        desired.outputs.iter().filter(|o| o.enabled).count()
+    );
 
     for path in &mut next_paths {
         let key = path_target_key(path);
         let desired_output = desired_outputs.get(&key);
         let should_be_active = desired_output.map(|o| o.enabled).unwrap_or(false);
+        let mode_idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+
+        log::debug!(
+            "apply phase2: path {:016x}:{} active={} desired={} mode_idx={:#x}",
+            key.0, key.1,
+            (path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG) != 0,
+            should_be_active,
+            mode_idx
+        );
 
         if should_be_active {
             path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-            let has_valid_mode =
-                unsafe { path.sourceInfo.Anonymous.modeInfoIdx } != 0xFFFF_FFFF;
-            if has_valid_mode {
+            if mode_idx != 0xFFFF_FFFF {
                 apply_desired_source_mode(path, &mut next_modes, desired_output);
             }
             apply_desired_target_refresh(path, desired_output);
         } else {
-            // Mirror PS DeactivateAllExcept: clear the active flag but keep mode
-            // indices intact so the modes array remains internally consistent.
+            // Mirror PS DeactivateAllExcept: clear flag, keep mode indices intact.
             path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
         }
     }
+
+    // Normalise all source-mode positions so the desired primary lands at (0,0).
+    // Mirrors PS SetPrimaryByName which subtracts the primary's current offset from
+    // every source mode — required so Windows accepts the config when only the
+    // newly-enabled display remains active.
+    normalize_primary_position(&next_paths, &mut next_modes, &desired_outputs);
+
+    // Safety: refuse to call SetDisplayConfig with zero active paths — that would
+    // always be rejected and could leave the desktop in an unusable state.
+    let active_count = next_paths.iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .count();
+    if active_count == 0 {
+        return Err(ManagerError::Backend(
+            "phase2: all paths would be inactive — refusing to apply (would black-screen)".to_string(),
+        ));
+    }
+    log::info!("apply phase2: {} path(s) will be active", active_count);
 
     reorder_paths_for_desired_priority(&mut next_paths, &desired_outputs);
 
@@ -122,6 +153,7 @@ pub fn apply_layout_against_snapshot(
         let exact_flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_NO_OPTIMIZATION;
         let mut status = SetDisplayConfig(Some(next_paths.as_slice()), Some(next_modes.as_slice()), exact_flags);
         if status != 0 {
+            log::debug!("apply phase2: exact flags failed ({status}), retrying with ALLOW_CHANGES");
             status = SetDisplayConfig(
                 Some(next_paths.as_slice()),
                 Some(next_modes.as_slice()),
@@ -142,8 +174,116 @@ pub fn apply_layout_against_snapshot(
     Ok(next_snapshot)
 }
 
-/// Phase 1: append inactive targets to the active paths array and enable them.
-/// Uses the active modes array (not the ALL_PATHS modes) — mirrors EnableMonitorByName.
+/// Mirrors PS `SetPrimaryByName`: find the desired primary in the modes array and
+/// subtract its current (x,y) offset from every source-mode entry. This ensures
+/// the primary always lands at (0,0) as Windows requires.
+fn normalize_primary_position(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    modes: &mut Vec<DISPLAYCONFIG_MODE_INFO>,
+    desired_outputs: &HashMap<(u64, u32), &monarch::OutputConfig>,
+) {
+    // Find the desired primary's current mode index
+    let primary_mode_idx = paths.iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .filter_map(|p| {
+            let key = path_target_key(p);
+            let output = desired_outputs.get(&key)?;
+            if !output.primary { return None; }
+            let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx };
+            if idx == 0xFFFF_FFFF { return None; }
+            Some(idx as usize)
+        })
+        .next();
+
+    let Some(pidx) = primary_mode_idx else { return };
+    let Some(primary_mode) = modes.get(pidx) else { return };
+    if primary_mode.infoType.0 != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE.0 { return; }
+
+    let (offset_x, offset_y) = unsafe {
+        (primary_mode.Anonymous.sourceMode.position.x,
+         primary_mode.Anonymous.sourceMode.position.y)
+    };
+
+    if offset_x == 0 && offset_y == 0 {
+        log::debug!("normalize_primary_position: primary already at (0,0), no shift needed");
+        return;
+    }
+
+    log::info!(
+        "normalize_primary_position: shifting all source modes by (-{}, -{})",
+        offset_x, offset_y
+    );
+    for mode in modes.iter_mut() {
+        if mode.infoType.0 == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE.0 {
+            unsafe {
+                mode.Anonymous.sourceMode.position.x -= offset_x;
+                mode.Anonymous.sourceMode.position.y -= offset_y;
+            }
+        }
+    }
+}
+
+/// Poll QDC_ONLY_ACTIVE_PATHS until all `needs_enable` targets appear as active,
+/// or the timeout elapses. Mirrors PS `Wait-MonitorActive`.
+fn wait_for_targets_active(needs_enable: &[(u64, u32)], timeout_ms: u64) -> bool {
+    use std::collections::HashSet;
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        match super::enumerate::query_active_topology() {
+            Ok(snap) => {
+                let active: HashSet<(u64, u32)> = snap.raw.paths.iter()
+                    .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+                    .map(|p| path_target_key(p))
+                    .collect();
+                let missing: Vec<_> = needs_enable.iter().filter(|k| !active.contains(*k)).collect();
+                if missing.is_empty() {
+                    log::info!("wait_for_targets_active: all targets active after {:?}", start.elapsed());
+                    return true;
+                }
+                log::debug!("wait_for_targets_active: still waiting, missing={:?}", missing);
+            }
+            Err(e) => log::warn!("wait_for_targets_active: query failed: {e}"),
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+    }
+}
+
+/// Check whether the active topology matches what the desired layout requires.
+pub(super) fn verify_layout_applied(desired: &Layout, snapshot: &TopologySnapshot) -> bool {
+    use std::collections::HashSet;
+    let active: HashSet<(u64, u32)> = snapshot.raw.paths.iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .map(|p| path_target_key(p))
+        .collect();
+
+    let mut ok = true;
+    for output in &desired.outputs {
+        let key = (output.display_id.adapter_luid, output.display_id.target_id);
+        if output.enabled && !active.contains(&key) {
+            log::warn!(
+                "verify: {:016x}:{} should be ACTIVE but is not",
+                key.0, key.1
+            );
+            ok = false;
+        }
+        if !output.enabled && active.contains(&key) {
+            log::warn!(
+                "verify: {:016x}:{} should be INACTIVE but is still active",
+                key.0, key.1
+            );
+            ok = false;
+        }
+    }
+    if ok { log::info!("verify: layout matches active topology"); }
+    ok
+}
+
+/// Phase 1: append inactive targets to the active paths array and call SetDisplayConfig.
+/// Uses the **active** modes array — mirrors PS `EnableMonitorByName`.
 fn phase1_enable_targets(
     needs_enable: &[(u64, u32)],
     active_paths: &[DISPLAYCONFIG_PATH_INFO],
@@ -166,14 +306,14 @@ fn phase1_enable_targets(
                     p.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
                     p.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
                 }
-                log::info!("phase1: enabling {:016x}:{}", adapter_luid, target_id);
+                log::info!("phase1: appending inactive target {:016x}:{}", adapter_luid, target_id);
                 phase1_paths.push(p);
             }
             None => {
+                // Not found as inactive — might already be active from a prior attempt.
                 log::warn!(
-                    "phase1: {:016x}:{} not found in QDC_ALL_PATHS (may already be active or unavailable)",
-                    adapter_luid,
-                    target_id
+                    "phase1: {:016x}:{} not found as inactive in QDC_ALL_PATHS",
+                    adapter_luid, target_id
                 );
             }
         }
@@ -187,10 +327,7 @@ fn phase1_enable_targets(
         )
     };
     if status != 0 {
-        return Err(ManagerError::Backend(format!(
-            "phase1 SetDisplayConfig failed: {}",
-            status
-        )));
+        return Err(ManagerError::Backend(format!("phase1 SetDisplayConfig failed: {}", status)));
     }
     Ok(())
 }
