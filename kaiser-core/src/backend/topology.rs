@@ -227,12 +227,26 @@ impl DisplayBackend for KaiserBackend {
             Ok(s) => s,
             Err(e) => {
                 log::error!(
-                    "KaiserBackend: apply failed ({e}); trying topology extend as last resort"
+                    "KaiserBackend: main apply failed ({e}); \
+                     trying inactive-path attach fallback"
                 );
-                force_topology_extend()?;
-                std::thread::sleep(std::time::Duration::from_millis(700));
-                let recovered = query_active_topology()?;
-                super::apply::apply_layout_against_snapshot(&layout, &recovered)?
+                let active = query_active_topology()?;
+                match super::apply::try_attach_inactive_for_layout(&layout, &active) {
+                    Ok(s) => {
+                        log::info!("KaiserBackend: inactive-path attach succeeded");
+                        s
+                    }
+                    Err(attach_err) => {
+                        log::error!(
+                            "KaiserBackend: attach fallback failed ({attach_err}); \
+                             trying topology extend as last resort"
+                        );
+                        force_topology_extend()?;
+                        std::thread::sleep(std::time::Duration::from_millis(700));
+                        let recovered = query_active_topology()?;
+                        super::apply::apply_layout_against_snapshot(&layout, &recovered)?
+                    }
+                }
             }
         };
 

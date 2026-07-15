@@ -112,7 +112,7 @@ impl AudioManager {
     }
 
     pub fn set_default(&self, device_id: &str) -> anyhow::Result<()> {
-        let mut id_wide: Vec<u16> =
+        let id_wide: Vec<u16> =
             device_id.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             let policy: com_policy_config::IPolicyConfig =
