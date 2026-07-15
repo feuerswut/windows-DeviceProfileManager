@@ -213,10 +213,9 @@ impl DisplayBackend for KaiserBackend {
         }
 
         log::info!(
-            "KaiserBackend: applying layout ({} outputs, {} enabled, {} raw paths cached)",
+            "KaiserBackend: applying layout ({} outputs, {} enabled)",
             layout.outputs.len(),
             layout.outputs.iter().filter(|o| o.enabled).count(),
-            snapshot.raw.paths.len(),
         );
 
         let sdr_cache = {
@@ -226,30 +225,15 @@ impl DisplayBackend for KaiserBackend {
 
         let next_snapshot = match super::apply::apply_layout_against_snapshot(&layout, &snapshot) {
             Ok(s) => s,
-            Err(ref e) if is_set_display_invalid_parameter(e) => {
+            Err(e) => {
                 log::error!(
-                    "KaiserBackend: SetDisplayConfig error 87; \
-                     trying inactive-path attach fallback (PS-style)"
+                    "KaiserBackend: apply failed ({e}); trying topology extend as last resort"
                 );
-                let active = query_active_topology()?;
-                match super::apply::try_attach_inactive_for_layout(&layout, &active) {
-                    Ok(s) => {
-                        log::info!("KaiserBackend: inactive-path attach succeeded");
-                        s
-                    }
-                    Err(attach_err) => {
-                        log::error!(
-                            "KaiserBackend: attach fallback failed ({attach_err}); \
-                             trying topology extend as last resort"
-                        );
-                        force_topology_extend()?;
-                        std::thread::sleep(std::time::Duration::from_millis(700));
-                        let recovered = query_active_topology()?;
-                        super::apply::apply_layout_against_snapshot(&layout, &recovered)?
-                    }
-                }
+                force_topology_extend()?;
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                let recovered = query_active_topology()?;
+                super::apply::apply_layout_against_snapshot(&layout, &recovered)?
             }
-            Err(e) => return Err(e),
         };
 
         self.persist_snapshot(&next_snapshot);
@@ -371,10 +355,6 @@ fn raw_covers_active_outputs(raw: &RawTopologySnapshot, layout: &Layout) -> bool
                 && path.targetInfo.id == output.display_id.target_id
         })
     })
-}
-
-fn is_set_display_invalid_parameter(error: &ManagerError) -> bool {
-    matches!(error, ManagerError::Backend(msg) if msg.contains("SetDisplayConfig failed: 87"))
 }
 
 pub fn kaiser_data_dir() -> PathBuf {

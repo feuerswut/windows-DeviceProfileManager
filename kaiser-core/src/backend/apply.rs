@@ -15,8 +15,8 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
-    SDC_ALLOW_CHANGES, SDC_APPLY, SDC_NO_OPTIMIZATION, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
-    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_ALLOW_CHANGES, SDC_ALLOW_PATH_ORDER_CHANGES, SDC_APPLY, SDC_NO_OPTIMIZATION,
+    SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC};
 use windows::Win32::System::Com::{
@@ -42,43 +42,65 @@ pub fn apply_layout_against_snapshot(
     snapshot: &TopologySnapshot,
 ) -> Result<TopologySnapshot, ManagerError> {
     desired.ensure_valid()?;
+    // Capture pre-apply state for restoration after the topology change
     let saved_gamma_ramps = capture_active_gamma_ramps(snapshot);
     let saved_wallpapers = capture_active_wallpapers(snapshot);
     let saved_wallpaper_position = capture_wallpaper_position();
 
     let desired_outputs = desired_output_index(desired);
-    let mut next_paths: Vec<DISPLAYCONFIG_PATH_INFO> = snapshot.raw.paths.clone();
-    let mut next_modes: Vec<DISPLAYCONFIG_MODE_INFO> = snapshot.raw.modes.clone();
+
+    // Query fresh from Windows instead of using cached raw data.
+    // QDC_ALL_PATHS includes inactive paths so we can enable monitors
+    // that are currently off without hitting error 87 from stale cache.
+    let (mut next_paths, mut next_modes) = super::enumerate::query_all_paths()?;
+
     for path in &mut next_paths {
         let key = path_target_key(path);
         let desired_output = desired_outputs.get(&key);
-        let enabled = desired_output.map(|o| o.enabled).unwrap_or(false);
+        let should_be_active = desired_output.map(|o| o.enabled).unwrap_or(false);
+        let was_active = path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0;
+        let has_valid_mode_idx =
+            unsafe { path.sourceInfo.Anonymous.modeInfoIdx } != 0xFFFF_FFFF;
 
-        if enabled {
+        if should_be_active {
             path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        } else {
-            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        }
-
-        if enabled {
-            apply_desired_source_mode(path, &mut next_modes, desired_output);
+            if was_active && has_valid_mode_idx {
+                // Already active: update position/resolution in the existing mode slot
+                apply_desired_source_mode(path, &mut next_modes, desired_output);
+            }
+            // For newly-activated paths (mode index 0xFFFF_FFFF), leave the index as-is
+            // and rely on SDC_ALLOW_CHANGES to assign an appropriate mode.
             apply_desired_target_refresh(path, desired_output);
+        } else {
+            // Disabled paths MUST have both mode indices set to INVALID;
+            // passing a valid mode index for an inactive path causes error 87.
+            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+            unsafe {
+                path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+            }
         }
     }
+
+    // Two active paths on the same adapter may not share a sourceInfo.id
+    // (that would be cloning, which Kaiser doesn't use). Fix any collisions
+    // that arise when activating previously-inactive paths.
+    fix_source_id_collisions(&mut next_paths);
     reorder_paths_for_desired_priority(&mut next_paths, &desired_outputs);
 
     unsafe {
+        // First try without SDC_ALLOW_CHANGES to preserve exact modes for paths
+        // that were already active and had their mode slots updated above.
         let exact_flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_NO_OPTIMIZATION;
-        let mut status = SetDisplayConfig(
-            Some(next_paths.as_slice()),
-            Some(next_modes.as_slice()),
-            exact_flags,
-        );
+        let mut status = SetDisplayConfig(Some(next_paths.as_slice()), Some(next_modes.as_slice()), exact_flags);
         if status != 0 {
+            // Fallback: ALLOW_CHANGES lets Windows fill in modes for newly-enabled
+            // paths whose mode indices are still 0xFFFF_FFFF.
             status = SetDisplayConfig(
                 Some(next_paths.as_slice()),
                 Some(next_modes.as_slice()),
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE
+                    | SDC_ALLOW_CHANGES | SDC_ALLOW_PATH_ORDER_CHANGES,
             );
         }
         if status != 0 {
@@ -92,6 +114,33 @@ pub fn apply_layout_against_snapshot(
     best_effort_restore_wallpapers(&next_snapshot, &saved_wallpapers);
     best_effort_restore_wallpaper_position(saved_wallpaper_position);
     Ok(next_snapshot)
+}
+
+fn fix_source_id_collisions(paths: &mut [DISPLAYCONFIG_PATH_INFO]) {
+    let mut claimed: HashMap<(i32, u32), std::collections::HashSet<u32>> = HashMap::new();
+    for path in paths.iter_mut() {
+        if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 {
+            continue;
+        }
+        let adapter_key = (path.sourceInfo.adapterId.HighPart, path.sourceInfo.adapterId.LowPart);
+        let taken = claimed.entry(adapter_key).or_default();
+        if taken.contains(&path.sourceInfo.id) {
+            let mut free_id = 0u32;
+            while taken.contains(&free_id) {
+                free_id += 1;
+            }
+            path.sourceInfo.id = free_id;
+            // Invalidate mode indices: the old source mode slot referenced the previous
+            // source ID and is no longer valid. Windows will assign a new mode via ALLOW_CHANGES.
+            unsafe {
+                path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+            }
+            taken.insert(free_id);
+        } else {
+            taken.insert(path.sourceInfo.id);
+        }
+    }
 }
 
 pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
@@ -123,95 +172,6 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
         )));
     }
     Ok(())
-}
-
-pub(super) fn try_attach_inactive_for_layout(
-    desired: &Layout,
-    active_snapshot: &TopologySnapshot,
-) -> Result<TopologySnapshot, ManagerError> {
-    let active_keys: std::collections::HashSet<(u64, u32)> = active_snapshot
-        .raw
-        .paths
-        .iter()
-        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
-        .map(|p| (
-            luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart),
-            p.targetInfo.id,
-        ))
-        .collect();
-
-    let needs_attach: Vec<(u64, u32)> = desired
-        .outputs
-        .iter()
-        .filter(|o| {
-            o.enabled && !active_keys.contains(&(o.display_id.adapter_luid, o.display_id.target_id))
-        })
-        .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
-        .collect();
-
-    if needs_attach.is_empty() {
-        return Err(ManagerError::Backend(
-            "try_attach_inactive: no inactive outputs to attach".to_string(),
-        ));
-    }
-
-    let all_paths = super::enumerate::query_inactive_paths()?;
-
-    let desired_outputs = desired_output_index(desired);
-    let mut next_paths = active_snapshot.raw.paths.clone();
-    let mut next_modes = active_snapshot.raw.modes.clone();
-
-    for path in &mut next_paths {
-        let key = path_target_key(path);
-        let desired_output = desired_outputs.get(&key);
-        let enabled = desired_output.map(|o| o.enabled).unwrap_or(false);
-        if !enabled {
-            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        } else {
-            apply_desired_source_mode(path, &mut next_modes, desired_output);
-            apply_desired_target_refresh(path, desired_output);
-        }
-    }
-
-    for (adapter_luid, target_id) in &needs_attach {
-        let Some(mut inactive_path) = all_paths
-            .iter()
-            .find(|p| {
-                luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart)
-                    == *adapter_luid
-                    && p.targetInfo.id == *target_id
-            })
-            .cloned()
-        else {
-            log::warn!(
-                "try_attach_inactive: no path found for adapter={adapter_luid:#018x} target={target_id}"
-            );
-            continue;
-        };
-        inactive_path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        inactive_path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-        inactive_path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-        apply_desired_target_refresh(&mut inactive_path, desired_outputs.get(&(*adapter_luid, *target_id)));
-        next_paths.push(inactive_path);
-    }
-
-    reorder_paths_for_desired_priority(&mut next_paths, &desired_outputs);
-
-    unsafe {
-        let status = SetDisplayConfig(
-            Some(next_paths.as_slice()),
-            Some(next_modes.as_slice()),
-            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
-        );
-        if status != 0 {
-            return Err(ManagerError::Backend(format!(
-                "SetDisplayConfig (inactive-attach fallback) failed: {}",
-                status
-            )));
-        }
-    }
-
-    super::enumerate::query_active_topology()
 }
 
 pub(super) fn reapply_color_calibration_for_active_with_cached_sdr(
