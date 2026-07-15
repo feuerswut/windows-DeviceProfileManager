@@ -218,6 +218,10 @@ pub fn apply_layout_against_snapshot(
     }
 
     // ── Phase C: resolution & position ───────────────────────────────────────
+    // Clones are skipped here — their position comes from the shared source mode
+    // set in Phase D. Applying a separate position for a clone would either be
+    // overwritten by Phase D or cause a conflict if the clone's stored position
+    // differs from the source.
     {
         let cur = super::enumerate::query_active_topology()?;
         let mut paths = cur.raw.paths.clone();
@@ -227,6 +231,8 @@ pub fn apply_layout_against_snapshot(
         for path in paths.iter_mut() {
             if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
             let key = path_target_key(path);
+            // Skip clone displays — Phase D will wire their source mode
+            if desired_clones.contains_key(&key) { continue; }
             let Some(output) = desired_outputs.get(&key).copied() else { continue };
             if !output.enabled { continue; }
 
