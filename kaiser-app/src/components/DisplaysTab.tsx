@@ -428,18 +428,13 @@ function ResolutionPicker({ display, gdiName, onRefresh }: ResolutionPickerProps
 
 interface DpiPickerProps {
   displayId: DisplayId;
+  currentDpi: number | undefined;
+  onRefresh: () => Promise<void>;
 }
 
-function DpiPicker({ displayId }: DpiPickerProps) {
+function DpiPicker({ displayId, currentDpi, onRefresh }: DpiPickerProps) {
   const [open, setOpen] = useState(false);
-  const [currentDpi, setCurrentDpi] = useState<number | null>(null);
   const [applying, setApplying] = useState(false);
-
-  useEffect(() => {
-    api.getDisplayDpi(displayId.adapter_luid, displayId.target_id)
-      .then(setCurrentDpi)
-      .catch(() => {});
-  }, [displayId.adapter_luid, displayId.target_id]);
 
   async function selectDpi(percent: number) {
     if (percent === currentDpi) { setOpen(false); return; }
@@ -447,7 +442,7 @@ function DpiPicker({ displayId }: DpiPickerProps) {
     setOpen(false);
     try {
       await api.setDisplayDpi(displayId.adapter_luid, displayId.target_id, percent);
-      setCurrentDpi(percent);
+      await onRefresh();
       toast.success(`DPI set to ${percent}%`);
     } catch (err) {
       toast.error(`Set DPI failed: ${err}`);
@@ -460,10 +455,10 @@ function DpiPicker({ displayId }: DpiPickerProps) {
     <div className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
-        disabled={applying || currentDpi == null}
+        disabled={applying}
         className="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-1 transition-colors disabled:opacity-50 whitespace-nowrap"
       >
-        {applying ? "…" : currentDpi != null ? `${currentDpi}% DPI` : "DPI…"}
+        {applying ? "…" : currentDpi != null ? `${currentDpi}% DPI` : "DPI"}
         <ChevronDown size={10} className={`transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
       {open && (
@@ -635,7 +630,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                 </div>
 
                 <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
-                  {display.is_active && <DpiPicker displayId={display.id} />}
+                  {display.is_active && <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />}
                   {display.is_active && gdiName && (
                     <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />
                   )}

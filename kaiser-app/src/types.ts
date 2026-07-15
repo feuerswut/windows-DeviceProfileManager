@@ -75,6 +75,8 @@ export interface SnapshotDto {
   pending_confirmation_remaining_secs: number | null;
   /** GDI device names keyed as "adapter_luid:target_id" strings. */
   gdi_names: Record<string, string>;
+  /** Current DPI scaling percentages keyed by "adapter_luid:target_id". */
+  dpi_values: Record<string, number>;
 }
 
 export interface DisplayMode {

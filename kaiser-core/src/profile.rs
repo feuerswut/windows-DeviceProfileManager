@@ -152,11 +152,15 @@ impl ConfigStore for KaiserConfigStore {
                 .zip(existing.profiles.iter())
                 .find(|(n, _)| *n == &profile.name)
                 .map(|(_, kp)| kp);
+            // Preserve the Kaiser-file layout (may include user edits from update_profile).
+            // Only fall back to Monarch's layout when no Kaiser entry exists yet.
+            let layout = existing_kp.map(|kp| kp.layout.clone())
+                .unwrap_or_else(|| profile.layout.clone());
             let audio = existing_kp.map(|kp| kp.audio.clone()).unwrap_or_default();
             let dpi_scales = existing_kp.map(|kp| kp.dpi_scales.clone()).unwrap_or_default();
             let display_names = existing_kp.map(|kp| kp.display_names.clone()).unwrap_or_default();
             names.push(profile.name.clone());
-            profiles.push(KaiserProfile { layout: profile.layout.clone(), audio, dpi_scales, display_names });
+            profiles.push(KaiserProfile { layout, audio, dpi_scales, display_names });
         }
         let kaiser = KaiserConfig {
             profiles,

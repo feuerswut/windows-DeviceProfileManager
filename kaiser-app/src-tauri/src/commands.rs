@@ -132,6 +132,8 @@ pub struct SnapshotDto {
     /// GDI device names keyed as "LUID:TID" strings (avoids u64 JSON precision issues).
     /// Only present for active displays.
     pub gdi_names: HashMap<String, String>,
+    /// Current DPI scaling percentages keyed by "LUID:TID". Only present for active displays.
+    pub dpi_values: HashMap<String, u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -202,6 +204,16 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
         })
         .collect();
 
+    let dpi_values: HashMap<String, u32> = displays
+        .iter()
+        .filter(|d| d.is_active)
+        .filter_map(|d| {
+            get_display_dpi(d.id.adapter_luid, d.id.target_id)
+                .ok()
+                .map(|pct| (format!("{}:{}", d.id.adapter_luid, d.id.target_id), pct))
+        })
+        .collect();
+
     log::debug!("get_snapshot: {} displays, {} gdi_names", displays.len(), gdi_names.len());
 
     let snapshot = SnapshotDto {
@@ -211,6 +223,7 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
         pending_confirmation: pending,
         pending_confirmation_remaining_secs: remaining,
         gdi_names,
+        dpi_values,
     };
 
     // Release manager lock before file I/O, then sync any newly connected displays.

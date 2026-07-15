@@ -97,10 +97,6 @@ export const api = {
     return inv("make_primary", { displayId });
   },
 
-  getDisplayDpi(adapterLuid: number, targetId: number): Promise<number> {
-    return inv("get_display_dpi_cmd", { adapterLuid, targetId });
-  },
-
   setDisplayDpi(adapterLuid: number, targetId: number, percent: number): Promise<void> {
     return inv("set_display_dpi_cmd", { adapterLuid, targetId, percent });
   },
