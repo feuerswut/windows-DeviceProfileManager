@@ -539,6 +539,28 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
             }
         }
 
+        // Second DPI pass — display topology may still be settling after extend;
+        // re-applying after a short delay ensures the scaling actually sticks.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        log::info!("apply_profile: DPI second pass");
+        for (key, percent) in &kaiser_profile.dpi_scales {
+            let (luid, tid) = if let Some(&(l, t)) = dpi_key_remap.get(key) {
+                (l, t)
+            } else if let Some((ls, ts)) = key.split_once(':') {
+                match (ls.parse::<u64>(), ts.parse::<u32>()) {
+                    (Ok(l), Ok(t)) => (l, t),
+                    _ => continue,
+                }
+            } else {
+                continue;
+            };
+            if let Err(e) = set_display_dpi(luid, tid, *percent) {
+                log::warn!("apply_profile: DPI 2nd pass {key}={percent}% failed: {e}");
+            } else {
+                log::info!("apply_profile: DPI 2nd pass {key} → {percent}%");
+            }
+        }
+
     }
     Ok(())
 }
