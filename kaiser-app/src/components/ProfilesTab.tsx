@@ -351,10 +351,13 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                     <div className="flex flex-col gap-1 shrink-0">
                       {/* Row 1: DPI + Resolution — replaced by warning for mirrors */}
                       {isMirror ? (
-                        <div className="flex items-center gap-1 text-amber-400 text-[10px]">
-                          <AlertTriangle size={11} className="shrink-0" />
-                          <span>Check valid shared resolutions!</span>
-                        </div>
+                        <button
+                          onClick={() => {/* future: show resolution compatibility popup */}}
+                          className="flex items-center gap-1 text-[10px] border border-amber-600/60 bg-amber-950/40 text-amber-400 hover:bg-amber-950/70 rounded px-1.5 py-0.5 transition-colors"
+                        >
+                          <AlertTriangle size={10} className="shrink-0" />
+                          Check valid shared resolutions!
+                        </button>
                       ) : (
                       <div className="flex items-center gap-1.5">
                         {/* DPI */}

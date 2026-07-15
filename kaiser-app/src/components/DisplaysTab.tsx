@@ -805,10 +805,13 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                     <div className="flex flex-col gap-1.5 shrink-0">
                       {/* Row 1: DPI + Resolution — hidden for mirrors (shares source's settings) */}
                       {isMirror ? (
-                        <div className="flex items-center gap-1.5 text-amber-400 text-[10px]">
-                          <AlertTriangle size={12} className="shrink-0" />
-                          <span>Check valid shared resolutions!</span>
-                        </div>
+                        <button
+                          onClick={() => {/* future: show resolution compatibility popup */}}
+                          className="flex items-center gap-1.5 text-[10px] border border-amber-600/60 bg-amber-950/40 text-amber-400 hover:bg-amber-950/70 rounded px-2 py-1 transition-colors"
+                        >
+                          <AlertTriangle size={11} className="shrink-0" />
+                          Check valid shared resolutions!
+                        </button>
                       ) : (
                         <div className="flex items-center gap-2 flex-wrap">
                           <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />
