@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { toast } from "sonner";
-import { RefreshCw, Power, Monitor, ChevronDown, RotateCw, Copy } from "lucide-react";
+import { RefreshCw, Power, Monitor, ChevronDown, RotateCw, Copy, AlertTriangle } from "lucide-react";
 import { api } from "../api";
 import type { DisplayId, DisplayInfo, DisplayMode, Layout, OutputConfig, SnapshotDto } from "../types";
 
@@ -799,30 +799,44 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                 </div>
 
                 {/* Middle: DPI + Res (row 1) / Extended + Rotation (row 2) */}
-                {display.is_active && (
-                  <div className="flex flex-col gap-1.5 shrink-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />
-                      {gdiName && <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />}
-                    </div>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      {output && (
-                        <ClonePicker
-                          displayId={display.id}
-                          currentCloneSourceKey={clone_pairs?.[key] ?? null}
-                          otherOutputs={layout.outputs.filter((o) => displayKey(o.display_id) !== key)}
-                          displays={displays}
-                          onRefresh={onRefresh}
-                        />
+                {display.is_active && (() => {
+                  const isMirror = key in (clone_pairs ?? {});
+                  return (
+                    <div className="flex flex-col gap-1.5 shrink-0">
+                      {/* Row 1: DPI + Resolution — hidden for mirrors (shares source's settings) */}
+                      {isMirror ? (
+                        <div className="flex items-center gap-1.5 text-amber-400 text-[10px]">
+                          <AlertTriangle size={12} className="shrink-0" />
+                          <span>Check valid shared resolutions!</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />
+                          {gdiName && <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />}
+                        </div>
                       )}
-                      <RotationPicker
-                        displayId={display.id}
-                        current={rotation_values?.[key] ?? 0}
-                        onRefresh={onRefresh}
-                      />
+                      {/* Row 2: Extended picker always visible; Rotation hidden for mirrors */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {output && (
+                          <ClonePicker
+                            displayId={display.id}
+                            currentCloneSourceKey={clone_pairs?.[key] ?? null}
+                            otherOutputs={layout.outputs.filter((o) => displayKey(o.display_id) !== key)}
+                            displays={displays}
+                            onRefresh={onRefresh}
+                          />
+                        )}
+                        {!isMirror && (
+                          <RotationPicker
+                            displayId={display.id}
+                            current={rotation_values?.[key] ?? 0}
+                            onRefresh={onRefresh}
+                          />
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
 
                 {/* Right: Primary + Enable/Disable */}
                 <div className="flex flex-col gap-1.5 items-end shrink-0">

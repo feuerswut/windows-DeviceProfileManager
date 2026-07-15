@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import { toast } from "sonner";
-import { Play, Save, Trash2, RefreshCw, Monitor, Mic, Volume2, ChevronDown, Edit2, X, Check } from "lucide-react";
+import { Play, Save, Trash2, RefreshCw, Monitor, Mic, Volume2, ChevronDown, Edit2, X, Check, AlertTriangle } from "lucide-react";
 import { api } from "../api";
 import type { AudioDevice, AudioSetting, DisplayMode, Layout, OutputConfig, ProfileDto, SnapshotDto } from "../types";
 import { LayoutCanvas, DPI_OPTIONS, displayKey, normalizeLayout } from "./DisplaysTab";
@@ -345,8 +345,17 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                   </div>
 
                   {/* Middle: DPI+Res (row1) / Extended+Rotation (row2) — only when active */}
-                  {active && (
+                  {active && (() => {
+                    const isMirror = !!cloneSources[key];
+                    return (
                     <div className="flex flex-col gap-1 shrink-0">
+                      {/* Row 1: DPI + Resolution — replaced by warning for mirrors */}
+                      {isMirror ? (
+                        <div className="flex items-center gap-1 text-amber-400 text-[10px]">
+                          <AlertTriangle size={11} className="shrink-0" />
+                          <span>Check valid shared resolutions!</span>
+                        </div>
+                      ) : (
                       <div className="flex items-center gap-1.5">
                         {/* DPI */}
                         <div className="relative">
@@ -390,7 +399,8 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                           )}
                         </div>
                       </div>
-                      {/* Row 2: Extended + Rotation */}
+                      )}
+                      {/* Row 2: Extended picker always shown; Rotation hidden for mirrors */}
                       <div className="flex items-center gap-1.5">
                         <div className="relative">
                           {(() => {
@@ -417,7 +427,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                                       return (
                                         <button key={oKey} onClick={() => { setCloneSources(p => ({...p, [key]: oKey})); setCloneOpen(null); }}
                                           className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${cloneSources[key] === oKey ? "text-green-400 font-medium" : "text-zinc-300"}`}>
-                                          #{ oIdx} {oName}
+                                          #{oIdx} {oName}
                                         </button>
                                       );
                                     })}
@@ -427,18 +437,21 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
                             );
                           })()}
                         </div>
-                        <div className="flex items-center gap-0.5">
-                          {([0, 90, 180, 270] as const).map(deg => (
-                            <button key={deg}
-                              onClick={() => setDisplayRotations(p => deg === 0 ? (({ [key]: _, ...rest }) => rest)(p) : {...p, [key]: deg})}
-                              className={`flex items-center justify-center w-6 h-5 rounded text-[9px] border transition-colors ${(displayRotations[key] ?? 0) === deg ? "bg-purple-900/40 border-purple-600 text-purple-300" : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"}`}>
-                              {deg}°
-                            </button>
-                          ))}
-                        </div>
+                        {!isMirror && (
+                          <div className="flex items-center gap-0.5">
+                            {([0, 90, 180, 270] as const).map(deg => (
+                              <button key={deg}
+                                onClick={() => setDisplayRotations(p => deg === 0 ? (({ [key]: _, ...rest }) => rest)(p) : {...p, [key]: deg})}
+                                className={`flex items-center justify-center w-6 h-5 rounded text-[9px] border transition-colors ${(displayRotations[key] ?? 0) === deg ? "bg-purple-900/40 border-purple-600 text-purple-300" : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"}`}>
+                                {deg}°
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </div>
-                  )}
+                    );
+                  })()}
 
                   {/* Right: Primary ★ + Enabled/Disabled toggle */}
                   <div className="flex flex-col gap-1 items-end shrink-0">

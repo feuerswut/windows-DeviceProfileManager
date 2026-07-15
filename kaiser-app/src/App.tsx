@@ -139,6 +139,17 @@ export default function App() {
     return () => clearInterval(id);
   }, [loading, refreshSnapshot, refreshAudio]);
 
+  function switchTab(next: Tab) {
+    if (next === tab) return;
+    setTab(next);
+    // Refresh whichever data source the new tab needs
+    if (next === "audio") {
+      refreshAudio();
+    } else {
+      refreshSnapshot();
+    }
+  }
+
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "displays", label: "Displays", icon: <Monitor size={16} /> },
     { id: "audio", label: "Audio", icon: <Volume2 size={16} /> },
@@ -162,7 +173,7 @@ export default function App() {
         {tabs.map((t) => (
           <button
             key={t.id}
-            onClick={() => setTab(t.id)}
+            onClick={() => switchTab(t.id)}
             className={`flex items-center gap-2 px-4 py-2 text-sm transition-colors ${
               tab === t.id
                 ? "border-b-2 border-blue-500 text-white"
