@@ -48,6 +48,8 @@ pub(super) type GammaRampWords = [u16; GAMMA_RAMP_WORDS];
 pub fn apply_layout_against_snapshot(
     desired: &Layout,
     snapshot: &TopologySnapshot,
+    desired_rotations: &HashMap<(u64, u32), u32>,
+    desired_clones: &HashMap<(u64, u32), (u64, u32)>,
 ) -> Result<TopologySnapshot, ManagerError> {
     desired.ensure_valid()?;
     let saved_gamma_ramps = capture_active_gamma_ramps(snapshot);
@@ -143,6 +145,70 @@ pub fn apply_layout_against_snapshot(
             if status != 0 {
                 return Err(ManagerError::Backend(format!("SetDisplayConfig failed: {status}")));
             }
+        }
+    }
+
+    // ── Step 4.5: apply rotation (before resolution — Windows may renegotiate
+    //    supported modes when orientation changes) ───────────────────────────
+    if !desired_rotations.is_empty() {
+        let cur = super::enumerate::query_active_topology()?;
+        let mut paths = cur.raw.paths.clone();
+        let modes = cur.raw.modes.clone();
+        let mut changed = false;
+        for path in paths.iter_mut() {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+            let key = path_target_key(path);
+            let Some(&degrees) = desired_rotations.get(&key) else { continue };
+            let rot = degrees_to_displayconfig_rotation(degrees);
+            if path.targetInfo.rotation.0 != rot.0 {
+                log::info!("apply s4.5: {:016x}:{} rotation → {}°", key.0, key.1, degrees);
+                path.targetInfo.rotation = rot;
+                changed = true;
+            }
+        }
+        if changed {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply s4.5: rotation SetDisplayConfig → {}", status);
+        }
+    }
+
+    // ── Step 4.6: apply clone/mirror (before resolution) ──────────────────
+    if !desired_clones.is_empty() {
+        let cur = super::enumerate::query_active_topology()?;
+        let mut paths = cur.raw.paths.clone();
+        let modes = cur.raw.modes.clone();
+        let mut changed = false;
+        for i in 0..paths.len() {
+            if paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+            let key = path_target_key(&paths[i]);
+            let Some(&(sl, st)) = desired_clones.get(&key) else { continue };
+            let src = paths.iter().find(|p| path_target_key(p) == (sl, st)).cloned();
+            if let Some(sp) = src {
+                let src_id = sp.sourceInfo.id;
+                let src_mode = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
+                if paths[i].sourceInfo.id != src_id {
+                    log::info!("apply s4.6: {:016x}:{} clones {:016x}:{}", key.0, key.1, sl, st);
+                    paths[i].sourceInfo.id = src_id;
+                    paths[i].sourceInfo.Anonymous.modeInfoIdx = src_mode;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply s4.6: clone SetDisplayConfig → {}", status);
         }
     }
 
