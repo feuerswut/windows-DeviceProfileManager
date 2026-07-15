@@ -15,8 +15,8 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
-    SDC_ALLOW_CHANGES, SDC_ALLOW_PATH_ORDER_CHANGES, SDC_APPLY, SDC_NO_OPTIMIZATION,
-    SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG, DISPLAYCONFIG_ROTATION,
 };
 use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC};
 use windows::Win32::System::Com::{
@@ -146,17 +146,19 @@ pub fn apply_layout_against_snapshot(
         }
     }
 
-    // ── Step 5: apply desired resolutions / positions ─────────────────────────
+    // ── Step 5: apply desired resolutions / positions ────────────────────────
     {
         let cur = super::enumerate::query_active_topology()?;
         let mut paths = cur.raw.paths.clone();
         let mut modes = cur.raw.modes.clone();
         let mut changed = false;
+
         for path in paths.iter_mut() {
             if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
             let key = path_target_key(path);
             let Some(output) = desired_outputs.get(&key).copied() else { continue };
             if !output.enabled { continue; }
+
             let mode_idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
             if let Some(mode) = modes.get_mut(mode_idx) {
                 if mode.infoType.0 == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE.0 {
@@ -186,6 +188,7 @@ pub fn apply_layout_against_snapshot(
             }
             apply_desired_target_refresh(path, desired_outputs.get(&key));
         }
+
         if changed {
             let status = unsafe {
                 SetDisplayConfig(
@@ -204,6 +207,15 @@ pub fn apply_layout_against_snapshot(
     best_effort_restore_wallpapers(&next_snapshot, &saved_wallpapers);
     best_effort_restore_wallpaper_position(saved_wallpaper_position);
     Ok(next_snapshot)
+}
+
+fn degrees_to_displayconfig_rotation(degrees: u32) -> DISPLAYCONFIG_ROTATION {
+    DISPLAYCONFIG_ROTATION(match degrees {
+        90  => 2,
+        180 => 3,
+        270 => 4,
+        _   => 1, // identity
+    })
 }
 
 fn active_keys(paths: &[DISPLAYCONFIG_PATH_INFO]) -> std::collections::HashSet<(u64, u32)> {
@@ -454,6 +466,116 @@ pub(super) fn try_attach_inactive_for_layout(
     }
 
     super::enumerate::query_active_topology()
+}
+
+/// Set the rotation of a single active display. Queries fresh active paths,
+/// updates the target rotation, and calls SetDisplayConfig. Rotation is in
+/// degrees: 0 (identity), 90, 180, 270.
+pub fn apply_display_rotation(
+    adapter_luid: u64,
+    target_id: u32,
+    degrees: u32,
+) -> Result<(), ManagerError> {
+    let snap = super::enumerate::query_active_topology()?;
+    let mut paths = snap.raw.paths.clone();
+    let modes = snap.raw.modes.clone();
+
+    let desired_rot = degrees_to_displayconfig_rotation(degrees);
+    let mut found = false;
+    for path in paths.iter_mut() {
+        if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+        let key = path_target_key(path);
+        if key != (adapter_luid, target_id) { continue; }
+        path.targetInfo.rotation = desired_rot;
+        found = true;
+        break;
+    }
+    if !found {
+        return Err(ManagerError::Backend(format!(
+            "display {:016x}:{} not active", adapter_luid, target_id
+        )));
+    }
+
+    let status = unsafe {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        )
+    };
+    if status != 0 {
+        return Err(ManagerError::Backend(format!("apply_rotation SetDisplayConfig failed: {status}")));
+    }
+    log::info!("apply_display_rotation: {:016x}:{} → {}°", adapter_luid, target_id, degrees);
+    Ok(())
+}
+
+/// Make one active display clone another by assigning them the same GDI source slot.
+/// Pass `src_adapter_luid = 0, src_target_id = 0` to remove cloning (make it extended).
+pub fn apply_clone_source(
+    clone_adapter_luid: u64,
+    clone_target_id: u32,
+    src_adapter_luid: u64,
+    src_target_id: u32,
+) -> Result<(), ManagerError> {
+    let snap = super::enumerate::query_active_topology()?;
+    let mut paths = snap.raw.paths.clone();
+    let modes = snap.raw.modes.clone();
+
+    if src_adapter_luid == 0 {
+        // Remove clone: find a free sourceInfo.id on the adapter and assign it
+        let clone_path = paths.iter().find(|p| path_target_key(p) == (clone_adapter_luid, clone_target_id)).cloned();
+        let Some(mut cp) = clone_path else {
+            return Err(ManagerError::Backend(format!("clone target not active")));
+        };
+        let used_ids: std::collections::HashSet<u32> = paths.iter()
+            .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+            .filter(|p| p.sourceInfo.adapterId.HighPart == cp.sourceInfo.adapterId.HighPart
+                && p.sourceInfo.adapterId.LowPart == cp.sourceInfo.adapterId.LowPart)
+            .map(|p| p.sourceInfo.id)
+            .collect();
+        let mut free_id = 0u32;
+        while used_ids.contains(&free_id) { free_id += 1; }
+        for p in paths.iter_mut() {
+            if path_target_key(p) == (clone_adapter_luid, clone_target_id) {
+                p.sourceInfo.id = free_id;
+                p.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                p.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                break;
+            }
+        }
+    } else {
+        // Set clone: copy source slot from the src path to the clone path
+        let src_path = paths.iter().find(|p| path_target_key(p) == (src_adapter_luid, src_target_id)).cloned();
+        let Some(sp) = src_path else {
+            return Err(ManagerError::Backend(format!("clone source not active")));
+        };
+        let src_source_id = sp.sourceInfo.id;
+        let src_mode_idx = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
+        for p in paths.iter_mut() {
+            if path_target_key(p) == (clone_adapter_luid, clone_target_id) {
+                p.sourceInfo.id = src_source_id;
+                p.sourceInfo.Anonymous.modeInfoIdx = src_mode_idx;
+                break;
+            }
+        }
+    }
+
+    let status = unsafe {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        )
+    };
+    if status != 0 {
+        return Err(ManagerError::Backend(format!("apply_clone_source SetDisplayConfig failed: {status}")));
+    }
+    log::info!(
+        "apply_clone_source: {:016x}:{} → clone of {:016x}:{}",
+        clone_adapter_luid, clone_target_id, src_adapter_luid, src_target_id
+    );
+    Ok(())
 }
 
 pub(super) fn force_topology_extend() -> Result<(), ManagerError> {

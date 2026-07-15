@@ -111,6 +111,20 @@ impl KaiserBackend {
         let mut cache = self.cache.lock().unwrap();
         cache.last_snapshot = None;
     }
+
+    pub fn get_rotation_values(&self) -> HashMap<(u64, u32), u32> {
+        let cache = self.cache.lock().unwrap();
+        cache.last_snapshot.as_ref()
+            .map(|s| s.rotation_values.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn get_clone_pairs(&self) -> HashMap<(u64, u32), (u64, u32)> {
+        let cache = self.cache.lock().unwrap();
+        cache.last_snapshot.as_ref()
+            .map(|s| s.clone_pairs.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl DisplayBackend for KaiserBackend {

@@ -9,6 +9,8 @@ mod win32_types;
 
 #[cfg(target_os = "windows")]
 pub use topology::{KaiserBackend, SharedKaiserBackend};
+#[cfg(target_os = "windows")]
+pub use apply::{apply_display_rotation, apply_clone_source};
 
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, Default)]

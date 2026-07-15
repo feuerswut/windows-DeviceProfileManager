@@ -43,6 +43,9 @@ pub fn run() {
             commands::get_display_dpi_cmd,
             commands::set_display_dpi_cmd,
             commands::update_profile,
+            commands::set_display_rotation,
+            commands::set_clone_source,
+            commands::refresh_backend,
             commands::frontend_log,
         ])
         .run(tauri::generate_context!())

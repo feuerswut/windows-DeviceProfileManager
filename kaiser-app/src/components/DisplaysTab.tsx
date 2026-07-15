@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { toast } from "sonner";
-import { RefreshCw, Power, Monitor, ChevronDown } from "lucide-react";
+import { RefreshCw, Power, Monitor, ChevronDown, RotateCw, Copy } from "lucide-react";
 import { api } from "../api";
 import type { DisplayId, DisplayInfo, DisplayMode, Layout, OutputConfig, SnapshotDto } from "../types";
 
@@ -29,15 +29,22 @@ export const DPI_OPTIONS = [
 
 const SNAP_THRESHOLD = 60; // virtual pixels — how close before an edge snaps
 const CANVAS_SIZE = 6000;
+const ROTATION_OPTIONS = [0, 90, 180, 270] as const;
 
 // ---- Helpers ----------------------------------------------------------------
 
-function getBounds(outputs: OutputConfig[]) {
+/** Returns the visual (effective) dimensions accounting for 90°/270° rotation. */
+function effectiveSize(o: OutputConfig, rotationDeg: number): { width: number; height: number } {
+  if (rotationDeg === 90 || rotationDeg === 270) return { width: o.resolution.height, height: o.resolution.width };
+  return { width: o.resolution.width, height: o.resolution.height };
+}
+
+function getBounds(outputs: OutputConfig[], rotations: Record<string, number>) {
   if (outputs.length === 0) return { left: 0, top: 0, right: 1920, bottom: 1080, width: 1920, height: 1080 };
   const left = Math.min(...outputs.map((o) => o.position.x));
   const top = Math.min(...outputs.map((o) => o.position.y));
-  const right = Math.max(...outputs.map((o) => o.position.x + o.resolution.width));
-  const bottom = Math.max(...outputs.map((o) => o.position.y + o.resolution.height));
+  const right = Math.max(...outputs.map((o) => o.position.x + effectiveSize(o, rotations[displayKey(o.display_id)] ?? 0).width));
+  const bottom = Math.max(...outputs.map((o) => o.position.y + effectiveSize(o, rotations[displayKey(o.display_id)] ?? 0).height));
   return { left, top, right, bottom, width: right - left, height: bottom - top };
 }
 
@@ -48,15 +55,16 @@ function getBounds(outputs: OutputConfig[]) {
  */
 function edgeSnap(
   rawX: number, rawY: number, w: number, h: number,
-  others: OutputConfig[]
+  others: OutputConfig[], rotations: Record<string, number>
 ): { x: number; y: number } {
   let bestX = rawX, bestY = rawY;
   let dxBest = SNAP_THRESHOLD + 1, dyBest = SNAP_THRESHOLD + 1;
 
   for (const o of others) {
     if (!o.enabled) continue;
+    const { width: ow, height: oh } = effectiveSize(o, rotations[displayKey(o.display_id)] ?? 0);
     const ol = o.position.x, ot = o.position.y;
-    const or_ = ol + o.resolution.width, ob = ot + o.resolution.height;
+    const or_ = ol + ow, ob = ot + oh;
 
     // --- X candidates ---
     // our left → their right (place us to the right of them)
@@ -114,11 +122,13 @@ export function normalizeLayout(layout: Layout): Layout {
 interface CanvasProps {
   draft: Layout;
   displays: DisplayInfo[];
+  rotations: Record<string, number>;
+  clonePairs: Record<string, string>;
   onDraftChange: (l: Layout) => void;
   height?: number;
 }
 
-export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: CanvasProps) {
+export function LayoutCanvas({ draft, displays, rotations, clonePairs, onDraftChange, height = 512 }: CanvasProps) {
   const outerRef = useRef<HTMLDivElement>(null);
   const [outerSize, setOuterSize] = useState({ w: 700, h: height });
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -144,7 +154,7 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
 
   const allOutputs = draft.outputs;
   const activeOutputs = allOutputs.filter((o) => o.enabled);
-  const bounds = getBounds(activeOutputs.length > 0 ? activeOutputs : allOutputs);
+  const bounds = getBounds(activeOutputs.length > 0 ? activeOutputs : allOutputs, rotations);
 
   // Scale: fit bounding box with 30% margin (15% each side)
   const scale = Math.min(
@@ -165,7 +175,7 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
   // Auto-center when layout changes externally
   const layoutSigRef = useRef("");
   useEffect(() => {
-    const sig = draft.outputs.map((o) => `${o.display_id.adapter_luid}:${o.display_id.target_id}:${o.enabled}:${o.position.x}:${o.position.y}:${o.resolution.width}:${o.resolution.height}`).join("|");
+    const sig = draft.outputs.map((o) => `${o.display_id.adapter_luid}:${o.display_id.target_id}:${o.enabled}:${o.position.x}:${o.position.y}:${o.resolution.width}:${o.resolution.height}:${rotations[displayKey(o.display_id)] ?? 0}`).join("|");
     if (sig !== layoutSigRef.current) {
       layoutSigRef.current = sig;
       setOffset(computeCenter());
@@ -237,13 +247,13 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
       const rawY = d.ovy + dvy;
 
       const dragged = d.frozenLayout.outputs.find((o) => displayKey(o.display_id) === d.key);
-      const w = dragged?.resolution.width ?? 1920;
-      const h = dragged?.resolution.height ?? 1080;
+      const dragRot = rotations[d.key] ?? 0;
+      const { width: w, height: h } = dragged ? effectiveSize(dragged, dragRot) : { width: 1920, height: 1080 };
       const others = d.frozenLayout.outputs.filter(
         (o) => displayKey(o.display_id) !== d.key
       );
 
-      const { x, y } = edgeSnap(rawX, rawY, w, h, others);
+      const { x, y } = edgeSnap(rawX, rawY, w, h, others, rotations);
       onDraftChange({
         ...d.frozenLayout,
         outputs: d.frozenLayout.outputs.map((o) =>
@@ -291,10 +301,13 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
           const display = displays.find((d) => displayKey(d.id) === key);
           const monNum = monitorNumbers.get(key);
           const active = output.enabled;
+          const rot = rotations[key] ?? 0;
+          const isClone = key in clonePairs;
+          const { width: ew, height: eh } = effectiveSize(output, rot);
           const x = output.position.x * scale;
           const y = output.position.y * scale;
-          const w = Math.max(42, output.resolution.width * scale);
-          const h = Math.max(28, output.resolution.height * scale);
+          const w = Math.max(42, ew * scale);
+          const h = Math.max(28, eh * scale);
 
           return (
             <div
@@ -318,14 +331,13 @@ export function LayoutCanvas({ draft, displays, onDraftChange, height = 512 }: C
                   )}
                   <span className="truncate font-medium leading-tight">{display?.friendly_name ?? key}</span>
                 </div>
-                {output.primary && (
-                  <span className="shrink-0 rounded-full border border-yellow-500/50 px-1 py-px text-[7px] font-semibold uppercase tracking-wide text-yellow-400">
-                    Primary
-                  </span>
-                )}
+                <div className="flex shrink-0 items-center gap-0.5">
+                  {isClone && <span className="rounded-full border border-purple-500/50 px-1 py-px text-[7px] font-semibold uppercase text-purple-400">Clone</span>}
+                  {output.primary && <span className="rounded-full border border-yellow-500/50 px-1 py-px text-[7px] font-semibold uppercase text-yellow-400">Primary</span>}
+                </div>
               </div>
               <span className="text-[9px] leading-none text-zinc-500 pointer-events-none">
-                {active ? `${output.resolution.width}×${output.resolution.height}` : "Detached"}
+                {active ? `${ew}×${eh}${rot ? ` ${rot}°` : ""}` : "Detached"}
               </span>
             </div>
           );
@@ -480,6 +492,132 @@ function DpiPicker({ displayId, currentDpi, onRefresh }: DpiPickerProps) {
   );
 }
 
+// ---- Rotation Picker --------------------------------------------------------
+
+interface RotationPickerProps {
+  displayId: DisplayId;
+  current: number;
+  onRefresh: () => Promise<void>;
+}
+
+function RotationPicker({ displayId, current, onRefresh }: RotationPickerProps) {
+  const [applying, setApplying] = useState(false);
+
+  async function selectRotation(deg: number) {
+    if (deg === current) return;
+    setApplying(true);
+    try {
+      await api.setDisplayRotation(displayId.adapter_luid, displayId.target_id, deg);
+      await onRefresh();
+      toast.success(`Rotation set to ${deg}°`);
+    } catch (err) {
+      toast.error(`Rotation failed: ${err}`);
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-0.5">
+      {ROTATION_OPTIONS.map((deg) => (
+        <button
+          key={deg}
+          onClick={() => selectRotation(deg)}
+          disabled={applying}
+          title={`Rotate ${deg}°`}
+          className={`flex items-center justify-center w-7 h-6 rounded text-[10px] border transition-colors disabled:opacity-50 ${
+            current === deg
+              ? "bg-blue-700 border-blue-600 text-white"
+              : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"
+          }`}
+        >
+          {deg === 0 ? <RotateCw size={9} /> : `${deg}°`}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---- Clone / Mirror Picker --------------------------------------------------
+
+interface ClonePickerProps {
+  displayId: DisplayId;
+  currentCloneSourceKey: string | null;
+  otherOutputs: OutputConfig[];
+  displays: DisplayInfo[];
+  onRefresh: () => Promise<void>;
+}
+
+function ClonePicker({ displayId, currentCloneSourceKey, otherOutputs, displays, onRefresh }: ClonePickerProps) {
+  const [open, setOpen] = useState(false);
+  const [applying, setApplying] = useState(false);
+
+  const sourceName = currentCloneSourceKey
+    ? displays.find((d) => displayKey(d.id) === currentCloneSourceKey)?.friendly_name ?? currentCloneSourceKey
+    : null;
+
+  async function selectSource(src: DisplayId | null) {
+    setApplying(true);
+    setOpen(false);
+    try {
+      if (src) {
+        await api.setCloneSource(displayId.adapter_luid, displayId.target_id, src.adapter_luid, src.target_id);
+        toast.success(`Mirroring enabled`);
+      } else {
+        await api.setCloneSource(displayId.adapter_luid, displayId.target_id, 0, 0);
+        toast.success(`Extended mode restored`);
+      }
+      await onRefresh();
+    } catch (err) {
+      toast.error(`Clone failed: ${err}`);
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        disabled={applying}
+        title="Mirror / clone this display"
+        className={`flex items-center gap-1 text-xs border rounded px-2 py-1 transition-colors disabled:opacity-50 ${
+          currentCloneSourceKey
+            ? "border-purple-600 text-purple-300 bg-purple-900/20 hover:bg-purple-900/40"
+            : "border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500"
+        }`}
+      >
+        <Copy size={9} />
+        {applying ? "…" : currentCloneSourceKey ? `Mirrors: ${sourceName}` : "Extended"}
+        <ChevronDown size={9} className={`transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-50 w-48 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl">
+          <button
+            onClick={() => selectSource(null)}
+            className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 transition-colors ${!currentCloneSourceKey ? "text-blue-400 font-medium" : "text-zinc-300"}`}
+          >
+            Extended (no mirror)
+          </button>
+          {otherOutputs.filter((o) => o.enabled).map((o) => {
+            const name = displays.find((d) => displayKey(d.id) === displayKey(o.display_id))?.friendly_name ?? displayKey(o.display_id);
+            const selected = currentCloneSourceKey === displayKey(o.display_id);
+            return (
+              <button
+                key={displayKey(o.display_id)}
+                onClick={() => selectSource(o.display_id)}
+                className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 transition-colors ${selected ? "text-purple-400 font-medium" : "text-zinc-300"}`}
+              >
+                Mirror: {name}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---- Main component ---------------------------------------------------------
 
 interface Props {
@@ -492,7 +630,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
   const [draftLayout, setDraftLayout] = useState<Layout | null>(null);
   const [applyingLayout, setApplyingLayout] = useState(false);
 
-  const { displays, layout, pending_confirmation, gdi_names } = snapshot;
+  const { displays, layout, pending_confirmation, gdi_names, rotation_values, clone_pairs } = snapshot;
   const activeCount = displays.filter((d) => d.is_active).length;
   const currentLayout = draftLayout ?? layout;
   const isDirty = draftLayout !== null;
@@ -563,12 +701,25 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-medium text-zinc-400">Display Layout</h2>
-        <button onClick={onRefresh} className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
+        <button
+          onClick={async () => {
+            try { await api.refreshBackend(); } catch {}
+            await onRefresh();
+          }}
+          className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+          title="Re-query all display state from Windows"
+        >
           <RefreshCw size={12} /> Refresh
         </button>
       </div>
 
-      <LayoutCanvas draft={currentLayout} displays={displays} onDraftChange={setDraftLayout} />
+      <LayoutCanvas
+        draft={currentLayout}
+        displays={displays}
+        rotations={rotation_values ?? {}}
+        clonePairs={clone_pairs ?? {}}
+        onDraftChange={setDraftLayout}
+      />
 
       <div className="flex items-center gap-2 min-h-[28px]">
         {isDirty ? (
@@ -594,7 +745,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
       <div className="grid gap-3">
         {displays.map((display, index) => {
           const key = displayKey(display.id);
-          const output = layout.outputs.find(
+          const output = currentLayout.outputs.find(
             (o) =>
               o.display_id.adapter_luid === display.id.adapter_luid &&
               o.display_id.target_id === display.id.target_id
@@ -630,6 +781,22 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                 </div>
 
                 <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
+                  {display.is_active && output && (
+                    <ClonePicker
+                      displayId={display.id}
+                      currentCloneSourceKey={clone_pairs?.[key] ?? null}
+                      otherOutputs={layout.outputs.filter((o) => displayKey(o.display_id) !== key)}
+                      displays={displays}
+                      onRefresh={onRefresh}
+                    />
+                  )}
+                  {display.is_active && (
+                    <RotationPicker
+                      displayId={display.id}
+                      current={rotation_values?.[key] ?? 0}
+                      onRefresh={onRefresh}
+                    />
+                  )}
                   {display.is_active && <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />}
                   {display.is_active && gdiName && (
                     <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />

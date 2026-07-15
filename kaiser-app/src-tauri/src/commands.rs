@@ -7,6 +7,8 @@ use kaiser_core::{
     get_display_dpi, set_display_dpi, set_display_mode as core_set_display_mode, AudioDevice,
     AudioFlow, AudioSetting, DisplayMode, KaiserConfigStore, KaiserProfile, SharedKaiserBackend,
 };
+#[cfg(target_os = "windows")]
+use kaiser_core::{apply_clone_source, apply_display_rotation};
 use monarch::{DisplayId, DisplayInfo, Layout, Profile};
 
 use crate::state::AppState;
@@ -130,10 +132,13 @@ pub struct SnapshotDto {
     pub pending_confirmation: bool,
     pub pending_confirmation_remaining_secs: Option<f64>,
     /// GDI device names keyed as "LUID:TID" strings (avoids u64 JSON precision issues).
-    /// Only present for active displays.
     pub gdi_names: HashMap<String, String>,
-    /// Current DPI scaling percentages keyed by "LUID:TID". Only present for active displays.
+    /// Current DPI scaling percentages keyed by "LUID:TID".
     pub dpi_values: HashMap<String, u32>,
+    /// Current rotation in degrees (0/90/180/270) keyed by "LUID:TID". Absent = 0°.
+    pub rotation_values: HashMap<String, u32>,
+    /// Clone relationships: "LUID:TID" (clone) → "LUID:TID" (source).
+    pub clone_pairs: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -241,6 +246,16 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
         })
         .collect();
 
+    let rotation_values: HashMap<String, u32> = state.backend.get_rotation_values()
+        .into_iter()
+        .map(|((luid, tid), deg)| (format!("{luid}:{tid}"), deg))
+        .collect();
+
+    let clone_pairs: HashMap<String, String> = state.backend.get_clone_pairs()
+        .into_iter()
+        .map(|((cl, ct), (sl, st))| (format!("{cl}:{ct}"), format!("{sl}:{st}")))
+        .collect();
+
     log::trace!("get_snapshot: {} displays, {} gdi_names", displays.len(), gdi_names.len());
 
     let snapshot = SnapshotDto {
@@ -251,6 +266,8 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
         pending_confirmation_remaining_secs: remaining,
         gdi_names,
         dpi_values,
+        rotation_values,
+        clone_pairs,
     };
 
     // Release manager lock before file I/O, then sync any newly connected displays.
@@ -706,6 +723,51 @@ pub fn revert_layout(state: State<AppState>) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+// ---- Rotation & clone ---------------------------------------------------
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn set_display_rotation(
+    adapter_luid: u64,
+    target_id: u32,
+    degrees: u32,
+    state: State<AppState>,
+) -> Result<(), String> {
+    log::info!("set_display_rotation: {adapter_luid}:{target_id} → {degrees}°");
+    apply_display_rotation(adapter_luid, target_id, degrees).map_err(|e| e.to_string())?;
+    state.backend.invalidate_snapshot();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn set_clone_source(
+    clone_adapter_luid: u64,
+    clone_target_id: u32,
+    src_adapter_luid: u64,
+    src_target_id: u32,
+    state: State<AppState>,
+) -> Result<(), String> {
+    log::info!(
+        "set_clone_source: {clone_adapter_luid}:{clone_target_id} mirrors {src_adapter_luid}:{src_target_id}"
+    );
+    apply_clone_source(clone_adapter_luid, clone_target_id, src_adapter_luid, src_target_id)
+        .map_err(|e| e.to_string())?;
+    state.backend.invalidate_snapshot();
+    Ok(())
+}
+
+// ---- Backend refresh ----------------------------------------------------
+
+/// Invalidate the cached display snapshot, forcing a fresh QueryDisplayConfig
+/// on the next backend call. Useful after external topology changes.
+#[tauri::command]
+pub fn refresh_backend(state: State<AppState>) -> Result<(), String> {
+    log::info!("refresh_backend: invalidating snapshot cache");
+    state.backend.invalidate_snapshot();
     Ok(())
 }
 
