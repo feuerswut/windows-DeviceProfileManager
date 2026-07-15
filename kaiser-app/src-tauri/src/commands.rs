@@ -421,8 +421,11 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
 
     log::info!("save_profile: '{name}' dpi_scales={dpi_scales:?} audio={}", audio.len());
     let store = state.new_store();
+    let existing = store.load_kaiser_profile(&name);
+    let display_rotations = existing.as_ref().map(|kp| kp.display_rotations.clone()).unwrap_or_default();
+    let clone_sources = existing.as_ref().map(|kp| kp.clone_sources.clone()).unwrap_or_default();
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources })
         .map_err(|e| e.to_string())?;
 
     let mut manager = state.manager.lock().unwrap();
@@ -515,11 +518,12 @@ pub fn update_profile(
 ) -> Result<(), String> {
     log::info!("update_profile: '{name}'");
     let store = state.new_store();
-    let display_names = store.load_kaiser_profile(&name)
-        .map(|kp| kp.display_names)
-        .unwrap_or_default();
+    let existing = store.load_kaiser_profile(&name);
+    let display_names = existing.as_ref().map(|kp| kp.display_names.clone()).unwrap_or_default();
+    let display_rotations = existing.as_ref().map(|kp| kp.display_rotations.clone()).unwrap_or_default();
+    let clone_sources = existing.as_ref().map(|kp| kp.clone_sources.clone()).unwrap_or_default();
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources })
         .map_err(|e| e.to_string())
 }
 
