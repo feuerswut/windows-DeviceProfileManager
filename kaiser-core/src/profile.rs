@@ -165,8 +165,10 @@ impl ConfigStore for KaiserConfigStore {
             let audio = existing_kp.map(|kp| kp.audio.clone()).unwrap_or_default();
             let dpi_scales = existing_kp.map(|kp| kp.dpi_scales.clone()).unwrap_or_default();
             let display_names = existing_kp.map(|kp| kp.display_names.clone()).unwrap_or_default();
+            let display_rotations = existing_kp.map(|kp| kp.display_rotations.clone()).unwrap_or_default();
+            let clone_sources = existing_kp.map(|kp| kp.clone_sources.clone()).unwrap_or_default();
             names.push(profile.name.clone());
-            profiles.push(KaiserProfile { layout, audio, dpi_scales, display_names });
+            profiles.push(KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources });
         }
         let kaiser = KaiserConfig {
             profiles,

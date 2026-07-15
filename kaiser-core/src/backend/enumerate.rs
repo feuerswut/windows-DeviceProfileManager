@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::hash::Hasher;
 use std::mem::size_of;
 
-use monarch::{DisplayId, DisplayInfo, Layout, ManagerError, OutputConfig, Position, Resolution};
+use monarch::{DisplayInfo, Layout, ManagerError, OutputConfig, Position, Resolution};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,

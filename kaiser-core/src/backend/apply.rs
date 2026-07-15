@@ -525,7 +525,7 @@ pub fn apply_clone_source(
     if src_adapter_luid == 0 {
         // Remove clone: find a free sourceInfo.id on the adapter and assign it
         let clone_path = paths.iter().find(|p| path_target_key(p) == (clone_adapter_luid, clone_target_id)).cloned();
-        let Some(mut cp) = clone_path else {
+        let Some(cp) = clone_path else {
             return Err(ManagerError::Backend(format!("clone target not active")));
         };
         let used_ids: std::collections::HashSet<u32> = paths.iter()
