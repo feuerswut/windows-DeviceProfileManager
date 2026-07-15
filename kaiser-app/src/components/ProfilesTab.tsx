@@ -186,14 +186,18 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
     () => profile.clone_sources ? { ...profile.clone_sources } : {}
   );
   const [saving, setSaving] = useState(false);
-  const [modesCache, setModesCache] = useState<Record<string, DisplayMode[] | null>>({});
+  // Pre-populate from saved_modes so offline monitors show their known resolutions immediately.
+  const [modesCache, setModesCache] = useState<Record<string, DisplayMode[] | null>>(
+    () => ({ ...(profile.saved_modes ?? {}) })
+  );
   const [modesOpen, setModesOpen] = useState<string | null>(null);
   const [dpiOpen, setDpiOpen] = useState<string | null>(null);
   const [cloneOpen, setCloneOpen] = useState<string | null>(null);
 
   async function loadModes(key: string, output: OutputConfig) {
-    if (modesCache[key] !== undefined) return;
-    setModesCache((prev) => ({ ...prev, [key]: null }));
+    // Always try a live query — if it succeeds, update the cache (even over saved_modes).
+    // If it fails, keep whatever is already in cache (saved_modes fallback).
+    setModesCache((prev) => ({ ...prev, [key]: prev[key] ?? null }));
     try {
       const modes = await api.listDisplayModesForId(output.display_id);
       modes.sort((a, b) =>
@@ -203,7 +207,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
       );
       setModesCache((prev) => ({ ...prev, [key]: modes }));
     } catch {
-      setModesCache((prev) => ({ ...prev, [key]: [] }));
+      // Live query failed (monitor offline) — saved_modes already in cache, keep it.
     }
   }
 
@@ -285,8 +289,8 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
         <LayoutCanvas
           draft={layout}
           displays={snapshot.displays}
-          rotations={snapshot.rotation_values ?? {}}
-          clonePairs={snapshot.clone_pairs ?? {}}
+          rotations={displayRotations}
+          clonePairs={cloneSources}
           onDraftChange={setLayout}
           height={320}
         />

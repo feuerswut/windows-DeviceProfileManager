@@ -36,6 +36,10 @@ pub struct KaiserProfile {
     /// Clone relationships. Key = "luid:tid" (clone), value = "luid:tid" (source).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub clone_sources: HashMap<String, String>,
+    /// Known valid display modes per monitor. Key = "adapter_luid:target_id".
+    /// Captured at save time and used as fallback when a monitor is offline.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub saved_modes: HashMap<String, Vec<crate::resolution::DisplayMode>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,8 +171,9 @@ impl ConfigStore for KaiserConfigStore {
             let display_names = existing_kp.map(|kp| kp.display_names.clone()).unwrap_or_default();
             let display_rotations = existing_kp.map(|kp| kp.display_rotations.clone()).unwrap_or_default();
             let clone_sources = existing_kp.map(|kp| kp.clone_sources.clone()).unwrap_or_default();
+            let saved_modes = existing_kp.map(|kp| kp.saved_modes.clone()).unwrap_or_default();
             names.push(profile.name.clone());
-            profiles.push(KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources });
+            profiles.push(KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes });
         }
         let kaiser = KaiserConfig {
             profiles,

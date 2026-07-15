@@ -69,6 +69,8 @@ export interface ProfileDto {
   display_rotations?: Record<string, number>;
   /** Clone relationships: "luid:tid" (clone) → "luid:tid" (source) */
   clone_sources?: Record<string, string>;
+  /** Known display modes captured at save time, keyed by "adapter_luid:target_id" */
+  saved_modes?: Record<string, DisplayMode[]>;
 }
 
 export interface SnapshotDto {

@@ -154,6 +154,8 @@ pub struct ProfileDto {
     pub display_rotations: HashMap<String, u32>,
     /// Clone relationships: "luid:tid" (clone) → "luid:tid" (source)
     pub clone_sources: HashMap<String, String>,
+    /// Known valid display modes per monitor, keyed by "adapter_luid:target_id"
+    pub saved_modes: HashMap<String, Vec<DisplayMode>>,
 }
 
 /// Deduplicate outputs by target_id (prefer enabled over disabled) and strip
@@ -186,10 +188,11 @@ fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
     let display_names = kp.as_ref().map(|k| k.display_names.clone()).unwrap_or_default();
     let display_rotations = kp.as_ref().map(|k| k.display_rotations.clone()).unwrap_or_default();
     let clone_sources = kp.as_ref().map(|k| k.clone_sources.clone()).unwrap_or_default();
+    let saved_modes = kp.as_ref().map(|k| k.saved_modes.clone()).unwrap_or_default();
     let layout = kp
         .map(|k| sanitize_layout(k.layout))
         .unwrap_or_else(|| profile.layout.clone());
-    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names, display_rotations, clone_sources }
+    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes }
 }
 
 // ---- Display commands ---------------------------------------------------
@@ -401,9 +404,10 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
         }
     };
 
-    // Auto-capture per-monitor DPI and friendly names for all active outputs
+    // Auto-capture per-monitor DPI, friendly names, and display modes for active outputs
     let mut dpi_scales: HashMap<String, u32> = HashMap::new();
     let mut display_names: HashMap<String, String> = HashMap::new();
+    let mut saved_modes_new: HashMap<String, Vec<DisplayMode>> = HashMap::new();
     {
         let manager = state.manager.lock().unwrap();
         let displays = manager.list_displays().unwrap_or_default();
@@ -418,7 +422,22 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
                 d.id.adapter_luid == o.display_id.adapter_luid
                     && d.id.target_id == o.display_id.target_id
             }) {
-                display_names.insert(key, d.friendly_name.clone());
+                display_names.insert(key.clone(), d.friendly_name.clone());
+            }
+            // Capture available modes for this display while it's active
+            if let Some(gdi_name) = state.backend.get_gdi_name(o.display_id.adapter_luid, o.display_id.target_id) {
+                match kaiser_core::list_display_modes(&gdi_name) {
+                    Ok(mut modes) => {
+                        modes.sort_by(|a, b|
+                            b.width.cmp(&a.width)
+                                .then(b.height.cmp(&a.height))
+                                .then(b.refresh_rate_hz.cmp(&a.refresh_rate_hz))
+                        );
+                        log::info!("save_profile: captured {} modes for {key}", modes.len());
+                        saved_modes_new.insert(key, modes);
+                    }
+                    Err(e) => log::warn!("save_profile: list_display_modes for {key} failed: {e}"),
+                }
             }
         }
     }
@@ -428,8 +447,11 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
     let existing = store.load_kaiser_profile(&name);
     let display_rotations = existing.as_ref().map(|kp| kp.display_rotations.clone()).unwrap_or_default();
     let clone_sources = existing.as_ref().map(|kp| kp.clone_sources.clone()).unwrap_or_default();
+    // Merge: keep saved modes for offline monitors, update with fresh data for active ones
+    let mut saved_modes = existing.as_ref().map(|kp| kp.saved_modes.clone()).unwrap_or_default();
+    saved_modes.extend(saved_modes_new);
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes })
         .map_err(|e| e.to_string())?;
 
     let mut manager = state.manager.lock().unwrap();
@@ -580,8 +602,9 @@ pub fn update_profile(
     let store = state.new_store();
     let existing = store.load_kaiser_profile(&name);
     let display_names = existing.as_ref().map(|kp| kp.display_names.clone()).unwrap_or_default();
+    let saved_modes = existing.as_ref().map(|kp| kp.saved_modes.clone()).unwrap_or_default();
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes })
         .map_err(|e| e.to_string())
 }
 
