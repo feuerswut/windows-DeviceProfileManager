@@ -623,7 +623,7 @@ function ClonePicker({ displayId, currentCloneSourceKey, otherOutputs, displays,
               <button
                 key={displayKey(o.display_id)}
                 onClick={() => selectSource(o.display_id)}
-                className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 transition-colors ${selected ? "text-purple-400 font-medium" : "text-zinc-300"}`}
+                className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 transition-colors ${selected ? "text-green-400 font-medium" : "text-zinc-300"}`}
               >
                 Mirror: {name}
               </button>
