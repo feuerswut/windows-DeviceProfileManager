@@ -600,7 +600,7 @@ function ClonePicker({ displayId, currentCloneSourceKey, otherOutputs, displays,
         title="Mirror / clone this display"
         className={`flex items-center gap-1 text-xs border rounded px-2 py-1 transition-colors disabled:opacity-50 ${
           currentCloneSourceKey
-            ? "border-purple-600 text-purple-300 bg-purple-900/20 hover:bg-purple-900/40"
+            ? "border-green-600 text-green-300 bg-green-900/20 hover:bg-green-900/40"
             : "border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500"
         }`}
       >
