@@ -263,6 +263,8 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
         <LayoutCanvas
           draft={layout}
           displays={snapshot.displays}
+          rotations={snapshot.rotation_values ?? {}}
+          clonePairs={snapshot.clone_pairs ?? {}}
           onDraftChange={setLayout}
           height={320}
         />
