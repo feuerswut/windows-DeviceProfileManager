@@ -19,5 +19,8 @@ kaiser-app/src-tauri/WixTools/
 bin/
 obj/
 
+# Windows trash
+*.ink
+
 .cargo/
 
