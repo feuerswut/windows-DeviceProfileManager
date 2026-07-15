@@ -30,6 +30,12 @@ pub struct KaiserProfile {
     /// Friendly display names captured at save time. Key = "adapter_luid:target_id", value = Windows friendly name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub display_names: HashMap<String, String>,
+    /// Per-monitor rotation in degrees (0, 90, 180, 270). Key = "adapter_luid:target_id".
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub display_rotations: HashMap<String, u32>,
+    /// Clone relationships. Key = "luid:tid" (clone), value = "luid:tid" (source).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub clone_sources: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
