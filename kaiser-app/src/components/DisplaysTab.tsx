@@ -760,10 +760,10 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                 display.is_active ? "border-zinc-700 bg-zinc-900" : "border-zinc-800 bg-zinc-900/50 opacity-60"
               }`}
             >
-              {/* Row 1: info + main controls */}
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex items-center gap-3 min-w-0">
-                  <Monitor size={20} className={display.is_active ? "text-blue-400" : "text-zinc-600"} />
+              <div className="flex items-start gap-4">
+                {/* Left: icon + info */}
+                <div className="flex items-start gap-3 flex-1 min-w-0">
+                  <Monitor size={20} className={`mt-0.5 shrink-0 ${display.is_active ? "text-blue-400" : "text-zinc-600"}`} />
                   <div className="min-w-0">
                     <div className="font-medium text-sm flex items-center gap-2 flex-wrap">
                       <span className="text-xs text-zinc-500 font-mono">#{dispNum}</span>
@@ -781,11 +781,34 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
-                  {display.is_active && <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />}
-                  {display.is_active && gdiName && (
-                    <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />
-                  )}
+                {/* Middle: DPI + Res (row 1) / Extended + Rotation (row 2) */}
+                {display.is_active && (
+                  <div className="flex flex-col gap-1.5 shrink-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <DpiPicker displayId={display.id} currentDpi={snapshot.dpi_values?.[key]} onRefresh={onRefresh} />
+                      {gdiName && <ResolutionPicker display={display} gdiName={gdiName} onRefresh={onRefresh} />}
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {output && (
+                        <ClonePicker
+                          displayId={display.id}
+                          currentCloneSourceKey={clone_pairs?.[key] ?? null}
+                          otherOutputs={layout.outputs.filter((o) => displayKey(o.display_id) !== key)}
+                          displays={displays}
+                          onRefresh={onRefresh}
+                        />
+                      )}
+                      <RotationPicker
+                        displayId={display.id}
+                        current={rotation_values?.[key] ?? 0}
+                        onRefresh={onRefresh}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Right: Primary + Enable/Disable */}
+                <div className="flex flex-col gap-1.5 items-end shrink-0">
                   {display.is_active && (
                     display.is_primary ? (
                       <button disabled
@@ -813,26 +836,6 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
                   </button>
                 </div>
               </div>
-
-              {/* Row 2: Extended + Rotation (only for active displays) */}
-              {display.is_active && (
-                <div className="flex items-center gap-2 mt-2 flex-wrap">
-                  {output && (
-                    <ClonePicker
-                      displayId={display.id}
-                      currentCloneSourceKey={clone_pairs?.[key] ?? null}
-                      otherOutputs={layout.outputs.filter((o) => displayKey(o.display_id) !== key)}
-                      displays={displays}
-                      onRefresh={onRefresh}
-                    />
-                  )}
-                  <RotationPicker
-                    displayId={display.id}
-                    current={rotation_values?.[key] ?? 0}
-                    onRefresh={onRefresh}
-                  />
-                </div>
-              )}
             </div>
           );
         })}
