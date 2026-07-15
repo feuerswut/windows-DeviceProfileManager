@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import { toast } from "sonner";
-import { Play, Save, Trash2, RefreshCw, Monitor, Mic, Volume2, ChevronDown, Edit2, X, Check } from "lucide-react";
+import { Play, Save, Trash2, RefreshCw, Monitor, Mic, Volume2, ChevronDown, Edit2, X, Check, AlertTriangle } from "lucide-react";
 import { api } from "../api";
 import type { AudioDevice, AudioSetting, DisplayMode, Layout, OutputConfig, ProfileDto, SnapshotDto } from "../types";
 import { LayoutCanvas, DPI_OPTIONS, displayKey, normalizeLayout } from "./DisplaysTab";
@@ -32,38 +32,53 @@ function MonitorCard({
   index,
   dpi,
   name,
+  rotation,
+  cloneSourceName,
+  cloneSourceIndex,
 }: {
   output: OutputConfig;
   index: number;
   dpi: number | undefined;
   name: string | undefined;
+  rotation?: number;
+  cloneSourceName?: string;
+  cloneSourceIndex?: number;
 }) {
   const hz = Math.round(output.refresh_rate_mhz / 1000);
   const displayName = name
     ? name.replace(` ${output.display_id.target_id}`, '').trim() || 'Display'
     : undefined;
   return (
-    <div
-      className={`flex items-center gap-2 rounded border px-2 py-1 text-xs ${
-        output.enabled
-          ? "border-zinc-700 bg-zinc-800/60 text-zinc-300"
-          : "border-zinc-800 bg-zinc-900/40 text-zinc-600"
-      }`}
-    >
+    <div className={`flex items-center gap-2 rounded border px-2 py-1 text-xs ${
+      output.enabled
+        ? "border-zinc-700 bg-zinc-800/60 text-zinc-300"
+        : "border-zinc-800 bg-zinc-900/40 text-zinc-600"
+    }`}>
       <Monitor size={11} className={output.enabled ? "text-blue-400" : "text-zinc-600"} />
       <span className="font-mono text-[10px] text-zinc-500">#{index}</span>
       {displayName && <span className="text-zinc-400">{displayName}</span>}
       <span className="font-mono text-[10px] text-zinc-500">{output.display_id.target_id}</span>
       {output.enabled ? (
-        <>
-          <span>{output.resolution.width}×{output.resolution.height}</span>
-          {hz > 0 && <span className="text-zinc-500">@{hz}Hz</span>}
-          {dpi != null && <span className="text-cyan-400">{dpi}%</span>}
-          {output.primary && <span className="text-yellow-400 font-bold">★</span>}
-        </>
+        cloneSourceName ? (
+          <span className="flex items-center gap-1 text-green-400">
+            Mirror of <Monitor size={11} />
+            {cloneSourceIndex != null && <span className="font-mono text-[10px]">#{cloneSourceIndex}</span>}
+            {cloneSourceName}
+          </span>
+        ) : (
+          <>
+            <span>{output.resolution.width}×{output.resolution.height}</span>
+            {hz > 0 && <span className="text-zinc-500">@{hz}Hz</span>}
+            {dpi != null && <span className="text-cyan-400">{dpi}%</span>}
+            {rotation != null && rotation !== 0 && (
+              <span className="text-violet-400 font-medium">{rotation}°</span>
+            )}
+          </>
+        )
       ) : (
         <span className="italic">Off</span>
       )}
+      {output.primary && <span className="text-yellow-400 font-bold">★</span>}
     </div>
   );
 }
@@ -164,14 +179,25 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
     () => profile.dpi_scales ? { ...profile.dpi_scales } : {}
   );
   const [audio, setAudio] = useState<AudioSetting[]>(() => JSON.parse(JSON.stringify(profile.audio)));
+  const [displayRotations, setDisplayRotations] = useState<Record<string, number>>(
+    () => profile.display_rotations ? { ...profile.display_rotations } : {}
+  );
+  const [cloneSources, setCloneSources] = useState<Record<string, string>>(
+    () => profile.clone_sources ? { ...profile.clone_sources } : {}
+  );
   const [saving, setSaving] = useState(false);
-  const [modesCache, setModesCache] = useState<Record<string, DisplayMode[] | null>>({});
+  // Pre-populate from saved_modes so offline monitors show their known resolutions immediately.
+  const [modesCache, setModesCache] = useState<Record<string, DisplayMode[] | null>>(
+    () => ({ ...(profile.saved_modes ?? {}) })
+  );
   const [modesOpen, setModesOpen] = useState<string | null>(null);
   const [dpiOpen, setDpiOpen] = useState<string | null>(null);
+  const [cloneOpen, setCloneOpen] = useState<string | null>(null);
 
   async function loadModes(key: string, output: OutputConfig) {
-    if (modesCache[key] !== undefined) return;
-    setModesCache((prev) => ({ ...prev, [key]: null }));
+    // Always try a live query — if it succeeds, update the cache (even over saved_modes).
+    // If it fails, keep whatever is already in cache (saved_modes fallback).
+    setModesCache((prev) => ({ ...prev, [key]: prev[key] ?? null }));
     try {
       const modes = await api.listDisplayModesForId(output.display_id);
       modes.sort((a, b) =>
@@ -181,7 +207,7 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
       );
       setModesCache((prev) => ({ ...prev, [key]: modes }));
     } catch {
-      setModesCache((prev) => ({ ...prev, [key]: [] }));
+      // Live query failed (monitor offline) — saved_modes already in cache, keep it.
     }
   }
 
@@ -234,10 +260,25 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
     });
   }
 
+  /** Ensure cloned outputs share the same position/resolution as their source. */
+  function syncClonePositions(l: Layout): Layout {
+    return {
+      ...l,
+      outputs: l.outputs.map(o => {
+        const key = displayKey(o.display_id);
+        const srcKey = cloneSources[key];
+        if (!srcKey) return o;
+        const src = l.outputs.find(s => displayKey(s.display_id) === srcKey);
+        if (!src) return o;
+        return { ...o, position: src.position, resolution: src.resolution };
+      }),
+    };
+  }
+
   async function save() {
     setSaving(true);
     try {
-      await api.updateProfile(profile.name, normalizeLayout(layout), dpiScales, audio);
+      await api.updateProfile(profile.name, normalizeLayout(syncClonePositions(layout)), dpiScales, audio, displayRotations, cloneSources);
       toast.success(`Profile "${profile.name}" updated`);
       onSaved();
     } catch (err) {
@@ -263,6 +304,8 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
         <LayoutCanvas
           draft={layout}
           displays={snapshot.displays}
+          rotations={displayRotations}
+          clonePairs={cloneSources}
           onDraftChange={setLayout}
           height={320}
         />
@@ -279,111 +322,159 @@ function EditPanel({ profile, snapshot, audioDevices, onClose, onSaved }, ref) {
             const hz = Math.round(output.refresh_rate_mhz / 1000);
             const currentDpi = dpiScales[key];
             const modes = modesCache[key];
+            const active = output.enabled || output.primary;
 
             return (
-              <div key={key} className={`flex flex-wrap items-center gap-2 rounded border px-3 py-2 text-xs ${
-                output.enabled || output.primary ? "border-zinc-700 bg-zinc-800/40" : "border-zinc-800 bg-zinc-900/30 opacity-60"
+              <div key={key} className={`rounded-lg border p-3 transition-colors ${
+                active ? "border-zinc-700 bg-zinc-900" : "border-zinc-800 bg-zinc-900/50 opacity-60"
               }`}>
-                <Monitor size={12} className={output.enabled || output.primary ? "text-blue-400" : "text-zinc-600"} />
-                <span className="font-mono text-zinc-500">#{num}</span>
-                <span className="font-medium text-zinc-300 flex-1 truncate">{name}</span>
-
-                {/* Primary star */}
-                {output.primary ? (
-                  <button
-                    disabled
-                    className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium border border-yellow-600/60 bg-yellow-900/30 text-yellow-300 cursor-default"
-                  >
-                    ★ Primary
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => setPrimary(key)}
-                    className="px-2 py-1 rounded text-[10px] font-medium border border-zinc-700 text-zinc-500 hover:border-yellow-600/60 hover:text-yellow-400 transition-colors"
-                  >
-                    ☆
-                  </button>
-                )}
-
-                {/* Active toggle — hidden for primary (always enabled) */}
-                {!output.primary && (
-                  <button
-                    onClick={() => toggleEnabled(key)}
-                    className={`px-2 py-1 rounded text-[10px] font-medium border transition-colors ${
-                      output.enabled
-                        ? "bg-blue-700/50 border-blue-600 text-blue-200 hover:bg-red-900/50 hover:border-red-700 hover:text-red-300"
-                        : "bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-green-900/40 hover:border-green-700 hover:text-green-300"
-                    }`}
-                  >
-                    {output.enabled ? "Enabled" : "Disabled"}
-                  </button>
-                )}
-
-                {(output.enabled || output.primary) && (
-                  <>
-                    {/* DPI */}
-                    <div className="relative">
-                      <button
-                        onClick={() => {
-                          setDpiOpen(dpiOpen === key ? null : key);
-                          setModesOpen(null);
-                        }}
-                        className="flex items-center gap-1 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-1 transition-colors text-zinc-400 hover:text-zinc-200 whitespace-nowrap"
-                      >
-                        {currentDpi != null ? `${currentDpi}% DPI` : "DPI"}
-                        <ChevronDown size={9} className={`transition-transform ${dpiOpen === key ? "rotate-180" : ""}`} />
-                      </button>
-                      {dpiOpen === key && (
-                        <div className="absolute left-0 top-full mt-1 z-50 w-28 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-52">
-                          {DPI_OPTIONS.map((opt) => (
-                            <button key={opt.value} onClick={() => setDpi(key, opt.value)}
-                              className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${opt.value === currentDpi ? "text-blue-400 font-medium" : "text-zinc-300"}`}>
-                              {opt.label}
-                            </button>
-                          ))}
-                        </div>
-                      )}
+                <div className="flex items-start gap-3">
+                  {/* Left: icon + info (mirrors DisplaysTab layout at ~80%) */}
+                  <div className="flex items-start gap-2 flex-1 min-w-0">
+                    <Monitor size={16} className={`mt-0.5 shrink-0 ${active ? "text-blue-400" : "text-zinc-600"}`} />
+                    <div className="min-w-0">
+                      <div className="font-medium text-xs flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[10px] text-zinc-500 font-mono">#{num}</span>
+                        <span className="truncate">{name}</span>
+                        <span className="text-[10px] text-zinc-500 font-mono">{output.display_id.target_id}</span>
+                      </div>
+                      <div className="text-[10px] text-zinc-500 mt-0.5">
+                        {output.resolution.width}×{output.resolution.height} @ {hz} Hz
+                      </div>
                     </div>
+                  </div>
 
-                    {/* Resolution */}
-                    <div className="relative">
-                      <button
-                        onClick={async () => {
-                          const next = modesOpen === key ? null : key;
-                          setModesOpen(next);
-                          setDpiOpen(null);
-                          if (next) await loadModes(key, output);
-                        }}
-                        className="flex items-center gap-1 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-1 transition-colors text-zinc-400 hover:text-zinc-200 whitespace-nowrap"
-                      >
-                        {output.resolution.width}×{output.resolution.height}{hz > 0 ? ` @${hz}Hz` : ""}
-                        <ChevronDown size={9} className={`transition-transform ${modesOpen === key ? "rotate-180" : ""}`} />
-                      </button>
-                      {modesOpen === key && (
-                        <div className="absolute right-0 top-full mt-1 z-50 w-44 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-56">
-                          {modes == null ? (
-                            <div className="px-3 py-2 text-xs text-zinc-500">Loading…</div>
-                          ) : modes.length === 0 ? (
-                            <div className="px-3 py-2 text-xs text-zinc-500">No modes</div>
-                          ) : (
-                            modes.map((m, i) => {
-                              const active =
-                                m.width === output.resolution.width &&
-                                m.height === output.resolution.height &&
-                                m.refresh_rate_hz === hz;
-                              return (
-                                <button key={i} onClick={() => setResolution(key, m)}
-                                  className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${active ? "text-blue-400 font-medium" : "text-zinc-300"}`}>
-                                  {m.width}×{m.height} @{m.refresh_rate_hz}Hz
+                  {/* Middle: DPI+Res (row1) / Extended+Rotation (row2) — only when active */}
+                  {active && (() => {
+                    const isMirror = !!cloneSources[key];
+                    return (
+                    <div className="flex flex-col gap-1 shrink-0">
+                      {/* Row 1: DPI + Resolution — replaced by warning for mirrors */}
+                      {isMirror ? (
+                        <button
+                          onClick={() => {/* future: show resolution compatibility popup */}}
+                          className="flex items-center gap-1 text-[10px] border border-amber-600/60 bg-amber-950/40 text-amber-400 hover:bg-amber-950/70 rounded px-1.5 py-0.5 transition-colors"
+                        >
+                          <AlertTriangle size={10} className="shrink-0" />
+                          Check valid shared resolutions!
+                        </button>
+                      ) : (
+                      <div className="flex items-center gap-1.5">
+                        {/* DPI */}
+                        <div className="relative">
+                          <button onClick={() => { setDpiOpen(dpiOpen === key ? null : key); setModesOpen(null); setCloneOpen(null); }}
+                            className="flex items-center gap-0.5 border border-zinc-700 hover:border-zinc-500 rounded px-1.5 py-0.5 text-[10px] transition-colors text-zinc-400 hover:text-zinc-200 whitespace-nowrap">
+                            {currentDpi != null ? `${currentDpi}% DPI` : "DPI"}
+                            <ChevronDown size={8} className={`transition-transform ${dpiOpen === key ? "rotate-180" : ""}`} />
+                          </button>
+                          {dpiOpen === key && (
+                            <div className="absolute left-0 top-full mt-1 z-50 w-28 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-52">
+                              {DPI_OPTIONS.map((opt) => (
+                                <button key={opt.value} onClick={() => setDpi(key, opt.value)}
+                                  className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${opt.value === currentDpi ? "text-blue-400 font-medium" : "text-zinc-300"}`}>
+                                  {opt.label}
                                 </button>
-                              );
-                            })
+                              ))}
+                            </div>
                           )}
                         </div>
+                        {/* Resolution */}
+                        <div className="relative">
+                          <button onClick={async () => { const next = modesOpen === key ? null : key; setModesOpen(next); setDpiOpen(null); setCloneOpen(null); if (next) await loadModes(key, output); }}
+                            className="flex items-center gap-0.5 border border-zinc-700 hover:border-zinc-500 rounded px-1.5 py-0.5 text-[10px] transition-colors text-zinc-400 hover:text-zinc-200 whitespace-nowrap">
+                            {output.resolution.width}×{output.resolution.height}{hz > 0 ? ` @${hz}Hz` : ""}
+                            <ChevronDown size={8} className={`transition-transform ${modesOpen === key ? "rotate-180" : ""}`} />
+                          </button>
+                          {modesOpen === key && (
+                            <div className="absolute right-0 top-full mt-1 z-50 w-44 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl overflow-y-auto max-h-56">
+                              {modes == null ? <div className="px-3 py-2 text-xs text-zinc-500">Loading…</div>
+                              : modes.length === 0 ? <div className="px-3 py-2 text-xs text-zinc-500">No modes</div>
+                              : modes.map((m, i) => {
+                                const isCurrent = m.width === output.resolution.width && m.height === output.resolution.height && m.refresh_rate_hz === hz;
+                                return (
+                                  <button key={i} onClick={() => setResolution(key, m)}
+                                    className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${isCurrent ? "text-blue-400 font-medium" : "text-zinc-300"}`}>
+                                    {m.width}×{m.height} @{m.refresh_rate_hz}Hz
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      </div>
                       )}
+                      {/* Row 2: Extended picker always shown; Rotation hidden for mirrors */}
+                      <div className="flex items-center gap-1.5">
+                        <div className="relative">
+                          {(() => {
+                            const srcOut = cloneSources[key] ? layout.outputs.find(o => displayKey(o.display_id) === cloneSources[key]) : undefined;
+                            const srcIdx = srcOut ? (displayIndex(srcOut, snapshot) ?? layout.outputs.indexOf(srcOut) + 1) : undefined;
+                            const srcName = srcOut ? friendlyName(srcOut, snapshot) : undefined;
+                            return (
+                              <>
+                                <button onClick={() => { setCloneOpen(cloneOpen === key ? null : key); setDpiOpen(null); setModesOpen(null); }}
+                                  className={`flex items-center gap-0.5 text-[10px] border rounded px-1.5 py-0.5 transition-colors ${cloneSources[key] ? "border-green-600 text-green-300 bg-green-900/20 hover:bg-green-900/40" : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"}`}>
+                                  {cloneSources[key] ? `Mirrors: #${srcIdx} ${srcName}` : "Extended"}
+                                  <ChevronDown size={8} className={`transition-transform ${cloneOpen === key ? "rotate-180" : ""}`} />
+                                </button>
+                                {cloneOpen === key && (
+                                  <div className="absolute left-0 top-full mt-1 z-50 w-52 rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl">
+                                    <button onClick={() => { setCloneSources(p => { const n = {...p}; delete n[key]; return n; }); setCloneOpen(null); }}
+                                      className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${!cloneSources[key] ? "text-blue-400 font-medium" : "text-zinc-300"}`}>
+                                      Extended (no mirror)
+                                    </button>
+                                    {layout.outputs.filter(o => displayKey(o.display_id) !== key && (o.enabled || o.primary)).map((o, oi) => {
+                                      const oKey = displayKey(o.display_id);
+                                      const oIdx = displayIndex(o, snapshot) ?? oi + 1;
+                                      const oName = friendlyName(o, snapshot) || `Display ${o.display_id.target_id}`;
+                                      return (
+                                        <button key={oKey} onClick={() => { setCloneSources(p => ({...p, [key]: oKey})); setCloneOpen(null); }}
+                                          className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 ${cloneSources[key] === oKey ? "text-green-400 font-medium" : "text-zinc-300"}`}>
+                                          #{oIdx} {oName}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </div>
+                        {!isMirror && (
+                          <div className="flex items-center gap-0.5">
+                            {([0, 90, 180, 270] as const).map(deg => (
+                              <button key={deg}
+                                onClick={() => setDisplayRotations(p => deg === 0 ? (({ [key]: _, ...rest }) => rest)(p) : {...p, [key]: deg})}
+                                className={`flex items-center justify-center w-6 h-5 rounded text-[9px] border transition-colors ${(displayRotations[key] ?? 0) === deg ? "bg-purple-900/40 border-purple-600 text-purple-300" : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"}`}>
+                                {deg}°
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  </>
-                )}
+                    );
+                  })()}
+
+                  {/* Right: Primary ★ + Enabled/Disabled toggle */}
+                  <div className="flex flex-col gap-1 items-end shrink-0">
+                    {output.primary ? (
+                      <button disabled className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium bg-yellow-900/40 text-yellow-300 border border-yellow-700 cursor-default">★ Primary</button>
+                    ) : (
+                      <button onClick={() => setPrimary(key)} disabled={!active} className="flex items-center gap-1 px-2 py-1 rounded text-[10px] text-zinc-400 hover:text-yellow-300 border border-zinc-700 hover:border-yellow-600 transition-colors disabled:opacity-40">☆ Primary</button>
+                    )}
+                    {!output.primary && (
+                      <button onClick={() => toggleEnabled(key)}
+                        className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium border transition-colors ${
+                          output.enabled
+                            ? "bg-blue-900/40 text-blue-300 border-blue-800 hover:bg-red-900/40 hover:border-red-800 hover:text-red-300"
+                            : "bg-zinc-800/60 text-zinc-400 border-zinc-700 hover:bg-green-900/30 hover:border-green-800 hover:text-green-300"
+                        }`}>
+                        {output.enabled ? "Enabled" : "Disabled"}
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
             );
           })}
@@ -464,7 +555,14 @@ function ProfileCard({ profile, snapshot, audioDevices, busy, onApply, onDelete,
               const key = displayKey(output.display_id);
               const dpi = profile.dpi_scales?.[key];
               const name = profile.display_names?.[key];
-              return <MonitorCard key={key} output={output} index={num} dpi={dpi} name={name} />;
+              const rotation = profile.display_rotations?.[key];
+              const cloneKey = profile.clone_sources?.[key];
+              const cloneSourceOutput = cloneKey ? profile.layout.outputs.find(o => displayKey(o.display_id) === cloneKey) : undefined;
+              const cloneSourceName = cloneKey
+                ? (profile.display_names?.[cloneKey]?.replace(/ \d+$/, '').trim() ?? `Monitor ${cloneKey.split(':')[1]}`)
+                : undefined;
+              const cloneSourceIndex = cloneSourceOutput ? (displayIndex(cloneSourceOutput, snapshot) ?? profile.layout.outputs.indexOf(cloneSourceOutput) + 1) : undefined;
+              return <MonitorCard key={key} output={output} index={num} dpi={dpi} name={name} rotation={rotation} cloneSourceName={cloneSourceName} cloneSourceIndex={cloneSourceIndex} />;
             })}
           </div>
 

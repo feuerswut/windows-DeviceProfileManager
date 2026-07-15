@@ -21,9 +21,8 @@ use super::win32_types::{luid_to_u64, make_display_id, RawTopologySnapshot, Topo
 const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
 const QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ONLY_ACTIVE_PATHS;
 
-pub(super) fn query_inactive_paths() -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, ManagerError> {
-    let (paths, _) = query_raw(QDC_ALL_PATHS)?;
-    Ok(paths)
+pub(super) fn query_all_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), ManagerError> {
+    query_raw(QDC_ALL_PATHS)
 }
 
 pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
@@ -36,7 +35,13 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
     let mut displays = Vec::<DisplayInfo>::new();
     let mut outputs = Vec::new();
     let mut gdi_names = HashMap::new();
+    let mut rotation_values: HashMap<(u64, u32), u32> = HashMap::new();
+    let mut clone_pairs: HashMap<(u64, u32), (u64, u32)> = HashMap::new();
     let mode_map = modes_by_key(&modes);
+
+    // Track (adapter_high, adapter_low, sourceInfo.id) → first target's (luid, target_id).
+    // If two active paths share the same source slot, the second is a clone of the first.
+    let mut source_slot_to_target: HashMap<(i32, u32, u32), (u64, u32)> = HashMap::new();
 
     for path in &paths {
         if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 {
@@ -47,6 +52,7 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
             path.targetInfo.adapterId.HighPart,
             path.targetInfo.adapterId.LowPart,
         );
+        let target_key_self = (adapter_luid, path.targetInfo.id);
         let (friendly_name, stable_edid_hash) = target_name_and_stable_hash(path)
             .unwrap_or_else(|_| {
                 (format!("Display {}:{}", adapter_luid, path.targetInfo.id), None)
@@ -54,7 +60,19 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
         let display_id = make_display_id(adapter_luid, path.targetInfo.id, stable_edid_hash);
 
         if let Ok(gdi_name) = source_gdi_device_name(path) {
-            gdi_names.insert((adapter_luid, path.targetInfo.id), gdi_name);
+            gdi_names.insert(target_key_self, gdi_name);
+        }
+
+        // Clone detection: two active paths sharing the same (adapterId, sourceInfo.id).
+        let source_slot_key = (
+            path.sourceInfo.adapterId.HighPart,
+            path.sourceInfo.adapterId.LowPart,
+            path.sourceInfo.id,
+        );
+        if let Some(&src_target) = source_slot_to_target.get(&source_slot_key) {
+            clone_pairs.insert(target_key_self, src_target);
+        } else {
+            source_slot_to_target.insert(source_slot_key, target_key_self);
         }
 
         let source_key = (
@@ -81,6 +99,11 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
             .map(target_mode_refresh_mhz)
             .transpose()?
             .unwrap_or(60_000);
+
+        let rotation = rotation_to_degrees(path.targetInfo.rotation);
+        if rotation != 0 {
+            rotation_values.insert(target_key_self, rotation);
+        }
 
         let display_resolution =
             effective_resolution_for_rotation(source_resolution.clone(), path.targetInfo.rotation);
@@ -113,7 +136,16 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
         }
     }
 
-    Ok(TopologySnapshot { raw, layout: Layout { outputs }, displays, gdi_names })
+    Ok(TopologySnapshot { raw, layout: Layout { outputs }, displays, gdi_names, rotation_values, clone_pairs })
+}
+
+fn rotation_to_degrees(rotation: DISPLAYCONFIG_ROTATION) -> u32 {
+    match rotation.0 {
+        2 => 90,
+        3 => 180,
+        4 => 270,
+        _ => 0,
+    }
 }
 
 fn effective_resolution_for_rotation(

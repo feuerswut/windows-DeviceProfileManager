@@ -30,6 +30,16 @@ pub struct KaiserProfile {
     /// Friendly display names captured at save time. Key = "adapter_luid:target_id", value = Windows friendly name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub display_names: HashMap<String, String>,
+    /// Per-monitor rotation in degrees (0, 90, 180, 270). Key = "adapter_luid:target_id".
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub display_rotations: HashMap<String, u32>,
+    /// Clone relationships. Key = "luid:tid" (clone), value = "luid:tid" (source).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub clone_sources: HashMap<String, String>,
+    /// Known valid display modes per monitor. Key = "adapter_luid:target_id".
+    /// Captured at save time and used as fallback when a monitor is offline.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub saved_modes: HashMap<String, Vec<crate::resolution::DisplayMode>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,8 +169,11 @@ impl ConfigStore for KaiserConfigStore {
             let audio = existing_kp.map(|kp| kp.audio.clone()).unwrap_or_default();
             let dpi_scales = existing_kp.map(|kp| kp.dpi_scales.clone()).unwrap_or_default();
             let display_names = existing_kp.map(|kp| kp.display_names.clone()).unwrap_or_default();
+            let display_rotations = existing_kp.map(|kp| kp.display_rotations.clone()).unwrap_or_default();
+            let clone_sources = existing_kp.map(|kp| kp.clone_sources.clone()).unwrap_or_default();
+            let saved_modes = existing_kp.map(|kp| kp.saved_modes.clone()).unwrap_or_default();
             names.push(profile.name.clone());
-            profiles.push(KaiserProfile { layout, audio, dpi_scales, display_names });
+            profiles.push(KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes });
         }
         let kaiser = KaiserConfig {
             profiles,

@@ -6,7 +6,13 @@ use state::AppState;
 use tauri::Manager;
 
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // dev builds: TRACE so all frontend command traces + apply pipeline debug are visible.
+    // release builds: INFO only.
+    #[cfg(debug_assertions)]
+    let default_level = "trace,tao=warn,wry=warn,tauri=warn";
+    #[cfg(not(debug_assertions))]
+    let default_level = "info";
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 
     tauri::Builder::default()
         .setup(|app| {
@@ -37,6 +43,9 @@ pub fn run() {
             commands::get_display_dpi_cmd,
             commands::set_display_dpi_cmd,
             commands::update_profile,
+            commands::set_display_rotation,
+            commands::set_clone_source,
+            commands::refresh_backend,
             commands::frontend_log,
         ])
         .run(tauri::generate_context!())

@@ -65,6 +65,12 @@ export interface ProfileDto {
   dpi_scales?: Record<string, number>;
   /** Friendly display names captured at save time, keyed by "adapter_luid:target_id" */
   display_names?: Record<string, string>;
+  /** Per-monitor rotation in degrees (0/90/180/270), keyed by "adapter_luid:target_id" */
+  display_rotations?: Record<string, number>;
+  /** Clone relationships: "luid:tid" (clone) → "luid:tid" (source) */
+  clone_sources?: Record<string, string>;
+  /** Known display modes captured at save time, keyed by "adapter_luid:target_id" */
+  saved_modes?: Record<string, DisplayMode[]>;
 }
 
 export interface SnapshotDto {
@@ -77,6 +83,10 @@ export interface SnapshotDto {
   gdi_names: Record<string, string>;
   /** Current DPI scaling percentages keyed by "adapter_luid:target_id". */
   dpi_values: Record<string, number>;
+  /** Current rotation in degrees (0/90/180/270) keyed by "adapter_luid:target_id". Absent = 0°. */
+  rotation_values: Record<string, number>;
+  /** Clone relationships: "luid:tid" (clone) → "luid:tid" (source). */
+  clone_pairs: Record<string, string>;
 }
 
 export interface DisplayMode {

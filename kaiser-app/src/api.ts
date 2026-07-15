@@ -106,7 +106,31 @@ export const api = {
     layout: import("./types").Layout,
     dpiScales: Record<string, number>,
     audio: import("./types").AudioSetting[],
+    displayRotations: Record<string, number>,
+    cloneSources: Record<string, string>,
   ): Promise<void> {
-    return inv("update_profile", { name, layout, dpiScales, audio });
+    return inv("update_profile", { name, layout, dpiScales, audio, displayRotations, cloneSources });
+  },
+
+  /** Set rotation for a single active display (0, 90, 180, 270 degrees). */
+  setDisplayRotation(adapterLuid: number, targetId: number, degrees: number): Promise<void> {
+    return inv("set_display_rotation", { adapterLuid, targetId, degrees });
+  },
+
+  /** Set clone source for a display. Pass srcAdapterLuid=0, srcTargetId=0 to remove cloning. */
+  setCloneSource(
+    cloneAdapterLuid: number,
+    cloneTargetId: number,
+    srcAdapterLuid: number,
+    srcTargetId: number,
+  ): Promise<void> {
+    return inv("set_clone_source", {
+      cloneAdapterLuid, cloneTargetId, srcAdapterLuid, srcTargetId,
+    });
+  },
+
+  /** Invalidate the backend display snapshot, forcing a fresh Windows query. */
+  refreshBackend(): Promise<void> {
+    return inv("refresh_backend");
   },
 };

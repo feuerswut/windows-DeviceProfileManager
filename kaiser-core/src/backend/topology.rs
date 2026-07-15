@@ -19,6 +19,10 @@ struct BackendCache {
     last_snapshot: Option<TopologySnapshot>,
     last_color_state_signature: Option<String>,
     sdr_gamma_cache: HashMap<GammaRampKey, GammaRampWords>,
+    /// Rotation/clone to apply between deactivation (step 4) and resolution (step 5).
+    /// Set from apply_profile before calling apply_layout; consumed in try_apply_once.
+    pending_rotations: HashMap<(u64, u32), u32>,
+    pending_clones: HashMap<(u64, u32), (u64, u32)>,
 }
 
 impl BackendCache {
@@ -27,6 +31,8 @@ impl BackendCache {
             last_snapshot: None,
             last_color_state_signature: None,
             sdr_gamma_cache: HashMap::new(),
+            pending_rotations: HashMap::new(),
+            pending_clones: HashMap::new(),
         }
     }
 }
@@ -110,6 +116,47 @@ impl KaiserBackend {
     pub fn invalidate_snapshot(&self) {
         let mut cache = self.cache.lock().unwrap();
         cache.last_snapshot = None;
+    }
+
+    /// Set rotation and clone data to be applied (in order) between step 4 and step 5
+    /// of the next apply_layout call. Cleared automatically after the apply completes.
+    pub fn set_pending_display_ops(
+        &self,
+        rotations: HashMap<(u64, u32), u32>,
+        clones: HashMap<(u64, u32), (u64, u32)>,
+    ) {
+        log::debug!("set_pending_display_ops: rotations={:?} clones={:?}", rotations, clones);
+        let mut cache = self.cache.lock().unwrap();
+        cache.pending_rotations = rotations;
+        cache.pending_clones = clones;
+    }
+
+    pub fn clear_pending_display_ops(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.pending_rotations.clear();
+        cache.pending_clones.clear();
+    }
+
+    fn get_pending_display_ops(&self) -> (HashMap<(u64, u32), u32>, HashMap<(u64, u32), (u64, u32)>) {
+        let cache = self.cache.lock().unwrap();
+        let r = cache.pending_rotations.clone();
+        let c = cache.pending_clones.clone();
+        log::debug!("get_pending_display_ops: rotations={:?} clones={:?}", r, c);
+        (r, c)
+    }
+
+    pub fn get_rotation_values(&self) -> HashMap<(u64, u32), u32> {
+        let cache = self.cache.lock().unwrap();
+        cache.last_snapshot.as_ref()
+            .map(|s| s.rotation_values.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn get_clone_pairs(&self) -> HashMap<(u64, u32), (u64, u32)> {
+        let cache = self.cache.lock().unwrap();
+        cache.last_snapshot.as_ref()
+            .map(|s| s.clone_pairs.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -200,11 +247,6 @@ impl DisplayBackend for KaiserBackend {
     fn apply_layout(&self, layout: Layout) -> Result<(), ManagerError> {
         self.ensure_snapshot()?;
 
-        let snapshot = {
-            let cache = self.cache.lock().unwrap();
-            cache.last_snapshot.as_ref().unwrap().clone()
-        };
-
         let any_enabled = layout.outputs.iter().any(|o| o.enabled);
         if !any_enabled {
             return Err(ManagerError::Backend(
@@ -213,10 +255,9 @@ impl DisplayBackend for KaiserBackend {
         }
 
         log::info!(
-            "KaiserBackend: applying layout ({} outputs, {} enabled, {} raw paths cached)",
+            "KaiserBackend: applying layout ({} outputs, {} enabled)",
             layout.outputs.len(),
             layout.outputs.iter().filter(|o| o.enabled).count(),
-            snapshot.raw.paths.len(),
         );
 
         let sdr_cache = {
@@ -224,18 +265,81 @@ impl DisplayBackend for KaiserBackend {
             cache.sdr_gamma_cache.clone()
         };
 
-        let next_snapshot = match super::apply::apply_layout_against_snapshot(&layout, &snapshot) {
-            Ok(s) => s,
-            Err(ref e) if is_set_display_invalid_parameter(e) => {
+        // Retry loop: keep attempting until the active topology matches the desired
+        // layout or we exhaust all attempts. Windows topology changes are async and
+        // may require multiple passes to fully settle.
+        const MAX_ATTEMPTS: u32 = 6;
+        let mut last_err: Option<ManagerError> = None;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                log::info!("KaiserBackend: retry attempt {}/{}", attempt, MAX_ATTEMPTS - 1);
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+            }
+
+            // Always use the freshest cached snapshot for each attempt.
+            let snapshot = {
+                let cache = self.cache.lock().unwrap();
+                cache.last_snapshot.as_ref().unwrap().clone()
+            };
+
+            let result = self.try_apply_once(&layout, &snapshot);
+
+            match result {
+                Ok(next_snapshot) => {
+                    if super::apply::verify_layout_applied(&layout, &next_snapshot) {
+                        log::info!("KaiserBackend: layout verified on attempt {}", attempt + 1);
+                        self.persist_snapshot(&next_snapshot);
+                        let _ = reapply_color_calibration_for_active_with_cached_sdr(&sdr_cache);
+                        self.refresh_snapshot(next_snapshot);
+                        return Ok(());
+                    }
+                    log::warn!(
+                        "KaiserBackend: apply attempt {} returned Ok but verification failed — will retry",
+                        attempt + 1
+                    );
+                    self.refresh_snapshot(next_snapshot);
+                    last_err = Some(ManagerError::Backend(
+                        "topology verification failed after apply".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    log::error!("KaiserBackend: apply attempt {} failed: {e}", attempt + 1);
+                    // Refresh snapshot so the next attempt sees current state.
+                    if let Ok(fresh) = query_active_topology() {
+                        self.refresh_snapshot(fresh);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            ManagerError::Backend("apply failed after all attempts".to_string())
+        }))
+    }
+
+}
+
+impl KaiserBackend {
+    /// Single attempt: two-phase apply → inactive-attach fallback → extend+retry.
+    fn try_apply_once(
+        &self,
+        layout: &Layout,
+        snapshot: &TopologySnapshot,
+    ) -> Result<TopologySnapshot, ManagerError> {
+        let (pending_rotations, pending_clones) = self.get_pending_display_ops();
+        match super::apply::apply_layout_against_snapshot(layout, snapshot, &pending_rotations, &pending_clones) {
+            Ok(s) => Ok(s),
+            Err(e) => {
                 log::error!(
-                    "KaiserBackend: SetDisplayConfig error 87; \
-                     trying inactive-path attach fallback (PS-style)"
+                    "KaiserBackend: main apply failed ({e}); trying inactive-path attach fallback"
                 );
                 let active = query_active_topology()?;
-                match super::apply::try_attach_inactive_for_layout(&layout, &active) {
+                match super::apply::try_attach_inactive_for_layout(layout, &active) {
                     Ok(s) => {
                         log::info!("KaiserBackend: inactive-path attach succeeded");
-                        s
+                        Ok(s)
                     }
                     Err(attach_err) => {
                         log::error!(
@@ -243,19 +347,13 @@ impl DisplayBackend for KaiserBackend {
                              trying topology extend as last resort"
                         );
                         force_topology_extend()?;
-                        std::thread::sleep(std::time::Duration::from_millis(700));
+                        std::thread::sleep(std::time::Duration::from_millis(900));
                         let recovered = query_active_topology()?;
-                        super::apply::apply_layout_against_snapshot(&layout, &recovered)?
+                        super::apply::apply_layout_against_snapshot(layout, &recovered, &pending_rotations, &pending_clones)
                     }
                 }
             }
-            Err(e) => return Err(e),
-        };
-
-        self.persist_snapshot(&next_snapshot);
-        let _ = reapply_color_calibration_for_active_with_cached_sdr(&sdr_cache);
-        self.refresh_snapshot(next_snapshot);
-        Ok(())
+        }
     }
 }
 
@@ -371,10 +469,6 @@ fn raw_covers_active_outputs(raw: &RawTopologySnapshot, layout: &Layout) -> bool
                 && path.targetInfo.id == output.display_id.target_id
         })
     })
-}
-
-fn is_set_display_invalid_parameter(error: &ManagerError) -> bool {
-    matches!(error, ManagerError::Backend(msg) if msg.contains("SetDisplayConfig failed: 87"))
 }
 
 pub fn kaiser_data_dir() -> PathBuf {

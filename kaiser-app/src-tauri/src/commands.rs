@@ -7,6 +7,8 @@ use kaiser_core::{
     get_display_dpi, set_display_dpi, set_display_mode as core_set_display_mode, AudioDevice,
     AudioFlow, AudioSetting, DisplayMode, KaiserConfigStore, KaiserProfile, SharedKaiserBackend,
 };
+#[cfg(target_os = "windows")]
+use kaiser_core::{apply_clone_source, apply_display_rotation};
 use monarch::{DisplayId, DisplayInfo, Layout, Profile};
 
 use crate::state::AppState;
@@ -130,10 +132,13 @@ pub struct SnapshotDto {
     pub pending_confirmation: bool,
     pub pending_confirmation_remaining_secs: Option<f64>,
     /// GDI device names keyed as "LUID:TID" strings (avoids u64 JSON precision issues).
-    /// Only present for active displays.
     pub gdi_names: HashMap<String, String>,
-    /// Current DPI scaling percentages keyed by "LUID:TID". Only present for active displays.
+    /// Current DPI scaling percentages keyed by "LUID:TID".
     pub dpi_values: HashMap<String, u32>,
+    /// Current rotation in degrees (0/90/180/270) keyed by "LUID:TID". Absent = 0°.
+    pub rotation_values: HashMap<String, u32>,
+    /// Clone relationships: "LUID:TID" (clone) → "LUID:TID" (source).
+    pub clone_pairs: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -145,6 +150,35 @@ pub struct ProfileDto {
     pub dpi_scales: HashMap<String, u32>,
     /// Friendly display names captured at save time, keyed by "adapter_luid:target_id"
     pub display_names: HashMap<String, String>,
+    /// Per-monitor rotation in degrees (0/90/180/270) keyed by "adapter_luid:target_id"
+    pub display_rotations: HashMap<String, u32>,
+    /// Clone relationships: "luid:tid" (clone) → "luid:tid" (source)
+    pub clone_sources: HashMap<String, String>,
+    /// Known valid display modes per monitor, keyed by "adapter_luid:target_id"
+    pub saved_modes: HashMap<String, Vec<DisplayMode>>,
+}
+
+/// Deduplicate outputs by target_id (prefer enabled over disabled) and strip
+/// `primary` from any output that is not enabled. Fixes profiles corrupted by
+/// sync adding duplicate entries or by stale in-memory layouts.
+fn sanitize_layout(layout: Layout) -> Layout {
+    use std::collections::HashSet;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut outputs = Vec::new();
+    // Enabled outputs first so they "win" the dedup over disabled ones.
+    for o in layout.outputs.iter().filter(|o| o.enabled) {
+        if seen.insert(o.display_id.target_id) {
+            outputs.push(o.clone());
+        }
+    }
+    for o in layout.outputs.iter().filter(|o| !o.enabled) {
+        if seen.insert(o.display_id.target_id) {
+            let mut o = o.clone();
+            o.primary = false; // disabled outputs cannot be primary
+            outputs.push(o);
+        }
+    }
+    Layout { outputs }
 }
 
 fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
@@ -152,15 +186,20 @@ fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
     let audio = kp.as_ref().map(|k| k.audio.clone()).unwrap_or_default();
     let dpi_scales = kp.as_ref().map(|k| k.dpi_scales.clone()).unwrap_or_default();
     let display_names = kp.as_ref().map(|k| k.display_names.clone()).unwrap_or_default();
-    // Kaiser config layout is authoritative (may be user-edited); fall back to Monarch's
-    let layout = kp.map(|k| k.layout).unwrap_or_else(|| profile.layout.clone());
-    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names }
+    let display_rotations = kp.as_ref().map(|k| k.display_rotations.clone()).unwrap_or_default();
+    let clone_sources = kp.as_ref().map(|k| k.clone_sources.clone()).unwrap_or_default();
+    let saved_modes = kp.as_ref().map(|k| k.saved_modes.clone()).unwrap_or_default();
+    let layout = kp
+        .map(|k| sanitize_layout(k.layout))
+        .unwrap_or_else(|| profile.layout.clone());
+    ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes }
 }
 
 // ---- Display commands ---------------------------------------------------
 
 #[tauri::command]
 pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
+    log::trace!("→ get_snapshot");
     let mut manager = state.manager.lock().unwrap();
     // Auto-rollback if the confirmation window expired (acts as the daemon heartbeat).
     if let Ok(true) = manager.rollback_if_confirmation_expired() {
@@ -214,7 +253,17 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
         })
         .collect();
 
-    log::debug!("get_snapshot: {} displays, {} gdi_names", displays.len(), gdi_names.len());
+    let rotation_values: HashMap<String, u32> = state.backend.get_rotation_values()
+        .into_iter()
+        .map(|((luid, tid), deg)| (format!("{luid}:{tid}"), deg))
+        .collect();
+
+    let clone_pairs: HashMap<String, String> = state.backend.get_clone_pairs()
+        .into_iter()
+        .map(|((cl, ct), (sl, st))| (format!("{cl}:{ct}"), format!("{sl}:{st}")))
+        .collect();
+
+    log::trace!("get_snapshot: {} displays, {} gdi_names", displays.len(), gdi_names.len());
 
     let snapshot = SnapshotDto {
         displays,
@@ -224,6 +273,8 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
         pending_confirmation_remaining_secs: remaining,
         gdi_names,
         dpi_values,
+        rotation_values,
+        clone_pairs,
     };
 
     // Release manager lock before file I/O, then sync any newly connected displays.
@@ -264,10 +315,13 @@ fn sync_new_displays_to_profiles(
 
         for live_out in live_layout.outputs.iter().filter(|o| o.enabled) {
             let in_profile = kp.layout.outputs.iter().any(|o| {
-                match (o.display_id.edid_hash, live_out.display_id.edid_hash) {
-                    (Some(h1), Some(h2)) => h1 == h2,
-                    _ => o.display_id.target_id == live_out.display_id.target_id,
-                }
+                // Check edid_hash first; always fall back to target_id so virtual
+                // displays with unstable EDIDs (e.g. VDD) don't produce duplicates.
+                let hash_match = matches!(
+                    (o.display_id.edid_hash, live_out.display_id.edid_hash),
+                    (Some(h1), Some(h2)) if h1 == h2
+                );
+                hash_match || o.display_id.target_id == live_out.display_id.target_id
             });
             if !in_profile {
                 let mut new_out = live_out.clone();
@@ -290,12 +344,14 @@ fn sync_new_displays_to_profiles(
 
 #[tauri::command]
 pub fn list_displays(state: State<AppState>) -> Result<Vec<DisplayInfo>, String> {
+    log::trace!("→ list_displays");
     let manager = state.manager.lock().unwrap();
     manager.list_displays().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn toggle_display(display_id: DisplayId, state: State<AppState>) -> Result<(), String> {
+    log::trace!("→ toggle_display {:?}", display_id);
     let mut manager = state.manager.lock().unwrap();
     let resolved = resolve_display_id(&display_id, &manager);
     log::info!(
@@ -309,6 +365,7 @@ pub fn toggle_display(display_id: DisplayId, state: State<AppState>) -> Result<(
 
 #[tauri::command]
 pub fn apply_layout(layout: Layout, state: State<AppState>) -> Result<(), String> {
+    log::trace!("→ apply_layout {} outputs", layout.outputs.len());
     let mut manager = state.manager.lock().unwrap();
     let layout = fix_layout_display_ids(layout, &manager);
     log::info!(
@@ -347,9 +404,10 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
         }
     };
 
-    // Auto-capture per-monitor DPI and friendly names for all active outputs
+    // Auto-capture per-monitor DPI, friendly names, and display modes for active outputs
     let mut dpi_scales: HashMap<String, u32> = HashMap::new();
     let mut display_names: HashMap<String, String> = HashMap::new();
+    let mut saved_modes_new: HashMap<String, Vec<DisplayMode>> = HashMap::new();
     {
         let manager = state.manager.lock().unwrap();
         let displays = manager.list_displays().unwrap_or_default();
@@ -364,15 +422,36 @@ pub fn save_profile(name: String, state: State<AppState>) -> Result<(), String> 
                 d.id.adapter_luid == o.display_id.adapter_luid
                     && d.id.target_id == o.display_id.target_id
             }) {
-                display_names.insert(key, d.friendly_name.clone());
+                display_names.insert(key.clone(), d.friendly_name.clone());
+            }
+            // Capture available modes for this display while it's active
+            if let Some(gdi_name) = state.backend.get_gdi_name(o.display_id.adapter_luid, o.display_id.target_id) {
+                match kaiser_core::list_display_modes(&gdi_name) {
+                    Ok(mut modes) => {
+                        modes.sort_by(|a, b|
+                            b.width.cmp(&a.width)
+                                .then(b.height.cmp(&a.height))
+                                .then(b.refresh_rate_hz.cmp(&a.refresh_rate_hz))
+                        );
+                        log::info!("save_profile: captured {} modes for {key}", modes.len());
+                        saved_modes_new.insert(key, modes);
+                    }
+                    Err(e) => log::warn!("save_profile: list_display_modes for {key} failed: {e}"),
+                }
             }
         }
     }
 
     log::info!("save_profile: '{name}' dpi_scales={dpi_scales:?} audio={}", audio.len());
     let store = state.new_store();
+    let existing = store.load_kaiser_profile(&name);
+    let display_rotations = existing.as_ref().map(|kp| kp.display_rotations.clone()).unwrap_or_default();
+    let clone_sources = existing.as_ref().map(|kp| kp.clone_sources.clone()).unwrap_or_default();
+    // Merge: keep saved modes for offline monitors, update with fresh data for active ones
+    let mut saved_modes = existing.as_ref().map(|kp| kp.saved_modes.clone()).unwrap_or_default();
+    saved_modes.extend(saved_modes_new);
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes })
         .map_err(|e| e.to_string())?;
 
     let mut manager = state.manager.lock().unwrap();
@@ -385,6 +464,18 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
     let store = state.new_store();
     let kaiser_profile = store.load_kaiser_profile(&name);
 
+    // Spawn audio on its own thread immediately — it runs concurrently with display work.
+    // AudioManager initialises its own COM apartment, so creating a fresh one is correct.
+    if let Some(ref kp) = kaiser_profile {
+        if !kp.audio.is_empty() {
+            let audio_settings = kp.audio.clone();
+            std::thread::spawn(move || {
+                let mgr = kaiser_core::AudioManager::new();
+                apply_audio_settings(&mgr, &audio_settings);
+            });
+        }
+    }
+
     // Maps stored "luid:tid" DPI keys to the live (luid, tid) after ID remapping.
     let mut dpi_key_remap: HashMap<String, (u64, u32)> = HashMap::new();
 
@@ -393,7 +484,6 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
         if let Some(ref kp) = kaiser_profile {
             let original = kp.layout.clone();
             let remapped = fix_layout_display_ids(kp.layout.clone(), &manager);
-            // Capture old→new luid:tid pairs so DPI can follow the same remap.
             for (old_out, new_out) in original.outputs.iter().zip(remapped.outputs.iter()) {
                 let old_key = format!(
                     "{}:{}",
@@ -404,19 +494,54 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
                     (new_out.display_id.adapter_luid, new_out.display_id.target_id),
                 );
             }
-            manager.apply_layout(remapped).map_err(|e| e.to_string())?;
+
+            // Build (u64,u32)-keyed rotation/clone maps so they can be injected
+            // between deactivation (step 4) and resolution (step 5) in the apply pipeline.
+            #[cfg(target_os = "windows")]
+            {
+                let parse_key = |k: &str| -> Option<(u64, u32)> {
+                    let (ls, ts) = k.split_once(':')?;
+                    Some((ls.parse().ok()?, ts.parse().ok()?))
+                };
+                log::debug!("apply_profile: dpi_key_remap={:?}", dpi_key_remap);
+                log::debug!("apply_profile: raw display_rotations={:?}", kp.display_rotations);
+                log::debug!("apply_profile: raw clone_sources={:?}", kp.clone_sources);
+                let rotations: HashMap<(u64, u32), u32> = kp.display_rotations.iter()
+                    .filter_map(|(k, &d)| {
+                        let live = dpi_key_remap.get(k).copied().or_else(|| parse_key(k));
+                        if live.is_none() {
+                            log::warn!("apply_profile: rotation key '{k}' not found in remap, dropping");
+                        }
+                        Some((live?, d))
+                    })
+                    .collect();
+                let clones: HashMap<(u64, u32), (u64, u32)> = kp.clone_sources.iter()
+                    .filter_map(|(ck, sk)| {
+                        let cl = dpi_key_remap.get(ck).copied().or_else(|| parse_key(ck));
+                        let sl = dpi_key_remap.get(sk).copied().or_else(|| parse_key(sk));
+                        if cl.is_none() { log::warn!("apply_profile: clone key '{ck}' not in remap, dropping"); }
+                        if sl.is_none() { log::warn!("apply_profile: clone src key '{sk}' not in remap, dropping"); }
+                        Some((cl?, sl?))
+                    })
+                    .collect();
+                log::debug!("apply_profile: resolved rotations={:?} clones={:?}", rotations, clones);
+                state.backend.set_pending_display_ops(rotations, clones);
+            }
+
+            manager.apply_layout(remapped).map_err(|e| {
+                #[cfg(target_os = "windows")]
+                state.backend.clear_pending_display_ops();
+                e.to_string()
+            })?;
         } else {
             manager.apply_profile(&name).map_err(|e| e.to_string())?;
         }
+        #[cfg(target_os = "windows")]
+        state.backend.clear_pending_display_ops();
     }
 
     if let Some(kaiser_profile) = kaiser_profile {
-        if !kaiser_profile.audio.is_empty() {
-            let audio = state.audio.lock().unwrap();
-            apply_audio_settings(&audio, &kaiser_profile.audio);
-        }
-
-        // Snapshot current DPI for all outputs we are about to change so revert can undo it.
+        // Snapshot current DPI for rollback.
         let pre_apply_dpi: HashMap<String, u32> = dpi_key_remap
             .values()
             .filter_map(|&(luid, tid)| {
@@ -444,26 +569,51 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
                 log::info!("apply_profile: {key} DPI → {percent}%");
             }
         }
+
+        // Second DPI pass — display topology may still be settling after extend;
+        // re-applying after a short delay ensures the scaling actually sticks.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        log::info!("apply_profile: DPI second pass");
+        for (key, percent) in &kaiser_profile.dpi_scales {
+            let (luid, tid) = if let Some(&(l, t)) = dpi_key_remap.get(key) {
+                (l, t)
+            } else if let Some((ls, ts)) = key.split_once(':') {
+                match (ls.parse::<u64>(), ts.parse::<u32>()) {
+                    (Ok(l), Ok(t)) => (l, t),
+                    _ => continue,
+                }
+            } else {
+                continue;
+            };
+            if let Err(e) = set_display_dpi(luid, tid, *percent) {
+                log::warn!("apply_profile: DPI 2nd pass {key}={percent}% failed: {e}");
+            } else {
+                log::info!("apply_profile: DPI 2nd pass {key} → {percent}%");
+            }
+        }
+
     }
     Ok(())
 }
 
-/// Save edited profile settings (layout, DPI, audio) without applying to the system.
+/// Save edited profile settings (layout, DPI, audio, rotation, clone) without applying.
 #[tauri::command]
 pub fn update_profile(
     name: String,
     layout: Layout,
     dpi_scales: HashMap<String, u32>,
     audio: Vec<AudioSetting>,
+    display_rotations: HashMap<String, u32>,
+    clone_sources: HashMap<String, String>,
     state: State<AppState>,
 ) -> Result<(), String> {
-    log::info!("update_profile: '{name}'");
+    log::info!("update_profile: '{name}' rotations={display_rotations:?}");
     let store = state.new_store();
-    let display_names = store.load_kaiser_profile(&name)
-        .map(|kp| kp.display_names)
-        .unwrap_or_default();
+    let existing = store.load_kaiser_profile(&name);
+    let display_names = existing.as_ref().map(|kp| kp.display_names.clone()).unwrap_or_default();
+    let saved_modes = existing.as_ref().map(|kp| kp.saved_modes.clone()).unwrap_or_default();
     store
-        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names })
+        .save_kaiser_profile(&name, KaiserProfile { layout, audio, dpi_scales, display_names, display_rotations, clone_sources, saved_modes })
         .map_err(|e| e.to_string())
 }
 
@@ -667,6 +817,51 @@ pub fn revert_layout(state: State<AppState>) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+// ---- Rotation & clone ---------------------------------------------------
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn set_display_rotation(
+    adapter_luid: u64,
+    target_id: u32,
+    degrees: u32,
+    state: State<AppState>,
+) -> Result<(), String> {
+    log::info!("set_display_rotation: {adapter_luid}:{target_id} → {degrees}°");
+    apply_display_rotation(adapter_luid, target_id, degrees).map_err(|e| e.to_string())?;
+    state.backend.invalidate_snapshot();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn set_clone_source(
+    clone_adapter_luid: u64,
+    clone_target_id: u32,
+    src_adapter_luid: u64,
+    src_target_id: u32,
+    state: State<AppState>,
+) -> Result<(), String> {
+    log::info!(
+        "set_clone_source: {clone_adapter_luid}:{clone_target_id} mirrors {src_adapter_luid}:{src_target_id}"
+    );
+    apply_clone_source(clone_adapter_luid, clone_target_id, src_adapter_luid, src_target_id)
+        .map_err(|e| e.to_string())?;
+    state.backend.invalidate_snapshot();
+    Ok(())
+}
+
+// ---- Backend refresh ----------------------------------------------------
+
+/// Invalidate the cached display snapshot, forcing a fresh QueryDisplayConfig
+/// on the next backend call. Useful after external topology changes.
+#[tauri::command]
+pub fn refresh_backend(state: State<AppState>) -> Result<(), String> {
+    log::info!("refresh_backend: invalidating snapshot cache");
+    state.backend.invalidate_snapshot();
     Ok(())
 }
 

@@ -15,8 +15,8 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
-    SDC_ALLOW_CHANGES, SDC_APPLY, SDC_NO_OPTIMIZATION, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
-    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG, DISPLAYCONFIG_ROTATION,
 };
 use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC};
 use windows::Win32::System::Com::{
@@ -37,53 +37,306 @@ const GAMMA_RAMP_WORDS: usize = 3 * 256;
 pub(super) type GammaRampKey = (u64, u32);
 pub(super) type GammaRampWords = [u16; GAMMA_RAMP_WORDS];
 
+/// Robust multi-phase apply.
+///
+/// Phase A — Extend (enable all desired monitors)
+///   A1. If any desired monitor is inactive: try SDC_TOPOLOGY_EXTEND first (most
+///       reliable way to bring any connected monitor online), wait for it, then
+///       fall back to targeted phase1 enable for any still-missing targets.
+///   A2. Deactivate unwanted monitors (flag-clear only, retry up to 3×).
+///   A3. Verify topology; log discrepancies.
+///
+/// Phase B — Rotation (before resolution — Windows validates modes against orientation)
+///
+/// Phase C — Resolution / position
+///
+/// Phase D — Clone / mirror (last, after topology + rotation + resolution are stable)
 pub fn apply_layout_against_snapshot(
     desired: &Layout,
     snapshot: &TopologySnapshot,
+    desired_rotations: &HashMap<(u64, u32), u32>,
+    desired_clones: &HashMap<(u64, u32), (u64, u32)>,
 ) -> Result<TopologySnapshot, ManagerError> {
     desired.ensure_valid()?;
     let saved_gamma_ramps = capture_active_gamma_ramps(snapshot);
     let saved_wallpapers = capture_active_wallpapers(snapshot);
     let saved_wallpaper_position = capture_wallpaper_position();
-
     let desired_outputs = desired_output_index(desired);
-    let mut next_paths: Vec<DISPLAYCONFIG_PATH_INFO> = snapshot.raw.paths.clone();
-    let mut next_modes: Vec<DISPLAYCONFIG_MODE_INFO> = snapshot.raw.modes.clone();
-    for path in &mut next_paths {
-        let key = path_target_key(path);
-        let desired_output = desired_outputs.get(&key);
-        let enabled = desired_output.map(|o| o.enabled).unwrap_or(false);
 
-        if enabled {
-            path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+    let desired_active: std::collections::HashSet<(u64, u32)> = desired.outputs.iter()
+        .filter(|o| o.enabled)
+        .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
+        .collect();
+
+    // ── Phase A1: enable all desired-active monitors ──────────────────────────
+    {
+        let cur = super::enumerate::query_active_topology()?;
+        let cur_active = active_keys(&cur.raw.paths);
+        let missing: Vec<(u64, u32)> = desired_active.iter()
+            .filter(|k| !cur_active.contains(*k))
+            .copied()
+            .collect();
+
+        if !missing.is_empty() {
+            log::info!("apply A1: {} desired monitor(s) offline — extending topology first", missing.len());
+
+            // Try SDC_TOPOLOGY_EXTEND first (brings all connected monitors online).
+            if let Err(e) = force_topology_extend() {
+                log::warn!("apply A1: topology extend failed ({e}), trying targeted enable");
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+
+            // Wait for the desired targets to appear.
+            if !wait_for_targets_active(&missing, 8_000) {
+                log::warn!("apply A1: targets still missing after extend — trying phase1 direct enable");
+                let cur2 = super::enumerate::query_active_topology()?;
+                let still_missing: Vec<(u64, u32)> = missing.iter()
+                    .filter(|k| !active_keys(&cur2.raw.paths).contains(*k))
+                    .copied()
+                    .collect();
+                if !still_missing.is_empty() {
+                    match phase1_enable_targets(&still_missing, &cur2.raw.paths, &cur2.raw.modes) {
+                        Ok(()) => { wait_for_targets_active(&still_missing, 8_000); }
+                        Err(e) => log::warn!("apply A1: direct enable also failed: {e}"),
+                    }
+                }
+            } else {
+                log::info!("apply A1: all desired monitors confirmed active");
+            }
         } else {
-            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        }
-
-        if enabled {
-            apply_desired_source_mode(path, &mut next_modes, desired_output);
-            apply_desired_target_refresh(path, desired_output);
+            log::info!("apply A1: all desired monitors already active");
         }
     }
-    reorder_paths_for_desired_priority(&mut next_paths, &desired_outputs);
 
-    unsafe {
-        let exact_flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_NO_OPTIMIZATION;
-        let mut status = SetDisplayConfig(
-            Some(next_paths.as_slice()),
-            Some(next_modes.as_slice()),
-            exact_flags,
-        );
-        if status != 0 {
-            status = SetDisplayConfig(
-                Some(next_paths.as_slice()),
-                Some(next_modes.as_slice()),
+    // ── Phase A1.5: shift source modes so the desired primary lands at (0,0) ──
+    // Required before deactivation — if the current primary (e.g. VDD at 0,0)
+    // is being removed, Windows will reject the config unless a new display is
+    // already normalised to (0,0). Mirrors PS SetPrimaryByName.
+    {
+        let cur = super::enumerate::query_active_topology()?;
+        let paths = cur.raw.paths.clone();
+        let mut modes = cur.raw.modes.clone();
+        if shift_primary_to_origin(&paths, &mut modes, &desired_outputs) {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply A1.5: set_primary SetDisplayConfig → {}", status);
+            if status == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+
+    // ── Phase A2: deactivate unwanted monitors (retry up to 3×) ──────────────
+    for attempt in 0..3u32 {
+        let cur = super::enumerate::query_active_topology()?;
+        let cur_active = active_keys(&cur.raw.paths);
+        let unwanted: Vec<(u64, u32)> = cur_active.iter()
+            .filter(|k| !desired_active.contains(*k))
+            .copied()
+            .collect();
+
+        if unwanted.is_empty() {
+            log::info!("apply A2: no unwanted monitors to deactivate");
+            break;
+        }
+
+        log::info!("apply A2: deactivating {} monitor(s) (attempt {}): {:?}", unwanted.len(), attempt + 1, unwanted);
+
+        let mut paths = cur.raw.paths.clone();
+        let modes = cur.raw.modes.clone();
+        for path in paths.iter_mut() {
+            if unwanted.contains(&path_target_key(path)) {
+                path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+            }
+        }
+        let remaining = paths.iter().filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0).count();
+        if remaining == 0 {
+            return Err(ManagerError::Backend("A2: deactivation would leave 0 active displays".to_string()));
+        }
+
+        let status = unsafe {
+            SetDisplayConfig(
+                Some(paths.as_slice()),
+                Some(modes.as_slice()),
                 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
-            );
+            )
+        };
+        if status == 0 {
+            log::info!("apply A2: deactivation OK ({} active remaining)", remaining);
+            break;
         }
-        if status != 0 {
-            return Err(ManagerError::Backend(format!("SetDisplayConfig failed: {}", status)));
+        log::warn!("apply A2: attempt {} failed (status={})", attempt + 1, status);
+        if attempt < 2 { std::thread::sleep(std::time::Duration::from_millis(600)); }
+    }
+
+    // ── Phase A3: verify topology ─────────────────────────────────────────────
+    {
+        let cur = super::enumerate::query_active_topology()?;
+        let cur_active = active_keys(&cur.raw.paths);
+        let missing: Vec<_> = desired_active.iter().filter(|k| !cur_active.contains(*k)).collect();
+        let extra: Vec<_> = cur_active.iter().filter(|k| !desired_active.contains(k)).collect();
+        if missing.is_empty() && extra.is_empty() {
+            log::info!("apply A3: topology verified OK");
+        } else {
+            log::warn!("apply A3: topology mismatch — missing={:?} extra={:?}", missing, extra);
         }
+    }
+
+    // ── Phase B: rotation (before resolution) ────────────────────────────────
+    log::debug!("apply B: desired_rotations={:?}", desired_rotations);
+    if !desired_rotations.is_empty() {
+        let cur = super::enumerate::query_active_topology()?;
+        let mut paths = cur.raw.paths.clone();
+        let modes = cur.raw.modes.clone();
+        let mut changed = false;
+        for path in paths.iter_mut() {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+            let key = path_target_key(path);
+            let Some(&deg) = desired_rotations.get(&key) else {
+                log::debug!("apply B: {:016x}:{} — no rotation entry, skipping", key.0, key.1);
+                continue;
+            };
+            let rot = degrees_to_displayconfig_rotation(deg);
+            let current_rot = path.targetInfo.rotation.0;
+            log::debug!("apply B: {:016x}:{} current_rot={} desired_rot={} deg={}°", key.0, key.1, current_rot, rot.0, deg);
+            if current_rot != rot.0 {
+                log::info!("apply B: {:016x}:{} rotation {} → {}°", key.0, key.1, current_rot, deg);
+                path.targetInfo.rotation = rot;
+                changed = true;
+            } else {
+                log::debug!("apply B: {:016x}:{} rotation already {}°, no change", key.0, key.1, deg);
+            }
+        }
+        if changed {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply B: rotation SetDisplayConfig → {}", status);
+        } else {
+            log::debug!("apply B: no rotation changes needed");
+        }
+    } else {
+        log::debug!("apply B: no rotations specified");
+    }
+
+    // ── Phase C: resolution & position ───────────────────────────────────────
+    // Clones are skipped here — their position comes from the shared source mode
+    // set in Phase D. Applying a separate position for a clone would either be
+    // overwritten by Phase D or cause a conflict if the clone's stored position
+    // differs from the source.
+    {
+        let cur = super::enumerate::query_active_topology()?;
+        let mut paths = cur.raw.paths.clone();
+        let mut modes = cur.raw.modes.clone();
+        let mut changed = false;
+
+        for path in paths.iter_mut() {
+            if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+            let key = path_target_key(path);
+            // Skip clone displays — Phase D will wire their source mode
+            if desired_clones.contains_key(&key) { continue; }
+            let Some(output) = desired_outputs.get(&key).copied() else { continue };
+            if !output.enabled { continue; }
+
+            let mode_idx = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            if let Some(mode) = modes.get_mut(mode_idx) {
+                if mode.infoType.0 == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE.0 {
+                    let (cx, cy, cw, ch) = unsafe {
+                        let s = &mode.Anonymous.sourceMode;
+                        (s.position.x, s.position.y, s.width, s.height)
+                    };
+                    if cx != output.position.x || cy != output.position.y
+                        || cw != output.resolution.width || ch != output.resolution.height
+                    {
+                        unsafe {
+                            let s = &mut mode.Anonymous.sourceMode;
+                            s.position.x = output.position.x;
+                            s.position.y = output.position.y;
+                            s.width = output.resolution.width;
+                            s.height = output.resolution.height;
+                        }
+                        log::info!("apply C: {:016x}:{} → {}x{} @({},{})",
+                            key.0, key.1, output.resolution.width, output.resolution.height,
+                            output.position.x, output.position.y);
+                        changed = true;
+                    }
+                }
+            }
+            apply_desired_target_refresh(path, desired_outputs.get(&key));
+        }
+
+        if changed {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply C: resolution SetDisplayConfig → {}", status);
+        }
+    }
+
+    // ── Phase D: clone / mirror (after topology + rotation + resolution) ──────
+    log::debug!("apply D: desired_clones={:?}", desired_clones);
+    if !desired_clones.is_empty() {
+        let cur = super::enumerate::query_active_topology()?;
+        let mut paths = cur.raw.paths.clone();
+        let modes = cur.raw.modes.clone();
+        let mut changed = false;
+        for i in 0..paths.len() {
+            if paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+            let key = path_target_key(&paths[i]);
+            let Some(&(sl, st)) = desired_clones.get(&key) else { continue };
+            log::debug!("apply D: {:016x}:{} should clone {:016x}:{}", key.0, key.1, sl, st);
+            match paths.iter().find(|p| path_target_key(p) == (sl, st) && p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0).cloned() {
+                Some(sp) => {
+                    let src_id = sp.sourceInfo.id;
+                    let cur_id = paths[i].sourceInfo.id;
+                    log::debug!("apply D: src source_id={} cur source_id={}", src_id, cur_id);
+                    if cur_id != src_id {
+                        log::info!("apply D: {:016x}:{} mirrors {:016x}:{} (source_id {} → {})", key.0, key.1, sl, st, cur_id, src_id);
+                        // Share the source slot — set both mode indices to INVALID so
+                        // Windows picks valid modes for the clone via SDC_ALLOW_CHANGES.
+                        // Copying the source's modeInfoIdx causes ERROR_NOT_SUPPORTED
+                        // because the source mode entry is already "owned" by source_id.
+                        paths[i].sourceInfo.id = src_id;
+                        paths[i].sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                        paths[i].targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                        changed = true;
+                    } else {
+                        log::debug!("apply D: {:016x}:{} already clones {:016x}:{}", key.0, key.1, sl, st);
+                    }
+                }
+                None => {
+                    log::warn!("apply D: clone source {:016x}:{} not found in active paths — clone skipped", sl, st);
+                }
+            }
+        }
+        if changed {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply D: clone SetDisplayConfig → {} ({})", status, if status == 0 { "OK" } else { "FAILED" });
+        } else {
+            log::debug!("apply D: no clone changes needed");
+        }
+    } else {
+        log::debug!("apply D: no clones specified");
     }
 
     let next_snapshot = super::enumerate::query_active_topology()?;
@@ -92,6 +345,375 @@ pub fn apply_layout_against_snapshot(
     best_effort_restore_wallpapers(&next_snapshot, &saved_wallpapers);
     best_effort_restore_wallpaper_position(saved_wallpaper_position);
     Ok(next_snapshot)
+}
+
+fn degrees_to_displayconfig_rotation(degrees: u32) -> DISPLAYCONFIG_ROTATION {
+    DISPLAYCONFIG_ROTATION(match degrees {
+        90  => 2,
+        180 => 3,
+        270 => 4,
+        _   => 1, // identity
+    })
+}
+
+fn active_keys(paths: &[DISPLAYCONFIG_PATH_INFO]) -> std::collections::HashSet<(u64, u32)> {
+    paths.iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .map(|p| path_target_key(p))
+        .collect()
+}
+
+/// Mirrors PS `SetPrimaryByName`: subtract the desired primary's current position
+/// from every source-mode so it ends up at (0,0). Returns true if a shift was needed.
+fn shift_primary_to_origin(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    modes: &mut Vec<DISPLAYCONFIG_MODE_INFO>,
+    desired_outputs: &HashMap<(u64, u32), &monarch::OutputConfig>,
+) -> bool {
+    let pidx = paths.iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .filter_map(|p| {
+            let key = path_target_key(p);
+            let out = desired_outputs.get(&key)?;
+            if !out.primary { return None; }
+            let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx };
+            if idx == 0xFFFF_FFFF { return None; }
+            Some(idx as usize)
+        })
+        .next();
+
+    let Some(pidx) = pidx else { return false };
+    let Some(pm) = modes.get(pidx) else { return false };
+    if pm.infoType.0 != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE.0 { return false; }
+
+    let (ox, oy) = unsafe { (pm.Anonymous.sourceMode.position.x, pm.Anonymous.sourceMode.position.y) };
+    if ox == 0 && oy == 0 {
+        log::debug!("shift_primary: already at (0,0)");
+        return false;
+    }
+    log::info!("shift_primary: subtracting ({ox},{oy}) from all source modes");
+    for m in modes.iter_mut() {
+        if m.infoType.0 == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE.0 {
+            unsafe {
+                m.Anonymous.sourceMode.position.x -= ox;
+                m.Anonymous.sourceMode.position.y -= oy;
+            }
+        }
+    }
+    true
+}
+
+/// Poll QDC_ONLY_ACTIVE_PATHS until all `needs_enable` targets appear as active,
+/// or the timeout elapses. Mirrors PS `Wait-MonitorActive`.
+fn wait_for_targets_active(needs_enable: &[(u64, u32)], timeout_ms: u64) -> bool {
+    use std::collections::HashSet;
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        match super::enumerate::query_active_topology() {
+            Ok(snap) => {
+                let active: HashSet<(u64, u32)> = snap.raw.paths.iter()
+                    .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+                    .map(|p| path_target_key(p))
+                    .collect();
+                let missing: Vec<_> = needs_enable.iter().filter(|k| !active.contains(*k)).collect();
+                if missing.is_empty() {
+                    log::info!("wait_for_targets_active: all targets active after {:?}", start.elapsed());
+                    return true;
+                }
+                log::debug!("wait_for_targets_active: still waiting, missing={:?}", missing);
+            }
+            Err(e) => log::warn!("wait_for_targets_active: query failed: {e}"),
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+    }
+}
+
+/// Check whether the active topology matches what the desired layout requires.
+pub(super) fn verify_layout_applied(desired: &Layout, snapshot: &TopologySnapshot) -> bool {
+    use std::collections::HashSet;
+    let active: HashSet<(u64, u32)> = snapshot.raw.paths.iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .map(|p| path_target_key(p))
+        .collect();
+
+    let mut ok = true;
+    for output in &desired.outputs {
+        let key = (output.display_id.adapter_luid, output.display_id.target_id);
+        if output.enabled && !active.contains(&key) {
+            log::warn!(
+                "verify: {:016x}:{} should be ACTIVE but is not",
+                key.0, key.1
+            );
+            ok = false;
+        }
+        if !output.enabled && active.contains(&key) {
+            log::warn!(
+                "verify: {:016x}:{} should be INACTIVE but is still active",
+                key.0, key.1
+            );
+            ok = false;
+        }
+    }
+    if ok { log::info!("verify: layout matches active topology"); }
+    ok
+}
+
+/// Phase 1: append inactive targets to the active paths array and call SetDisplayConfig.
+/// Uses the **active** modes array — mirrors PS `EnableMonitorByName`.
+fn phase1_enable_targets(
+    needs_enable: &[(u64, u32)],
+    active_paths: &[DISPLAYCONFIG_PATH_INFO],
+    active_modes: &[DISPLAYCONFIG_MODE_INFO],
+) -> Result<(), ManagerError> {
+    let (all_paths, _) = super::enumerate::query_all_paths()?;
+    let mut phase1_paths: Vec<DISPLAYCONFIG_PATH_INFO> = active_paths.to_vec();
+
+    for &(adapter_luid, target_id) in needs_enable {
+        match all_paths.iter().find(|p| {
+            luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart)
+                == adapter_luid
+                && p.targetInfo.id == target_id
+                && p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0
+        }) {
+            Some(p) => {
+                let mut p = p.clone();
+                p.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+                p.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                p.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                log::info!("phase1: appending inactive target {:016x}:{}", adapter_luid, target_id);
+                phase1_paths.push(p);
+            }
+            None => {
+                // Not found as inactive — might already be active from a prior attempt.
+                log::warn!(
+                    "phase1: {:016x}:{} not found as inactive in QDC_ALL_PATHS",
+                    adapter_luid, target_id
+                );
+            }
+        }
+    }
+
+    let status = unsafe {
+        SetDisplayConfig(
+            Some(phase1_paths.as_slice()),
+            Some(active_modes),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        )
+    };
+    if status != 0 {
+        return Err(ManagerError::Backend(format!("phase1 SetDisplayConfig failed: {}", status)));
+    }
+    Ok(())
+}
+
+/// Fallback: query fresh active topology, find inactive targets from QDC_ALL_PATHS,
+/// append them, and apply. Kept as a second-chance strategy alongside the main
+/// two-phase approach.
+pub(super) fn try_attach_inactive_for_layout(
+    desired: &Layout,
+    active_snapshot: &TopologySnapshot,
+) -> Result<TopologySnapshot, ManagerError> {
+    let active_keys: std::collections::HashSet<(u64, u32)> = active_snapshot
+        .raw
+        .paths
+        .iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .map(|p| (
+            luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart),
+            p.targetInfo.id,
+        ))
+        .collect();
+
+    let needs_attach: Vec<(u64, u32)> = desired
+        .outputs
+        .iter()
+        .filter(|o| {
+            o.enabled
+                && !active_keys.contains(&(o.display_id.adapter_luid, o.display_id.target_id))
+        })
+        .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
+        .collect();
+
+    if needs_attach.is_empty() {
+        return Err(ManagerError::Backend(
+            "try_attach_inactive: no inactive outputs to attach".to_string(),
+        ));
+    }
+
+    let (all_paths, _) = super::enumerate::query_all_paths()?;
+    let desired_outputs = desired_output_index(desired);
+    let mut next_paths = active_snapshot.raw.paths.clone();
+    let mut next_modes = active_snapshot.raw.modes.clone();
+
+    for path in &mut next_paths {
+        let key = path_target_key(path);
+        let desired_output = desired_outputs.get(&key);
+        let enabled = desired_output.map(|o| o.enabled).unwrap_or(false);
+        if enabled {
+            apply_desired_source_mode(path, &mut next_modes, desired_output);
+            apply_desired_target_refresh(path, desired_output);
+        } else {
+            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+        }
+    }
+
+    for (adapter_luid, target_id) in &needs_attach {
+        let Some(mut inactive_path) = all_paths
+            .iter()
+            .find(|p| {
+                luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart)
+                    == *adapter_luid
+                    && p.targetInfo.id == *target_id
+                    && p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0
+            })
+            .cloned()
+        else {
+            log::warn!(
+                "try_attach_inactive: no path found for adapter={adapter_luid:#018x} target={target_id}"
+            );
+            continue;
+        };
+        inactive_path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+        inactive_path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+        inactive_path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+        apply_desired_target_refresh(
+            &mut inactive_path,
+            desired_outputs.get(&(*adapter_luid, *target_id)),
+        );
+        next_paths.push(inactive_path);
+    }
+
+    reorder_paths_for_desired_priority(&mut next_paths, &desired_outputs);
+
+    unsafe {
+        let status = SetDisplayConfig(
+            Some(next_paths.as_slice()),
+            Some(next_modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        );
+        if status != 0 {
+            return Err(ManagerError::Backend(format!(
+                "SetDisplayConfig (inactive-attach fallback) failed: {}",
+                status
+            )));
+        }
+    }
+
+    super::enumerate::query_active_topology()
+}
+
+/// Set the rotation of a single active display. Queries fresh active paths,
+/// updates the target rotation, and calls SetDisplayConfig. Rotation is in
+/// degrees: 0 (identity), 90, 180, 270.
+pub fn apply_display_rotation(
+    adapter_luid: u64,
+    target_id: u32,
+    degrees: u32,
+) -> Result<(), ManagerError> {
+    let snap = super::enumerate::query_active_topology()?;
+    let mut paths = snap.raw.paths.clone();
+    let modes = snap.raw.modes.clone();
+
+    let desired_rot = degrees_to_displayconfig_rotation(degrees);
+    let mut found = false;
+    for path in paths.iter_mut() {
+        if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+        let key = path_target_key(path);
+        if key != (adapter_luid, target_id) { continue; }
+        path.targetInfo.rotation = desired_rot;
+        found = true;
+        break;
+    }
+    if !found {
+        return Err(ManagerError::Backend(format!(
+            "display {:016x}:{} not active", adapter_luid, target_id
+        )));
+    }
+
+    let status = unsafe {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        )
+    };
+    if status != 0 {
+        return Err(ManagerError::Backend(format!("apply_rotation SetDisplayConfig failed: {status}")));
+    }
+    log::info!("apply_display_rotation: {:016x}:{} → {}°", adapter_luid, target_id, degrees);
+    Ok(())
+}
+
+/// Make one active display clone another by assigning them the same GDI source slot.
+/// Pass `src_adapter_luid = 0, src_target_id = 0` to remove cloning (make it extended).
+pub fn apply_clone_source(
+    clone_adapter_luid: u64,
+    clone_target_id: u32,
+    src_adapter_luid: u64,
+    src_target_id: u32,
+) -> Result<(), ManagerError> {
+    let snap = super::enumerate::query_active_topology()?;
+    let mut paths = snap.raw.paths.clone();
+    let modes = snap.raw.modes.clone();
+
+    if src_adapter_luid == 0 {
+        // Remove clone: find a free sourceInfo.id on the adapter and assign it
+        let clone_path = paths.iter().find(|p| path_target_key(p) == (clone_adapter_luid, clone_target_id)).cloned();
+        let Some(cp) = clone_path else {
+            return Err(ManagerError::Backend(format!("clone target not active")));
+        };
+        let used_ids: std::collections::HashSet<u32> = paths.iter()
+            .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+            .filter(|p| p.sourceInfo.adapterId.HighPart == cp.sourceInfo.adapterId.HighPart
+                && p.sourceInfo.adapterId.LowPart == cp.sourceInfo.adapterId.LowPart)
+            .map(|p| p.sourceInfo.id)
+            .collect();
+        let mut free_id = 0u32;
+        while used_ids.contains(&free_id) { free_id += 1; }
+        for p in paths.iter_mut() {
+            if path_target_key(p) == (clone_adapter_luid, clone_target_id) {
+                p.sourceInfo.id = free_id;
+                p.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                p.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
+                break;
+            }
+        }
+    } else {
+        // Set clone: copy source slot from the src path to the clone path
+        let src_path = paths.iter().find(|p| path_target_key(p) == (src_adapter_luid, src_target_id)).cloned();
+        let Some(sp) = src_path else {
+            return Err(ManagerError::Backend(format!("clone source not active")));
+        };
+        let src_source_id = sp.sourceInfo.id;
+        let src_mode_idx = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
+        for p in paths.iter_mut() {
+            if path_target_key(p) == (clone_adapter_luid, clone_target_id) {
+                p.sourceInfo.id = src_source_id;
+                p.sourceInfo.Anonymous.modeInfoIdx = src_mode_idx;
+                break;
+            }
+        }
+    }
+
+    let status = unsafe {
+        SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+        )
+    };
+    if status != 0 {
+        return Err(ManagerError::Backend(format!("apply_clone_source SetDisplayConfig failed: {status}")));
+    }
+    log::info!(
+        "apply_clone_source: {:016x}:{} → clone of {:016x}:{}",
+        clone_adapter_luid, clone_target_id, src_adapter_luid, src_target_id
+    );
+    Ok(())
 }
 
 pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
@@ -123,95 +745,6 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
         )));
     }
     Ok(())
-}
-
-pub(super) fn try_attach_inactive_for_layout(
-    desired: &Layout,
-    active_snapshot: &TopologySnapshot,
-) -> Result<TopologySnapshot, ManagerError> {
-    let active_keys: std::collections::HashSet<(u64, u32)> = active_snapshot
-        .raw
-        .paths
-        .iter()
-        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
-        .map(|p| (
-            luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart),
-            p.targetInfo.id,
-        ))
-        .collect();
-
-    let needs_attach: Vec<(u64, u32)> = desired
-        .outputs
-        .iter()
-        .filter(|o| {
-            o.enabled && !active_keys.contains(&(o.display_id.adapter_luid, o.display_id.target_id))
-        })
-        .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
-        .collect();
-
-    if needs_attach.is_empty() {
-        return Err(ManagerError::Backend(
-            "try_attach_inactive: no inactive outputs to attach".to_string(),
-        ));
-    }
-
-    let all_paths = super::enumerate::query_inactive_paths()?;
-
-    let desired_outputs = desired_output_index(desired);
-    let mut next_paths = active_snapshot.raw.paths.clone();
-    let mut next_modes = active_snapshot.raw.modes.clone();
-
-    for path in &mut next_paths {
-        let key = path_target_key(path);
-        let desired_output = desired_outputs.get(&key);
-        let enabled = desired_output.map(|o| o.enabled).unwrap_or(false);
-        if !enabled {
-            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        } else {
-            apply_desired_source_mode(path, &mut next_modes, desired_output);
-            apply_desired_target_refresh(path, desired_output);
-        }
-    }
-
-    for (adapter_luid, target_id) in &needs_attach {
-        let Some(mut inactive_path) = all_paths
-            .iter()
-            .find(|p| {
-                luid_to_u64(p.targetInfo.adapterId.HighPart, p.targetInfo.adapterId.LowPart)
-                    == *adapter_luid
-                    && p.targetInfo.id == *target_id
-            })
-            .cloned()
-        else {
-            log::warn!(
-                "try_attach_inactive: no path found for adapter={adapter_luid:#018x} target={target_id}"
-            );
-            continue;
-        };
-        inactive_path.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-        inactive_path.sourceInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-        inactive_path.targetInfo.Anonymous.modeInfoIdx = 0xFFFF_FFFF;
-        apply_desired_target_refresh(&mut inactive_path, desired_outputs.get(&(*adapter_luid, *target_id)));
-        next_paths.push(inactive_path);
-    }
-
-    reorder_paths_for_desired_priority(&mut next_paths, &desired_outputs);
-
-    unsafe {
-        let status = SetDisplayConfig(
-            Some(next_paths.as_slice()),
-            Some(next_modes.as_slice()),
-            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
-        );
-        if status != 0 {
-            return Err(ManagerError::Backend(format!(
-                "SetDisplayConfig (inactive-attach fallback) failed: {}",
-                status
-            )));
-        }
-    }
-
-    super::enumerate::query_active_topology()
 }
 
 pub(super) fn reapply_color_calibration_for_active_with_cached_sdr(
