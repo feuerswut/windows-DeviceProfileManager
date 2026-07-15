@@ -37,14 +37,20 @@ const GAMMA_RAMP_WORDS: usize = 3 * 256;
 pub(super) type GammaRampKey = (u64, u32);
 pub(super) type GammaRampWords = [u16; GAMMA_RAMP_WORDS];
 
-/// Five-step apply mirroring kaiser.ps1 exactly — each step is a separate
-/// SetDisplayConfig call, never mixing flag changes with mode changes:
+/// Robust multi-phase apply.
 ///
-/// Step 1: Enable desired primary target if inactive (EnableMonitorByName)
-/// Step 2: Enable remaining desired-active targets if inactive
-/// Step 3: Shift all source modes so the desired primary lands at (0,0) (SetPrimaryByName)
-/// Step 4: Deactivate unwanted monitors — flag clear ONLY, no mode changes (DeactivateAllExcept)
-/// Step 5: Apply desired resolutions/positions to the now-active monitors
+/// Phase A — Extend (enable all desired monitors)
+///   A1. If any desired monitor is inactive: try SDC_TOPOLOGY_EXTEND first (most
+///       reliable way to bring any connected monitor online), wait for it, then
+///       fall back to targeted phase1 enable for any still-missing targets.
+///   A2. Deactivate unwanted monitors (flag-clear only, retry up to 3×).
+///   A3. Verify topology; log discrepancies.
+///
+/// Phase B — Rotation (before resolution — Windows validates modes against orientation)
+///
+/// Phase C — Resolution / position
+///
+/// Phase D — Clone / mirror (last, after topology + rotation + resolution are stable)
 pub fn apply_layout_against_snapshot(
     desired: &Layout,
     snapshot: &TopologySnapshot,
@@ -57,99 +63,109 @@ pub fn apply_layout_against_snapshot(
     let saved_wallpaper_position = capture_wallpaper_position();
     let desired_outputs = desired_output_index(desired);
 
-    // Which target is the desired primary?
-    let primary_key = desired.outputs.iter()
-        .find(|o| o.enabled && o.primary)
-        .or_else(|| desired.outputs.iter().find(|o| o.enabled))
-        .map(|o| (o.display_id.adapter_luid, o.display_id.target_id));
+    let desired_active: std::collections::HashSet<(u64, u32)> = desired.outputs.iter()
+        .filter(|o| o.enabled)
+        .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
+        .collect();
 
-    // ── Step 1: enable the desired primary first ──────────────────────────────
-    if let Some(pk) = primary_key {
+    // ── Phase A1: enable all desired-active monitors ──────────────────────────
+    {
         let cur = super::enumerate::query_active_topology()?;
-        let active = active_keys(&cur.raw.paths);
-        if !active.contains(&pk) {
-            log::info!("apply s1: enabling primary {:016x}:{}", pk.0, pk.1);
-            match phase1_enable_targets(&[pk], &cur.raw.paths, &cur.raw.modes) {
-                Ok(()) => { wait_for_targets_active(&[pk], 12_000); }
-                Err(e) => log::warn!("apply s1: primary enable failed: {e}"),
+        let cur_active = active_keys(&cur.raw.paths);
+        let missing: Vec<(u64, u32)> = desired_active.iter()
+            .filter(|k| !cur_active.contains(*k))
+            .copied()
+            .collect();
+
+        if !missing.is_empty() {
+            log::info!("apply A1: {} desired monitor(s) offline — extending topology first", missing.len());
+
+            // Try SDC_TOPOLOGY_EXTEND first (brings all connected monitors online).
+            if let Err(e) = force_topology_extend() {
+                log::warn!("apply A1: topology extend failed ({e}), trying targeted enable");
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+
+            // Wait for the desired targets to appear.
+            if !wait_for_targets_active(&missing, 8_000) {
+                log::warn!("apply A1: targets still missing after extend — trying phase1 direct enable");
+                let cur2 = super::enumerate::query_active_topology()?;
+                let still_missing: Vec<(u64, u32)> = missing.iter()
+                    .filter(|k| !active_keys(&cur2.raw.paths).contains(*k))
+                    .copied()
+                    .collect();
+                if !still_missing.is_empty() {
+                    match phase1_enable_targets(&still_missing, &cur2.raw.paths, &cur2.raw.modes) {
+                        Ok(()) => { wait_for_targets_active(&still_missing, 8_000); }
+                        Err(e) => log::warn!("apply A1: direct enable also failed: {e}"),
+                    }
+                }
+            } else {
+                log::info!("apply A1: all desired monitors confirmed active");
             }
         } else {
-            log::info!("apply s1: primary {:016x}:{} already active", pk.0, pk.1);
+            log::info!("apply A1: all desired monitors already active");
         }
     }
 
-    // ── Step 2: enable remaining desired-active targets ───────────────────────
-    {
+    // ── Phase A2: deactivate unwanted monitors (retry up to 3×) ──────────────
+    for attempt in 0..3u32 {
         let cur = super::enumerate::query_active_topology()?;
-        let active = active_keys(&cur.raw.paths);
-        let remaining: Vec<(u64, u32)> = desired.outputs.iter()
-            .filter(|o| o.enabled)
-            .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
-            .filter(|k| !active.contains(k))
+        let cur_active = active_keys(&cur.raw.paths);
+        let unwanted: Vec<(u64, u32)> = cur_active.iter()
+            .filter(|k| !desired_active.contains(*k))
+            .copied()
             .collect();
-        if !remaining.is_empty() {
-            log::info!("apply s2: enabling {} more target(s): {:?}", remaining.len(), remaining);
-            match phase1_enable_targets(&remaining, &cur.raw.paths, &cur.raw.modes) {
-                Ok(()) => { wait_for_targets_active(&remaining, 12_000); }
-                Err(e) => log::warn!("apply s2: enable failed: {e}"),
-            }
-        }
-    }
 
-    // ── Step 3: set primary position (shift all source modes → primary at 0,0) ─
-    {
-        let cur = super::enumerate::query_active_topology()?;
-        let mut paths = cur.raw.paths.clone();
-        let mut modes = cur.raw.modes.clone();
-        if shift_primary_to_origin(&paths, &mut modes, &desired_outputs) {
-            let status = unsafe {
-                SetDisplayConfig(
-                    Some(paths.as_slice()),
-                    Some(modes.as_slice()),
-                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
-                )
-            };
-            reorder_paths_for_desired_priority(&mut paths, &desired_outputs);
-            log::info!("apply s3: set_primary SetDisplayConfig → {}", status);
+        if unwanted.is_empty() {
+            log::info!("apply A2: no unwanted monitors to deactivate");
+            break;
         }
-    }
 
-    // ── Step 4: deactivate unwanted (flag-clear ONLY, no mode changes) ────────
-    {
-        let cur = super::enumerate::query_active_topology()?;
+        log::info!("apply A2: deactivating {} monitor(s) (attempt {}): {:?}", unwanted.len(), attempt + 1, unwanted);
+
         let mut paths = cur.raw.paths.clone();
         let modes = cur.raw.modes.clone();
-        let mut changed = false;
-        for path in &mut paths {
-            let key = path_target_key(path);
-            let keep = desired_outputs.get(&key).map(|o| o.enabled).unwrap_or(false);
-            if !keep && path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0 {
+        for path in paths.iter_mut() {
+            if unwanted.contains(&path_target_key(path)) {
                 path.flags &= !DISPLAYCONFIG_PATH_ACTIVE_FLAG;
-                log::info!("apply s4: deactivating {:016x}:{}", key.0, key.1);
-                changed = true;
             }
         }
-        let remaining_active = paths.iter().filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0).count();
-        log::info!("apply s4: {} path(s) remain active after deactivation", remaining_active);
-        if remaining_active == 0 {
-            return Err(ManagerError::Backend("s4: would leave 0 active displays".to_string()));
+        let remaining = paths.iter().filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0).count();
+        if remaining == 0 {
+            return Err(ManagerError::Backend("A2: deactivation would leave 0 active displays".to_string()));
         }
-        if changed {
-            let status = unsafe {
-                SetDisplayConfig(
-                    Some(paths.as_slice()),
-                    Some(modes.as_slice()),
-                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
-                )
-            };
-            if status != 0 {
-                return Err(ManagerError::Backend(format!("SetDisplayConfig failed: {status}")));
-            }
+
+        let status = unsafe {
+            SetDisplayConfig(
+                Some(paths.as_slice()),
+                Some(modes.as_slice()),
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+            )
+        };
+        if status == 0 {
+            log::info!("apply A2: deactivation OK ({} active remaining)", remaining);
+            break;
+        }
+        log::warn!("apply A2: attempt {} failed (status={})", attempt + 1, status);
+        if attempt < 2 { std::thread::sleep(std::time::Duration::from_millis(600)); }
+    }
+
+    // ── Phase A3: verify topology ─────────────────────────────────────────────
+    {
+        let cur = super::enumerate::query_active_topology()?;
+        let cur_active = active_keys(&cur.raw.paths);
+        let missing: Vec<_> = desired_active.iter().filter(|k| !cur_active.contains(*k)).collect();
+        let extra: Vec<_> = cur_active.iter().filter(|k| !desired_active.contains(k)).collect();
+        if missing.is_empty() && extra.is_empty() {
+            log::info!("apply A3: topology verified OK");
+        } else {
+            log::warn!("apply A3: topology mismatch — missing={:?} extra={:?}", missing, extra);
         }
     }
 
-    // ── Step 4.5: apply rotation (before resolution — Windows may renegotiate
-    //    supported modes when orientation changes) ───────────────────────────
+    // ── Phase B: rotation (before resolution) ────────────────────────────────
     if !desired_rotations.is_empty() {
         let cur = super::enumerate::query_active_topology()?;
         let mut paths = cur.raw.paths.clone();
@@ -158,10 +174,10 @@ pub fn apply_layout_against_snapshot(
         for path in paths.iter_mut() {
             if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
             let key = path_target_key(path);
-            let Some(&degrees) = desired_rotations.get(&key) else { continue };
-            let rot = degrees_to_displayconfig_rotation(degrees);
+            let Some(&deg) = desired_rotations.get(&key) else { continue };
+            let rot = degrees_to_displayconfig_rotation(deg);
             if path.targetInfo.rotation.0 != rot.0 {
-                log::info!("apply s4.5: {:016x}:{} rotation → {}°", key.0, key.1, degrees);
+                log::info!("apply B: {:016x}:{} rotation → {}°", key.0, key.1, deg);
                 path.targetInfo.rotation = rot;
                 changed = true;
             }
@@ -174,45 +190,11 @@ pub fn apply_layout_against_snapshot(
                     SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
                 )
             };
-            log::info!("apply s4.5: rotation SetDisplayConfig → {}", status);
+            log::info!("apply B: rotation SetDisplayConfig → {}", status);
         }
     }
 
-    // ── Step 4.6: apply clone/mirror (before resolution) ──────────────────
-    if !desired_clones.is_empty() {
-        let cur = super::enumerate::query_active_topology()?;
-        let mut paths = cur.raw.paths.clone();
-        let modes = cur.raw.modes.clone();
-        let mut changed = false;
-        for i in 0..paths.len() {
-            if paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
-            let key = path_target_key(&paths[i]);
-            let Some(&(sl, st)) = desired_clones.get(&key) else { continue };
-            let src = paths.iter().find(|p| path_target_key(p) == (sl, st)).cloned();
-            if let Some(sp) = src {
-                let src_id = sp.sourceInfo.id;
-                let src_mode = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
-                if paths[i].sourceInfo.id != src_id {
-                    log::info!("apply s4.6: {:016x}:{} clones {:016x}:{}", key.0, key.1, sl, st);
-                    paths[i].sourceInfo.id = src_id;
-                    paths[i].sourceInfo.Anonymous.modeInfoIdx = src_mode;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            let status = unsafe {
-                SetDisplayConfig(
-                    Some(paths.as_slice()),
-                    Some(modes.as_slice()),
-                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
-                )
-            };
-            log::info!("apply s4.6: clone SetDisplayConfig → {}", status);
-        }
-    }
-
-    // ── Step 5: apply desired resolutions / positions ────────────────────────
+    // ── Phase C: resolution & position ───────────────────────────────────────
     {
         let cur = super::enumerate::query_active_topology()?;
         let mut paths = cur.raw.paths.clone();
@@ -242,12 +224,9 @@ pub fn apply_layout_against_snapshot(
                             s.width = output.resolution.width;
                             s.height = output.resolution.height;
                         }
-                        log::info!(
-                            "apply s5: {:016x}:{} → {}x{} @({},{})",
-                            key.0, key.1,
-                            output.resolution.width, output.resolution.height,
-                            output.position.x, output.position.y
-                        );
+                        log::info!("apply C: {:016x}:{} → {}x{} @({},{})",
+                            key.0, key.1, output.resolution.width, output.resolution.height,
+                            output.position.x, output.position.y);
                         changed = true;
                     }
                 }
@@ -263,7 +242,39 @@ pub fn apply_layout_against_snapshot(
                     SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
                 )
             };
-            log::info!("apply s5: resolution SetDisplayConfig → {}", status);
+            log::info!("apply C: resolution SetDisplayConfig → {}", status);
+        }
+    }
+
+    // ── Phase D: clone / mirror (after topology + rotation + resolution) ──────
+    if !desired_clones.is_empty() {
+        let cur = super::enumerate::query_active_topology()?;
+        let mut paths = cur.raw.paths.clone();
+        let modes = cur.raw.modes.clone();
+        let mut changed = false;
+        for i in 0..paths.len() {
+            if paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+            let key = path_target_key(&paths[i]);
+            let Some(&(sl, st)) = desired_clones.get(&key) else { continue };
+            if let Some(sp) = paths.iter().find(|p| path_target_key(p) == (sl, st)).cloned() {
+                let src_id = sp.sourceInfo.id;
+                if paths[i].sourceInfo.id != src_id {
+                    log::info!("apply D: {:016x}:{} mirrors {:016x}:{}", key.0, key.1, sl, st);
+                    paths[i].sourceInfo.id = src_id;
+                    paths[i].sourceInfo.Anonymous.modeInfoIdx = unsafe { sp.sourceInfo.Anonymous.modeInfoIdx };
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let status = unsafe {
+                SetDisplayConfig(
+                    Some(paths.as_slice()),
+                    Some(modes.as_slice()),
+                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
+                )
+            };
+            log::info!("apply D: clone SetDisplayConfig → {}", status);
         }
     }
 
