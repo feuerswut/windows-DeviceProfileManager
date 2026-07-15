@@ -187,6 +187,7 @@ fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
 
 #[tauri::command]
 pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
+    log::trace!("→ get_snapshot");
     let mut manager = state.manager.lock().unwrap();
     // Auto-rollback if the confirmation window expired (acts as the daemon heartbeat).
     if let Ok(true) = manager.rollback_if_confirmation_expired() {
@@ -240,7 +241,7 @@ pub fn get_snapshot(state: State<AppState>) -> Result<SnapshotDto, String> {
         })
         .collect();
 
-    log::debug!("get_snapshot: {} displays, {} gdi_names", displays.len(), gdi_names.len());
+    log::trace!("get_snapshot: {} displays, {} gdi_names", displays.len(), gdi_names.len());
 
     let snapshot = SnapshotDto {
         displays,
@@ -319,12 +320,14 @@ fn sync_new_displays_to_profiles(
 
 #[tauri::command]
 pub fn list_displays(state: State<AppState>) -> Result<Vec<DisplayInfo>, String> {
+    log::trace!("→ list_displays");
     let manager = state.manager.lock().unwrap();
     manager.list_displays().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn toggle_display(display_id: DisplayId, state: State<AppState>) -> Result<(), String> {
+    log::trace!("→ toggle_display {:?}", display_id);
     let mut manager = state.manager.lock().unwrap();
     let resolved = resolve_display_id(&display_id, &manager);
     log::info!(
@@ -338,6 +341,7 @@ pub fn toggle_display(display_id: DisplayId, state: State<AppState>) -> Result<(
 
 #[tauri::command]
 pub fn apply_layout(layout: Layout, state: State<AppState>) -> Result<(), String> {
+    log::trace!("→ apply_layout {} outputs", layout.outputs.len());
     let mut manager = state.manager.lock().unwrap();
     let layout = fix_layout_display_ids(layout, &manager);
     log::info!(
@@ -414,6 +418,18 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
     let store = state.new_store();
     let kaiser_profile = store.load_kaiser_profile(&name);
 
+    // Spawn audio on its own thread immediately — it runs concurrently with display work.
+    // AudioManager initialises its own COM apartment, so creating a fresh one is correct.
+    if let Some(ref kp) = kaiser_profile {
+        if !kp.audio.is_empty() {
+            let audio_settings = kp.audio.clone();
+            std::thread::spawn(move || {
+                let mgr = kaiser_core::AudioManager::new();
+                apply_audio_settings(&mgr, &audio_settings);
+            });
+        }
+    }
+
     // Maps stored "luid:tid" DPI keys to the live (luid, tid) after ID remapping.
     let mut dpi_key_remap: HashMap<String, (u64, u32)> = HashMap::new();
 
@@ -422,7 +438,6 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
         if let Some(ref kp) = kaiser_profile {
             let original = kp.layout.clone();
             let remapped = fix_layout_display_ids(kp.layout.clone(), &manager);
-            // Capture old→new luid:tid pairs so DPI can follow the same remap.
             for (old_out, new_out) in original.outputs.iter().zip(remapped.outputs.iter()) {
                 let old_key = format!(
                     "{}:{}",
@@ -440,12 +455,7 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
     }
 
     if let Some(kaiser_profile) = kaiser_profile {
-        if !kaiser_profile.audio.is_empty() {
-            let audio = state.audio.lock().unwrap();
-            apply_audio_settings(&audio, &kaiser_profile.audio);
-        }
-
-        // Snapshot current DPI for all outputs we are about to change so revert can undo it.
+        // Snapshot current DPI for rollback.
         let pre_apply_dpi: HashMap<String, u32> = dpi_key_remap
             .values()
             .filter_map(|&(luid, tid)| {
