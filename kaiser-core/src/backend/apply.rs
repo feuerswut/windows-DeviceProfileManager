@@ -115,7 +115,7 @@ pub fn apply_layout_against_snapshot(
     // already normalised to (0,0). Mirrors PS SetPrimaryByName.
     {
         let cur = super::enumerate::query_active_topology()?;
-        let mut paths = cur.raw.paths.clone();
+        let paths = cur.raw.paths.clone();
         let mut modes = cur.raw.modes.clone();
         if shift_primary_to_origin(&paths, &mut modes, &desired_outputs) {
             let status = unsafe {
