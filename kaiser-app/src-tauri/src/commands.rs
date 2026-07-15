@@ -147,13 +147,39 @@ pub struct ProfileDto {
     pub display_names: HashMap<String, String>,
 }
 
+/// Deduplicate outputs by target_id (prefer enabled over disabled) and strip
+/// `primary` from any output that is not enabled. Fixes profiles corrupted by
+/// sync adding duplicate entries or by stale in-memory layouts.
+fn sanitize_layout(layout: Layout) -> Layout {
+    use std::collections::HashSet;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut outputs = Vec::new();
+    // Enabled outputs first so they "win" the dedup over disabled ones.
+    for o in layout.outputs.iter().filter(|o| o.enabled) {
+        if seen.insert(o.display_id.target_id) {
+            outputs.push(o.clone());
+        }
+    }
+    for o in layout.outputs.iter().filter(|o| !o.enabled) {
+        if seen.insert(o.display_id.target_id) {
+            let mut o = o.clone();
+            o.primary = false; // disabled outputs cannot be primary
+            outputs.push(o);
+        }
+    }
+    Layout { outputs }
+}
+
 fn to_profile_dto(profile: &Profile, store: &KaiserConfigStore) -> ProfileDto {
     let kp = store.load_kaiser_profile(&profile.name);
     let audio = kp.as_ref().map(|k| k.audio.clone()).unwrap_or_default();
     let dpi_scales = kp.as_ref().map(|k| k.dpi_scales.clone()).unwrap_or_default();
     let display_names = kp.as_ref().map(|k| k.display_names.clone()).unwrap_or_default();
-    // Kaiser config layout is authoritative (may be user-edited); fall back to Monarch's
-    let layout = kp.map(|k| k.layout).unwrap_or_else(|| profile.layout.clone());
+    // Kaiser config layout is authoritative (may be user-edited); fall back to Monarch's.
+    // Sanitize on every read to fix any duplicates or stale primary flags.
+    let layout = kp
+        .map(|k| sanitize_layout(k.layout))
+        .unwrap_or_else(|| profile.layout.clone());
     ProfileDto { name: profile.name.clone(), layout, audio, dpi_scales, display_names }
 }
 
@@ -264,10 +290,13 @@ fn sync_new_displays_to_profiles(
 
         for live_out in live_layout.outputs.iter().filter(|o| o.enabled) {
             let in_profile = kp.layout.outputs.iter().any(|o| {
-                match (o.display_id.edid_hash, live_out.display_id.edid_hash) {
-                    (Some(h1), Some(h2)) => h1 == h2,
-                    _ => o.display_id.target_id == live_out.display_id.target_id,
-                }
+                // Check edid_hash first; always fall back to target_id so virtual
+                // displays with unstable EDIDs (e.g. VDD) don't produce duplicates.
+                let hash_match = matches!(
+                    (o.display_id.edid_hash, live_out.display_id.edid_hash),
+                    (Some(h1), Some(h2)) if h1 == h2
+                );
+                hash_match || o.display_id.target_id == live_out.display_id.target_id
             });
             if !in_profile {
                 let mut new_out = live_out.clone();
