@@ -503,19 +503,28 @@ pub fn apply_profile(name: String, state: State<AppState>) -> Result<(), String>
                     let (ls, ts) = k.split_once(':')?;
                     Some((ls.parse().ok()?, ts.parse().ok()?))
                 };
+                log::debug!("apply_profile: dpi_key_remap={:?}", dpi_key_remap);
+                log::debug!("apply_profile: raw display_rotations={:?}", kp.display_rotations);
+                log::debug!("apply_profile: raw clone_sources={:?}", kp.clone_sources);
                 let rotations: HashMap<(u64, u32), u32> = kp.display_rotations.iter()
                     .filter_map(|(k, &d)| {
-                        let live = dpi_key_remap.get(k).copied().or_else(|| parse_key(k))?;
-                        Some((live, d))
+                        let live = dpi_key_remap.get(k).copied().or_else(|| parse_key(k));
+                        if live.is_none() {
+                            log::warn!("apply_profile: rotation key '{k}' not found in remap, dropping");
+                        }
+                        Some((live?, d))
                     })
                     .collect();
                 let clones: HashMap<(u64, u32), (u64, u32)> = kp.clone_sources.iter()
                     .filter_map(|(ck, sk)| {
-                        let cl = dpi_key_remap.get(ck).copied().or_else(|| parse_key(ck))?;
-                        let sl = dpi_key_remap.get(sk).copied().or_else(|| parse_key(sk))?;
-                        Some((cl, sl))
+                        let cl = dpi_key_remap.get(ck).copied().or_else(|| parse_key(ck));
+                        let sl = dpi_key_remap.get(sk).copied().or_else(|| parse_key(sk));
+                        if cl.is_none() { log::warn!("apply_profile: clone key '{ck}' not in remap, dropping"); }
+                        if sl.is_none() { log::warn!("apply_profile: clone src key '{sk}' not in remap, dropping"); }
+                        Some((cl?, sl?))
                     })
                     .collect();
+                log::debug!("apply_profile: resolved rotations={:?} clones={:?}", rotations, clones);
                 state.backend.set_pending_display_ops(rotations, clones);
             }
 
