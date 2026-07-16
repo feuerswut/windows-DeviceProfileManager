@@ -5,7 +5,27 @@ mod state;
 use state::AppState;
 use tauri::Manager;
 
+/// Enable ANSI escape code processing on Windows (cmd.exe / PowerShell).
+/// Without this the console ignores color codes and prints raw ESC sequences.
+#[cfg(target_os = "windows")]
+fn enable_ansi_console() {
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_ERROR_HANDLE).unwrap_or_default();
+        let mut mode = Default::default();
+        if GetConsoleMode(handle, &mut mode).is_ok() {
+            let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    enable_ansi_console();
+
     // dev builds: TRACE so all frontend command traces + apply pipeline debug are visible.
     // release builds: INFO only.
     #[cfg(debug_assertions)]
