@@ -1,7 +1,6 @@
 #![cfg(target_os = "windows")]
 
 use std::collections::HashMap;
-use std::hash::Hasher;
 use std::mem::size_of;
 
 use monarch::{DisplayInfo, Layout, ManagerError, OutputConfig, Position, Resolution};
@@ -16,7 +15,7 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 
-use super::win32_types::{luid_to_u64, make_display_id, RawTopologySnapshot, TopologySnapshot};
+use super::win32_types::{luid_to_u64, make_display_id, EdidFields, RawTopologySnapshot, TopologySnapshot};
 
 const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
 const QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ONLY_ACTIVE_PATHS;
@@ -37,6 +36,7 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
     let mut gdi_names = HashMap::new();
     let mut rotation_values: HashMap<(u64, u32), u32> = HashMap::new();
     let mut clone_pairs: HashMap<(u64, u32), (u64, u32)> = HashMap::new();
+    let mut edid_fields: HashMap<(u64, u32), EdidFields> = HashMap::new();
     let mode_map = modes_by_key(&modes);
 
     // Track (adapter_high, adapter_low, sourceInfo.id) → first target's (luid, target_id).
@@ -53,11 +53,12 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
             path.targetInfo.adapterId.LowPart,
         );
         let target_key_self = (adapter_luid, path.targetInfo.id);
-        let (friendly_name, stable_edid_hash) = target_name_and_stable_hash(path)
+        let (friendly_name, edid) = target_name_and_stable_hash(path)
             .unwrap_or_else(|_| {
-                (format!("Display {}:{}", adapter_luid, path.targetInfo.id), None)
+                (format!("Display {}:{}", adapter_luid, path.targetInfo.id), EdidFields::default())
             });
-        let display_id = make_display_id(adapter_luid, path.targetInfo.id, stable_edid_hash);
+        let display_id = make_display_id(adapter_luid, path.targetInfo.id, &edid);
+        edid_fields.insert(target_key_self, edid);
 
         if let Ok(gdi_name) = source_gdi_device_name(path) {
             gdi_names.insert(target_key_self, gdi_name);
@@ -136,7 +137,7 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
         }
     }
 
-    Ok(TopologySnapshot { raw, layout: Layout { outputs }, displays, gdi_names, rotation_values, clone_pairs })
+    Ok(TopologySnapshot { raw, layout: Layout { outputs }, displays, gdi_names, rotation_values, clone_pairs, edid_fields })
 }
 
 fn rotation_to_degrees(rotation: DISPLAYCONFIG_ROTATION) -> u32 {
@@ -220,7 +221,7 @@ fn query_raw(
 
 fn target_name_and_stable_hash(
     path: &DISPLAYCONFIG_PATH_INFO,
-) -> Result<(String, Option<u64>), ManagerError> {
+) -> Result<(String, EdidFields), ManagerError> {
     unsafe {
         let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
         name.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
@@ -239,57 +240,21 @@ fn target_name_and_stable_hash(
         }
 
         let friendly_name = wide_array_to_string(&name.monitorFriendlyDeviceName);
-        let device_path = wide_array_to_string(&name.monitorDevicePath);
-        let stable_hash = stable_display_hash(
-            name.edidManufactureId,
-            name.edidProductCodeId,
-            name.connectorInstance,
-            &device_path,
-        );
-        Ok((friendly_name, Some(stable_hash)))
+        let edid = EdidFields {
+            manufacture_id: nonzero_u16(name.edidManufactureId),
+            product_code: nonzero_u16(name.edidProductCodeId),
+            connector_instance: nonzero_u32(name.connectorInstance),
+        };
+        Ok((friendly_name, edid))
     }
 }
 
-fn stable_display_hash(
-    edid_manufacture_id: u16,
-    edid_product_code_id: u16,
-    connector_instance: u32,
-    monitor_device_path: &str,
-) -> u64 {
-    let mut hasher = Fnv1a64::new();
-    hasher.update(&edid_manufacture_id.to_le_bytes());
-    hasher.update(&edid_product_code_id.to_le_bytes());
-    hasher.update(&connector_instance.to_le_bytes());
-    let normalized_path = monitor_device_path.to_ascii_uppercase();
-    hasher.update(normalized_path.as_bytes());
-    hasher.finish()
+fn nonzero_u16(v: u16) -> Option<u16> {
+    if v == 0 { None } else { Some(v) }
 }
 
-struct Fnv1a64(u64);
-
-impl Fnv1a64 {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x0000_0100_0000_01B3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= *byte as u64;
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
-}
-
-impl Hasher for Fnv1a64 {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        self.update(bytes);
-    }
+fn nonzero_u32(v: u32) -> Option<u32> {
+    if v == 0 { None } else { Some(v) }
 }
 
 pub fn wide_array_to_string(wide: &[u16]) -> String {

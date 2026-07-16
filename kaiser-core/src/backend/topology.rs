@@ -13,7 +13,7 @@ use super::apply::{
     GammaRampKey, GammaRampWords,
 };
 use super::enumerate::query_active_topology;
-use super::win32_types::{luid_to_u64, RawTopologySnapshot, TopologySnapshot};
+use super::win32_types::{luid_to_u64, EdidFields, RawTopologySnapshot, TopologySnapshot};
 
 struct BackendCache {
     last_snapshot: Option<TopologySnapshot>,
@@ -177,31 +177,35 @@ impl DisplayBackend for KaiserBackend {
 
     fn list_displays(&self) -> Result<Vec<DisplayInfo>, ManagerError> {
         self.ensure_snapshot()?;
-        let cache = self.cache.lock().unwrap();
-        let snapshot = cache.last_snapshot.as_ref().unwrap();
-        let mut all_displays = snapshot.displays.clone();
+        let (mut all_displays, live_edid) = {
+            let cache = self.cache.lock().unwrap();
+            let snapshot = cache.last_snapshot.as_ref().unwrap();
+            let displays = snapshot.displays.clone();
+            let edid: Vec<EdidFields> = snapshot.edid_fields.values().cloned().collect();
+            (displays, edid)
+        };
 
         // Try to add known-inactive displays from the topology snapshot (previously active)
         // so the UI can show them as "off" and let the user re-enable them
         let active_ids: std::collections::HashSet<_> =
             all_displays.iter().map(|d| d.id.clone()).collect();
-        let active_edid_hashes: std::collections::HashSet<u64> =
-            all_displays.iter().filter_map(|d| d.id.edid_hash).collect();
 
         if let Ok(content) = std::fs::read_to_string(&self.snapshot_path) {
             if let Ok(persisted) = serde_json::from_str::<PersistedSnapshot>(&content) {
-                for display in persisted.displays {
-                    // Match by stable edid_hash first to avoid ghost entries after a
-                    // reboot where the adapter LUID changes for the same physical monitor.
-                    let matched_by_hash = display
-                        .id
-                        .edid_hash
-                        .map(|h| active_edid_hashes.contains(&h))
-                        .unwrap_or(false);
-                    if !active_ids.contains(&display.id) && !matched_by_hash {
-                        let mut inactive = display;
-                        inactive.is_active = false;
-                        all_displays.push(inactive);
+                if persisted.version >= SNAPSHOT_VERSION {
+                    for display in persisted.displays {
+                        if active_ids.contains(&display.id) {
+                            continue;
+                        }
+                        let key = format!("{}:{}", display.id.adapter_luid, display.id.target_id);
+                        let matched = persisted.edid_fields.get(&key)
+                            .map(|stored| live_edid.iter().any(|live| stored.matches(live)))
+                            .unwrap_or(false);
+                        if !matched {
+                            let mut inactive = display;
+                            inactive.is_active = false;
+                            all_displays.push(inactive);
+                        }
                     }
                 }
             }
@@ -211,9 +215,12 @@ impl DisplayBackend for KaiserBackend {
 
     fn get_layout(&self) -> Result<Layout, ManagerError> {
         self.ensure_snapshot()?;
-        let mut layout = {
+        let (mut layout, live_edid) = {
             let cache = self.cache.lock().unwrap();
-            cache.last_snapshot.as_ref().unwrap().layout.clone()
+            let snapshot = cache.last_snapshot.as_ref().unwrap();
+            let layout = snapshot.layout.clone();
+            let edid: Vec<EdidFields> = snapshot.edid_fields.values().cloned().collect();
+            (layout, edid)
         };
         // Merge in disabled outputs from the persisted snapshot so that monitors
         // disabled in a previous apply are still present (as enabled=false) and
@@ -223,20 +230,22 @@ impl DisplayBackend for KaiserBackend {
             .iter()
             .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
             .collect();
-        let active_edid_hashes: std::collections::HashSet<u64> =
-            layout.outputs.iter().filter_map(|o| o.display_id.edid_hash).collect();
         if let Ok(content) = std::fs::read_to_string(&self.snapshot_path) {
             if let Ok(persisted) = serde_json::from_str::<PersistedSnapshot>(&content) {
-                for mut output in persisted.layout.outputs {
-                    let key = (output.display_id.adapter_luid, output.display_id.target_id);
-                    let matched_by_hash = output
-                        .display_id
-                        .edid_hash
-                        .map(|h| active_edid_hashes.contains(&h))
-                        .unwrap_or(false);
-                    if !active_keys.contains(&key) && !matched_by_hash {
-                        output.enabled = false;
-                        layout.outputs.push(output);
+                if persisted.version >= SNAPSHOT_VERSION {
+                    for mut output in persisted.layout.outputs {
+                        let tid_key = (output.display_id.adapter_luid, output.display_id.target_id);
+                        if active_keys.contains(&tid_key) {
+                            continue;
+                        }
+                        let key = format!("{}:{}", output.display_id.adapter_luid, output.display_id.target_id);
+                        let matched = persisted.edid_fields.get(&key)
+                            .map(|stored| live_edid.iter().any(|live| stored.matches(live)))
+                            .unwrap_or(false);
+                        if !matched {
+                            output.enabled = false;
+                            layout.outputs.push(output);
+                        }
                     }
                 }
             }
@@ -379,10 +388,27 @@ impl DisplayBackend for SharedKaiserBackend {
     }
 }
 
+const SNAPSHOT_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 struct PersistedSnapshot {
+    version: u32,
     displays: Vec<DisplayInfo>,
     layout: Layout,
+    /// EDID fields per display, keyed by "adapter_luid:target_id" strings.
+    edid_fields: HashMap<String, EdidFields>,
+}
+
+impl Default for PersistedSnapshot {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            displays: Vec::new(),
+            layout: Layout::default(),
+            edid_fields: HashMap::new(),
+        }
+    }
 }
 
 impl KaiserBackend {
@@ -394,48 +420,64 @@ impl KaiserBackend {
 
         let active_ids: std::collections::HashSet<_> =
             snapshot.displays.iter().map(|d| d.id.clone()).collect();
-        let active_edid_hashes: std::collections::HashSet<u64> =
-            snapshot.displays.iter().filter_map(|d| d.id.edid_hash).collect();
         let active_keys: std::collections::HashSet<(u64, u32)> = snapshot
             .layout
             .outputs
             .iter()
             .map(|o| (o.display_id.adapter_luid, o.display_id.target_id))
             .collect();
-        let active_output_edid_hashes: std::collections::HashSet<u64> =
-            snapshot.layout.outputs.iter().filter_map(|o| o.display_id.edid_hash).collect();
+        let live_edid: Vec<&EdidFields> = snapshot.edid_fields.values().collect();
+
+        // Build the new edid_fields map from the live snapshot.
+        let mut edid_fields: HashMap<String, EdidFields> = snapshot
+            .edid_fields
+            .iter()
+            .map(|((luid, tid), f)| (format!("{luid}:{tid}"), f.clone()))
+            .collect();
 
         if let Ok(content) = std::fs::read_to_string(&self.snapshot_path) {
             if let Ok(old) = serde_json::from_str::<PersistedSnapshot>(&content) {
-                for mut d in old.displays {
-                    let matched_by_hash = d
-                        .id
-                        .edid_hash
-                        .map(|h| active_edid_hashes.contains(&h))
-                        .unwrap_or(false);
-                    if !active_ids.contains(&d.id) && !matched_by_hash {
-                        d.is_active = false;
-                        displays.push(d);
+                if old.version >= SNAPSHOT_VERSION {
+                    for mut d in old.displays {
+                        if active_ids.contains(&d.id) {
+                            continue;
+                        }
+                        let key = format!("{}:{}", d.id.adapter_luid, d.id.target_id);
+                        let matched = old.edid_fields.get(&key)
+                            .map(|stored| live_edid.iter().any(|live| stored.matches(live)))
+                            .unwrap_or(false);
+                        if !matched {
+                            d.is_active = false;
+                            displays.push(d);
+                            // Carry forward the EDID fields for this inactive display.
+                            if let Some(f) = old.edid_fields.get(&key) {
+                                edid_fields.entry(key).or_insert_with(|| f.clone());
+                            }
+                        }
                     }
-                }
-                for mut o in old.layout.outputs {
-                    let key = (o.display_id.adapter_luid, o.display_id.target_id);
-                    let matched_by_hash = o
-                        .display_id
-                        .edid_hash
-                        .map(|h| active_output_edid_hashes.contains(&h))
-                        .unwrap_or(false);
-                    if !active_keys.contains(&key) && !matched_by_hash {
-                        o.enabled = false;
-                        outputs.push(o);
+                    for mut o in old.layout.outputs {
+                        let tid_key = (o.display_id.adapter_luid, o.display_id.target_id);
+                        if active_keys.contains(&tid_key) {
+                            continue;
+                        }
+                        let key = format!("{}:{}", o.display_id.adapter_luid, o.display_id.target_id);
+                        let matched = old.edid_fields.get(&key)
+                            .map(|stored| live_edid.iter().any(|live| stored.matches(live)))
+                            .unwrap_or(false);
+                        if !matched {
+                            o.enabled = false;
+                            outputs.push(o);
+                        }
                     }
                 }
             }
         }
 
         let data = PersistedSnapshot {
+            version: SNAPSHOT_VERSION,
             displays,
             layout: Layout { outputs },
+            edid_fields,
         };
         if let Ok(json) = serde_json::to_string_pretty(&data) {
             let _ = std::fs::create_dir_all(self.snapshot_path.parent().unwrap());
