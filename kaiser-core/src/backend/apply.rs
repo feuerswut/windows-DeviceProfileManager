@@ -176,15 +176,25 @@ pub fn apply_layout_against_snapshot(
     }
 
     // ── Phase A3: verify topology ─────────────────────────────────────────────
+    // If any desired monitor is still missing here, return an error so the
+    // outer retry loop re-runs A1's extend on the next attempt.
     {
         let cur = super::enumerate::query_active_topology()?;
         let cur_active = active_keys(&cur.raw.paths);
-        let missing: Vec<_> = desired_active.iter().filter(|k| !cur_active.contains(*k)).collect();
-        let extra: Vec<_> = cur_active.iter().filter(|k| !desired_active.contains(k)).collect();
-        if missing.is_empty() && extra.is_empty() {
-            log::info!("apply A3: topology verified OK");
+        let missing: Vec<_> = desired_active.iter().filter(|k| !cur_active.contains(*k)).copied().collect();
+        let extra: Vec<_> = cur_active.iter().filter(|k| !desired_active.contains(k)).copied().collect();
+        if missing.is_empty() {
+            if extra.is_empty() {
+                log::info!("apply A3: topology verified OK");
+            } else {
+                log::warn!("apply A3: extra monitors still active (will be cleaned up by OS): {:?}", extra);
+            }
         } else {
-            log::warn!("apply A3: topology mismatch — missing={:?} extra={:?}", missing, extra);
+            log::warn!("apply A3: {} desired monitor(s) still missing after extend: {:?}", missing.len(), missing);
+            return Err(ManagerError::Backend(format!(
+                "apply A3: {} monitor(s) did not come online after extend: {:?}",
+                missing.len(), missing
+            )));
         }
     }
 
