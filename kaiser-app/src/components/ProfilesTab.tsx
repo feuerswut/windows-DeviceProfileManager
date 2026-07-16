@@ -629,9 +629,11 @@ interface Props {
   snapshot: SnapshotDto;
   audioDevices: AudioDevice[];
   onRefresh: () => Promise<void>;
+  onApplyStart?: () => void;
+  onApplyDone?: () => void;
 }
 
-export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
+export function ProfilesTab({ snapshot, audioDevices, onRefresh, onApplyStart, onApplyDone }: Props) {
   const [newName, setNewName] = useState("");
   const [saveBusy, setSaveBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
@@ -658,6 +660,7 @@ export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
 
   async function handleApply(profile: ProfileDto) {
     setActionBusy(profile.name);
+    onApplyStart?.();
     try {
       await api.applyProfile(profile.name);
       await onRefresh();
@@ -666,6 +669,7 @@ export function ProfilesTab({ snapshot, audioDevices, onRefresh }: Props) {
       toast.error(`Apply failed: ${err}`);
     } finally {
       setActionBusy(null);
+      onApplyDone?.();
     }
   }
 
