@@ -12,7 +12,46 @@ pub fn run() {
     let default_level = "trace,tao=warn,wry=warn,tauri=warn";
     #[cfg(not(debug_assertions))]
     let default_level = "info";
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .format(|buf, record| {
+            use std::io::Write;
+            use env_logger::fmt::style::{AnsiColor, Style};
+
+            let (level_style, line_style) = match record.level() {
+                log::Level::Error => (
+                    Style::new().fg_color(Some(AnsiColor::Red.into())).bold(),
+                    Some(Style::new().fg_color(Some(AnsiColor::Red.into()))),
+                ),
+                log::Level::Warn => (
+                    Style::new().fg_color(Some(AnsiColor::Yellow.into())).bold(),
+                    Some(Style::new().fg_color(Some(AnsiColor::Yellow.into()))),
+                ),
+                log::Level::Info => (
+                    Style::new().fg_color(Some(AnsiColor::Green.into())).bold(),
+                    None,
+                ),
+                log::Level::Debug => (
+                    Style::new().bold(),
+                    None,
+                ),
+                log::Level::Trace => (
+                    Style::new().fg_color(Some(AnsiColor::BrightBlack.into())).italic(),
+                    Some(Style::new().fg_color(Some(AnsiColor::BrightBlack.into())).italic()),
+                ),
+            };
+
+            let reset = Style::new();
+            let level_str = format!("{level_style}{:<5}{reset}", record.level());
+            let target = record.target();
+            let message = record.args();
+
+            if let Some(ls) = line_style {
+                writeln!(buf, "{level_str} {ls}[{target}] {message}{reset}")
+            } else {
+                writeln!(buf, "{level_str} [{target}] {message}")
+            }
+        })
+        .init();
 
     tauri::Builder::default()
         .setup(|app| {
