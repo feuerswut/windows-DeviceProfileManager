@@ -72,13 +72,14 @@ pub fn apply_layout_against_snapshot(
     {
         let cur = super::enumerate::query_active_topology()?;
         let cur_active = active_keys(&cur.raw.paths);
+        let cur_cloned = cloned_targets(&cur.raw.paths);
         let missing: Vec<(u64, u32)> = desired_active.iter()
-            .filter(|k| !cur_active.contains(*k))
+            .filter(|k| needs_extend(k, &cur_active, &cur_cloned, desired_clones))
             .copied()
             .collect();
 
         if !missing.is_empty() {
-            log::info!("apply A1: {} desired monitor(s) offline — extending topology first", missing.len());
+            log::info!("apply A1: {} desired monitor(s) offline or mirrored — extending topology first", missing.len());
 
             // Try SDC_TOPOLOGY_EXTEND first (brings all connected monitors online).
             if let Err(e) = force_topology_extend() {
@@ -87,25 +88,27 @@ pub fn apply_layout_against_snapshot(
                 std::thread::sleep(std::time::Duration::from_millis(400));
             }
 
-            // Wait for the desired targets to appear.
-            if !wait_for_targets_active(&missing, 8_000) {
-                log::warn!("apply A1: targets still missing after extend — trying phase1 direct enable");
+            // Wait for the desired targets to appear as active and extended.
+            if !wait_for_targets_extended(&missing, desired_clones, 8_000) {
+                log::warn!("apply A1: targets still missing/mirrored after extend — trying phase1 direct enable");
                 let cur2 = super::enumerate::query_active_topology()?;
+                let cur2_active = active_keys(&cur2.raw.paths);
+                let cur2_cloned = cloned_targets(&cur2.raw.paths);
                 let still_missing: Vec<(u64, u32)> = missing.iter()
-                    .filter(|k| !active_keys(&cur2.raw.paths).contains(*k))
+                    .filter(|k| needs_extend(k, &cur2_active, &cur2_cloned, desired_clones))
                     .copied()
                     .collect();
                 if !still_missing.is_empty() {
                     match phase1_enable_targets(&still_missing, &cur2.raw.paths, &cur2.raw.modes) {
-                        Ok(()) => { wait_for_targets_active(&still_missing, 8_000); }
+                        Ok(()) => { wait_for_targets_extended(&still_missing, desired_clones, 8_000); }
                         Err(e) => log::warn!("apply A1: direct enable also failed: {e}"),
                     }
                 }
             } else {
-                log::info!("apply A1: all desired monitors confirmed active");
+                log::info!("apply A1: all desired monitors confirmed extended");
             }
         } else {
-            log::info!("apply A1: all desired monitors already active");
+            log::info!("apply A1: all desired monitors already extended");
         }
     }
 
@@ -176,15 +179,29 @@ pub fn apply_layout_against_snapshot(
     }
 
     // ── Phase A3: verify topology ─────────────────────────────────────────────
+    // Fail if any desired monitor is still offline OR still mirrored when it
+    // should be extended — triggers the outer retry loop to re-run A1.
     {
         let cur = super::enumerate::query_active_topology()?;
         let cur_active = active_keys(&cur.raw.paths);
-        let missing: Vec<_> = desired_active.iter().filter(|k| !cur_active.contains(*k)).collect();
-        let extra: Vec<_> = cur_active.iter().filter(|k| !desired_active.contains(k)).collect();
-        if missing.is_empty() && extra.is_empty() {
-            log::info!("apply A3: topology verified OK");
+        let cur_cloned = cloned_targets(&cur.raw.paths);
+        let missing: Vec<_> = desired_active.iter()
+            .filter(|k| needs_extend(k, &cur_active, &cur_cloned, desired_clones))
+            .copied()
+            .collect();
+        let extra: Vec<_> = cur_active.iter().filter(|k| !desired_active.contains(k)).copied().collect();
+        if missing.is_empty() {
+            if extra.is_empty() {
+                log::info!("apply A3: topology verified OK");
+            } else {
+                log::warn!("apply A3: extra monitors still active (will be cleaned up by OS): {:?}", extra);
+            }
         } else {
-            log::warn!("apply A3: topology mismatch — missing={:?} extra={:?}", missing, extra);
+            log::warn!("apply A3: {} desired monitor(s) still offline or mirrored: {:?}", missing.len(), missing);
+            return Err(ManagerError::Backend(format!(
+                "apply A3: {} monitor(s) did not come online/extend: {:?}",
+                missing.len(), missing
+            )));
         }
     }
 
@@ -363,6 +380,43 @@ fn active_keys(paths: &[DISPLAYCONFIG_PATH_INFO]) -> std::collections::HashSet<(
         .collect()
 }
 
+/// Returns the set of active target keys that share a source slot with another
+/// active target — i.e. are currently mirrored/cloned rather than extended.
+fn cloned_targets(paths: &[DISPLAYCONFIG_PATH_INFO]) -> std::collections::HashSet<(u64, u32)> {
+    let mut slot_to_first: HashMap<(i32, u32, u32), (u64, u32)> = HashMap::new();
+    let mut cloned = std::collections::HashSet::new();
+    for path in paths {
+        if path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG == 0 { continue; }
+        let slot = (
+            path.sourceInfo.adapterId.HighPart,
+            path.sourceInfo.adapterId.LowPart,
+            path.sourceInfo.id,
+        );
+        let target = path_target_key(path);
+        if let Some(&first) = slot_to_first.get(&slot) {
+            cloned.insert(target);
+            cloned.insert(first);
+        } else {
+            slot_to_first.insert(slot, target);
+        }
+    }
+    cloned
+}
+
+/// A target counts as "properly extended" if it is active AND not sharing a
+/// source slot with another monitor (unless it is intentionally part of a clone
+/// pair — either as the clone key or as the clone source).
+fn needs_extend(
+    target: &(u64, u32),
+    cur_active: &std::collections::HashSet<(u64, u32)>,
+    cur_cloned: &std::collections::HashSet<(u64, u32)>,
+    desired_clones: &HashMap<(u64, u32), (u64, u32)>,
+) -> bool {
+    let intentionally_cloned = desired_clones.contains_key(target)
+        || desired_clones.values().any(|src| src == target);
+    !cur_active.contains(target) || (cur_cloned.contains(target) && !intentionally_cloned)
+}
+
 /// Mirrors PS `SetPrimaryByName`: subtract the desired primary's current position
 /// from every source-mode so it ends up at (0,0). Returns true if a shift was needed.
 fn shift_primary_to_origin(
@@ -403,6 +457,37 @@ fn shift_primary_to_origin(
     true
 }
 
+/// Poll until all `targets` are active AND not unintentionally mirrored.
+fn wait_for_targets_extended(
+    targets: &[(u64, u32)],
+    desired_clones: &HashMap<(u64, u32), (u64, u32)>,
+    timeout_ms: u64,
+) -> bool {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        match super::enumerate::query_active_topology() {
+            Ok(snap) => {
+                let cur_active = active_keys(&snap.raw.paths);
+                let cur_cloned = cloned_targets(&snap.raw.paths);
+                let still: Vec<_> = targets.iter()
+                    .filter(|k| needs_extend(k, &cur_active, &cur_cloned, desired_clones))
+                    .collect();
+                if still.is_empty() {
+                    log::info!("wait_for_targets_extended: all targets extended after {:?}", start.elapsed());
+                    return true;
+                }
+                log::debug!("wait_for_targets_extended: still waiting, not-extended={:?}", still);
+            }
+            Err(e) => log::warn!("wait_for_targets_extended: query failed: {e}"),
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+    }
+}
+
 /// Poll QDC_ONLY_ACTIVE_PATHS until all `needs_enable` targets appear as active,
 /// or the timeout elapses. Mirrors PS `Wait-MonitorActive`.
 fn wait_for_targets_active(needs_enable: &[(u64, u32)], timeout_ms: u64) -> bool {
@@ -433,28 +518,35 @@ fn wait_for_targets_active(needs_enable: &[(u64, u32)], timeout_ms: u64) -> bool
 }
 
 /// Check whether the active topology matches what the desired layout requires.
-pub(super) fn verify_layout_applied(desired: &Layout, snapshot: &TopologySnapshot) -> bool {
-    use std::collections::HashSet;
-    let active: HashSet<(u64, u32)> = snapshot.raw.paths.iter()
-        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
-        .map(|p| path_target_key(p))
+/// `desired_clones` maps clone-target → clone-source; both members of a pair
+/// are allowed to share a source slot (that is the intended mirror state).
+pub(super) fn verify_layout_applied(
+    desired: &Layout,
+    snapshot: &TopologySnapshot,
+    desired_clones: &HashMap<(u64, u32), (u64, u32)>,
+) -> bool {
+    let active = active_keys(&snapshot.raw.paths);
+    let cloned = cloned_targets(&snapshot.raw.paths);
+
+    // Collect all targets that are intentionally in a clone pair (both key and value).
+    let intentional_clone_members: std::collections::HashSet<(u64, u32)> = desired_clones
+        .iter()
+        .flat_map(|(&clone, &source)| [clone, source])
         .collect();
 
     let mut ok = true;
     for output in &desired.outputs {
         let key = (output.display_id.adapter_luid, output.display_id.target_id);
-        if output.enabled && !active.contains(&key) {
-            log::warn!(
-                "verify: {:016x}:{} should be ACTIVE but is not",
-                key.0, key.1
-            );
-            ok = false;
-        }
-        if !output.enabled && active.contains(&key) {
-            log::warn!(
-                "verify: {:016x}:{} should be INACTIVE but is still active",
-                key.0, key.1
-            );
+        if output.enabled {
+            if !active.contains(&key) {
+                log::warn!("verify: {:016x}:{} should be ACTIVE but is not", key.0, key.1);
+                ok = false;
+            } else if cloned.contains(&key) && !intentional_clone_members.contains(&key) {
+                log::warn!("verify: {:016x}:{} is ACTIVE but unintentionally mirrored", key.0, key.1);
+                ok = false;
+            }
+        } else if active.contains(&key) {
+            log::warn!("verify: {:016x}:{} should be INACTIVE but is still active", key.0, key.1);
             ok = false;
         }
     }

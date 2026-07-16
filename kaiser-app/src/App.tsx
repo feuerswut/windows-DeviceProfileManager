@@ -77,6 +77,24 @@ function ConfirmBanner({
   );
 }
 
+function ApplyingBanner() {
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const message = elapsed >= 5 ? "Still trying to apply profile…" : "Applying profile… please wait";
+
+  return (
+    <div className="rounded-lg border border-blue-600/50 bg-blue-950/40 px-5 py-3.5 flex items-center gap-3.5 shadow-xl backdrop-blur-sm">
+      <Monitor size={24} className="text-blue-400 shrink-0 animate-pulse" />
+      <div className="font-semibold text-base text-blue-200">{message}</div>
+    </div>
+  );
+}
+
 type Tab = "displays" | "audio" | "profiles";
 
 export default function App() {
@@ -84,6 +102,7 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<SnapshotDto | null>(null);
   const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
   const [loading, setLoading] = useState(true);
+  const [applying, setApplying] = useState(false);
 
   const refreshSnapshot = useCallback(async () => {
     try {
@@ -116,6 +135,8 @@ export default function App() {
       toast.success("Layout confirmed");
     } catch (err) {
       toast.error(`Confirm failed: ${err}`);
+    } finally {
+      setApplying(false);
     }
   }
 
@@ -126,6 +147,8 @@ export default function App() {
       toast.success("Layout reverted");
     } catch (err) {
       toast.error(`Revert failed: ${err}`);
+    } finally {
+      setApplying(false);
     }
   }
 
@@ -188,17 +211,21 @@ export default function App() {
 
       {/* Content */}
       <div className="relative flex-1 overflow-hidden">
-        {!loading && snapshot?.pending_confirmation && (
+        {!loading && (applying || snapshot?.pending_confirmation) && (
           <div className="absolute inset-0 z-50 pointer-events-none">
             {/* Blur gradient scrim — fades from top, leaves bottom readable */}
             <div className="absolute inset-0 bg-gradient-to-b from-zinc-950/80 via-zinc-950/40 to-transparent backdrop-blur-[2px] [mask-image:linear-gradient(to_bottom,black_0%,black_40%,transparent_100%)]" />
             {/* Card centred at 80% width, pinned near the top */}
             <div className="absolute top-4 left-1/2 -translate-x-1/2 w-4/5 pointer-events-auto">
-              <ConfirmBanner
-                remainingSecs={snapshot.pending_confirmation_remaining_secs}
-                onConfirm={handleConfirm}
-                onRevert={handleRevert}
-              />
+              {snapshot?.pending_confirmation ? (
+                <ConfirmBanner
+                  remainingSecs={snapshot.pending_confirmation_remaining_secs}
+                  onConfirm={handleConfirm}
+                  onRevert={handleRevert}
+                />
+              ) : (
+                <ApplyingBanner />
+              )}
             </div>
           </div>
         )}
@@ -213,6 +240,8 @@ export default function App() {
               <DisplaysTab
                 snapshot={snapshot}
                 onRefresh={refreshSnapshot}
+                onApplyStart={() => setApplying(true)}
+                onApplyDone={() => setApplying(false)}
               />
             )}
             {tab === "audio" && (
@@ -226,6 +255,8 @@ export default function App() {
                 snapshot={snapshot}
                 audioDevices={audioDevices}
                 onRefresh={refreshSnapshot}
+                onApplyStart={() => setApplying(true)}
+                onApplyDone={() => setApplying(false)}
               />
             )}
           </>
