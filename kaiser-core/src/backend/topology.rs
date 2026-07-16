@@ -292,11 +292,12 @@ impl DisplayBackend for KaiserBackend {
                 cache.last_snapshot.as_ref().unwrap().clone()
             };
 
+            let (pending_clones_for_verify, _) = self.get_pending_display_ops();
             let result = self.try_apply_once(&layout, &snapshot);
 
             match result {
                 Ok(next_snapshot) => {
-                    if super::apply::verify_layout_applied(&layout, &next_snapshot) {
+                    if super::apply::verify_layout_applied(&layout, &next_snapshot, &pending_clones_for_verify) {
                         log::info!("KaiserBackend: layout verified on attempt {}", attempt + 1);
                         self.persist_snapshot(&next_snapshot);
                         let _ = reapply_color_calibration_for_active_with_cached_sdr(&sdr_cache);

@@ -404,15 +404,17 @@ fn cloned_targets(paths: &[DISPLAYCONFIG_PATH_INFO]) -> std::collections::HashSe
 }
 
 /// A target counts as "properly extended" if it is active AND not sharing a
-/// source slot with another monitor (unless it is intentionally cloned).
+/// source slot with another monitor (unless it is intentionally part of a clone
+/// pair — either as the clone key or as the clone source).
 fn needs_extend(
     target: &(u64, u32),
     cur_active: &std::collections::HashSet<(u64, u32)>,
     cur_cloned: &std::collections::HashSet<(u64, u32)>,
     desired_clones: &HashMap<(u64, u32), (u64, u32)>,
 ) -> bool {
-    !cur_active.contains(target)
-        || (cur_cloned.contains(target) && !desired_clones.contains_key(target))
+    let intentionally_cloned = desired_clones.contains_key(target)
+        || desired_clones.values().any(|src| src == target);
+    !cur_active.contains(target) || (cur_cloned.contains(target) && !intentionally_cloned)
 }
 
 /// Mirrors PS `SetPrimaryByName`: subtract the desired primary's current position
@@ -516,18 +518,21 @@ fn wait_for_targets_active(needs_enable: &[(u64, u32)], timeout_ms: u64) -> bool
 }
 
 /// Check whether the active topology matches what the desired layout requires.
-pub(super) fn verify_layout_applied(desired: &Layout, snapshot: &TopologySnapshot) -> bool {
+/// `desired_clones` maps clone-target → clone-source; both members of a pair
+/// are allowed to share a source slot (that is the intended mirror state).
+pub(super) fn verify_layout_applied(
+    desired: &Layout,
+    snapshot: &TopologySnapshot,
+    desired_clones: &HashMap<(u64, u32), (u64, u32)>,
+) -> bool {
     let active = active_keys(&snapshot.raw.paths);
     let cloned = cloned_targets(&snapshot.raw.paths);
 
-    // Build the intended clone map from the desired layout's clone_pairs field
-    // (not available here directly, so we derive it: if a target is NOT supposed
-    // to be a clone, it must not be in the cloned set).
-    // We don't have desired_clones here, but we can check: any enabled output
-    // that appears in `cloned` and is not intentionally a clone is a failure.
-    // Since verify_layout_applied doesn't receive desired_clones, we treat any
-    // enabled output that is mirrored as a failure (the correct layout has no
-    // unintended mirrors).
+    // Collect all targets that are intentionally in a clone pair (both key and value).
+    let intentional_clone_members: std::collections::HashSet<(u64, u32)> = desired_clones
+        .iter()
+        .flat_map(|(&clone, &source)| [clone, source])
+        .collect();
 
     let mut ok = true;
     for output in &desired.outputs {
@@ -536,8 +541,8 @@ pub(super) fn verify_layout_applied(desired: &Layout, snapshot: &TopologySnapsho
             if !active.contains(&key) {
                 log::warn!("verify: {:016x}:{} should be ACTIVE but is not", key.0, key.1);
                 ok = false;
-            } else if cloned.contains(&key) {
-                log::warn!("verify: {:016x}:{} is ACTIVE but still mirrored (not extended)", key.0, key.1);
+            } else if cloned.contains(&key) && !intentional_clone_members.contains(&key) {
+                log::warn!("verify: {:016x}:{} is ACTIVE but unintentionally mirrored", key.0, key.1);
                 ok = false;
             }
         } else if active.contains(&key) {
