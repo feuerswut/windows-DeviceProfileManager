@@ -640,9 +640,11 @@ function ClonePicker({ displayId, currentCloneSourceKey, otherOutputs, displays,
 interface Props {
   snapshot: SnapshotDto;
   onRefresh: () => Promise<void>;
+  onApplyStart?: () => void;
+  onApplyDone?: () => void;
 }
 
-export function DisplaysTab({ snapshot, onRefresh }: Props) {
+export function DisplaysTab({ snapshot, onRefresh, onApplyStart, onApplyDone }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   const [draftLayout, setDraftLayout] = useState<Layout | null>(null);
   const [applyingLayout, setApplyingLayout] = useState(false);
@@ -684,6 +686,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
   async function applyDraft() {
     if (!draftLayout) return;
     setApplyingLayout(true);
+    onApplyStart?.();
     try {
       await api.applyLayout(normalizeLayout(draftLayout));
       setDraftLayout(null);
@@ -693,6 +696,7 @@ export function DisplaysTab({ snapshot, onRefresh }: Props) {
       toast.error(`Apply failed: ${err}`);
     } finally {
       setApplyingLayout(false);
+      onApplyDone?.();
     }
   }
 

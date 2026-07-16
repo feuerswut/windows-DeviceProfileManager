@@ -277,7 +277,7 @@ impl DisplayBackend for KaiserBackend {
         // Retry loop: keep attempting until the active topology matches the desired
         // layout or we exhaust all attempts. Windows topology changes are async and
         // may require multiple passes to fully settle.
-        const MAX_ATTEMPTS: u32 = 6;
+        const MAX_ATTEMPTS: u32 = 3;
         let mut last_err: Option<ManagerError> = None;
 
         for attempt in 0..MAX_ATTEMPTS {
