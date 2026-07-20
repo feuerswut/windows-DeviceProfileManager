@@ -18,7 +18,11 @@ use windows::Win32::Devices::Display::{
     SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
     SDC_USE_SUPPLIED_DISPLAY_CONFIG, DISPLAYCONFIG_ROTATION,
 };
-use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC};
+use windows::Win32::Graphics::Gdi::{
+    ChangeDisplaySettingsExW, CreateDCW, DeleteDC, EnumDisplayDevicesW, EnumDisplaySettingsW,
+    CDS_NORESET, CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+    DISPLAY_DEVICE_STATE_FLAGS, DISPLAY_DEVICEW, ENUM_DISPLAY_SETTINGS_MODE,
+};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_APARTMENTTHREADED,
@@ -837,6 +841,67 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
         )));
     }
     Ok(())
+}
+
+/// Fallback for displays absent from QDC_ALL_PATHS (e.g. VDDs, virtual streaming displays).
+/// Enumerates all GDI display devices, stages each inactive one via ChangeDisplaySettingsEx
+/// with its saved registry settings, then fires the combined apply call.
+/// Returns the number of devices that were successfully staged.
+pub(super) fn gdi_attach_inactive_displays() -> u32 {
+    const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: DISPLAY_DEVICE_STATE_FLAGS =
+        DISPLAY_DEVICE_STATE_FLAGS(0x0000_0001);
+    let mut staged = 0u32;
+    let mut i: u32 = 0;
+    loop {
+        let mut dd = DISPLAY_DEVICEW {
+            cb: size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let found = unsafe { EnumDisplayDevicesW(PCWSTR::null(), i, &mut dd, 0) };
+        if !found.as_bool() {
+            break;
+        }
+        i += 1;
+        if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP).0 != 0 {
+            continue;
+        }
+        let device_name_ptr = PCWSTR(dd.DeviceName.as_ptr());
+        let mut devmode = DEVMODEW {
+            dmSize: size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        let got = unsafe {
+            EnumDisplaySettingsW(device_name_ptr, ENUM_DISPLAY_SETTINGS_MODE(0xFFFF_FFFD), &mut devmode)
+        };
+        if !got.as_bool() {
+            log::warn!("gdi_attach: EnumDisplaySettings failed for GDI device index {i}");
+            continue;
+        }
+        let result = unsafe {
+            ChangeDisplaySettingsExW(
+                device_name_ptr,
+                Some(&devmode),
+                None,
+                CDS_UPDATEREGISTRY | CDS_NORESET,
+                None,
+            )
+        };
+        if result == DISP_CHANGE_SUCCESSFUL {
+            log::info!("gdi_attach: staged GDI device index {i} for attach");
+            staged += 1;
+        } else {
+            log::warn!("gdi_attach: ChangeDisplaySettingsEx returned {result:?} for GDI device index {i}");
+        }
+    }
+    if staged > 0 {
+        let result = unsafe {
+            ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None)
+        };
+        log::info!("gdi_attach: final apply returned {result:?} ({staged} device(s) staged)");
+    } else {
+        log::warn!("gdi_attach: no inactive GDI devices found to stage");
+    }
+    staged
 }
 
 pub(super) fn reapply_color_calibration_for_active_with_cached_sdr(

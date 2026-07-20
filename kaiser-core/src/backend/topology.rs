@@ -359,7 +359,19 @@ impl KaiserBackend {
                         force_topology_extend()?;
                         std::thread::sleep(std::time::Duration::from_millis(900));
                         let recovered = query_active_topology()?;
-                        super::apply::apply_layout_against_snapshot(layout, &recovered, &pending_rotations, &pending_clones)
+                        match super::apply::apply_layout_against_snapshot(layout, &recovered, &pending_rotations, &pending_clones) {
+                            Ok(s) => Ok(s),
+                            Err(extend_err) => {
+                                log::error!(
+                                    "KaiserBackend: extend+retry failed ({extend_err}); \
+                                     trying GDI legacy attach as last resort"
+                                );
+                                super::apply::gdi_attach_inactive_displays();
+                                std::thread::sleep(std::time::Duration::from_millis(1500));
+                                let recovered2 = query_active_topology()?;
+                                super::apply::apply_layout_against_snapshot(layout, &recovered2, &pending_rotations, &pending_clones)
+                            }
+                        }
                     }
                 }
             }
